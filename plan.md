@@ -262,6 +262,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** `pyproject.toml`, `measure_twice/{__init__,config,cli}.py`, `tests/test_config.py`
 - **Done when:** `uv run mt --version` exits 0; `from switchboard.harness import aggregate_agreement` succeeds in a test; config tests prove abort-on-malformed and correct resolution order; pytest/ruff/mypy --strict green
 - **Depends on:** none
+- **Status:** DONE (2026-07-17)
 
 <!-- autofix-applied: 2026-07-16 -->
 ### Step 2: Suite schema, loader, content hash
