@@ -313,6 +313,22 @@ def test_local_non_json_body() -> None:
     assert res.reason_class == RC_NON_JSON_BODY
 
 
+def test_local_non_utf8_transport_error_is_structured_not_raised() -> None:
+    """NIT (iter 3): a non-OSError transport/decode failure (e.g. UnicodeDecodeError from a
+    non-UTF-8 body — a ValueError, not OSError) must return a structured error result, honoring
+    local_chat's "never raises on a transport/envelope failure" contract (would propagate + abort
+    the sweep without the widened catch)."""
+    decode_err = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    res = local_chat(
+        "q",
+        model="general-35b",
+        config=RunConfig(),
+        transport_factory=_raising_transport(decode_err),
+    )
+    assert res.is_error
+    assert res.reason_class == RC_NON_JSON_BODY  # non-decodable body -> unusable envelope
+
+
 def test_local_bad_envelope_missing_choices() -> None:
     res = local_chat(
         "q",

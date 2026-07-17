@@ -23,6 +23,7 @@ max-turns / length cutoff (e.g. ``"error_max_turns"``) is a truncated partial an
 Failure -> switchboard reason_class (imported via :mod:`base`, plan §8 D6):
   * ``claude`` not on PATH (``FileNotFoundError``)      -> ``unreachable`` (the tier is unreachable)
   * other ``OSError`` spawning the process             -> ``os_error``
+  * any other unclassified exception (runner bug etc)  -> ``os_error`` (never raised; contract)
   * non-zero exit                                      -> ``os_error`` (the CLI ran but failed)
   * ``subprocess.TimeoutExpired``                      -> ``timeout``
   * stdout not JSON                                    -> ``non_json_body``
@@ -264,15 +265,61 @@ def claude_call(
     only propagating exception is :class:`BudgetExhaustedError` (a run-control signal).
     """
     budget.consume()  # count + cap BEFORE any subprocess; raises if the budget is spent.
-    eff_timeout = timeout if timeout is not None else DEFAULT_CLAUDE_TIMEOUT_S
-    factory = runner_factory if runner_factory is not None else _default_runner_factory
-    run = factory()
-    # Prompt via STDIN (input=), NOT argv: only flags go on the command line.
-    argv = ["claude", "-p", "--model", alias, "--output-format", "json"]
-
     start = time.monotonic()
+    # The ENTIRE post-budget body is wrapped, so the documented "never raises except
+    # BudgetExhaustedError — returns a structured ERROR result" contract holds for the WHOLE
+    # function, not just the subprocess spawn: json.loads, the is_error/subtype dispatch,
+    # resolved_model_of, and ModelCallResult.success() (which itself raises AdapterError on
+    # sentinel/empty text) are all inside. A fault ANYWHERE here would otherwise propagate out of
+    # claude_call_batch and discard a pool wave's already-succeeded, budget-CONSUMED sibling
+    # results (silent data loss — the runner appends a wave's rows only after the batch returns).
+    # BudgetExhaustedError is raised ABOVE the try so it still propagates; KeyboardInterrupt /
+    # SystemExit are BaseException (not Exception), so they propagate too.
     try:
+        eff_timeout = timeout if timeout is not None else DEFAULT_CLAUDE_TIMEOUT_S
+        factory = runner_factory if runner_factory is not None else _default_runner_factory
+        run = factory()
+        # Prompt via STDIN (input=), NOT argv: only flags go on the command line.
+        argv = ["claude", "-p", "--model", alias, "--output-format", "json"]
         result = run(argv, prompt, eff_timeout)
+        elapsed = round(time.monotonic() - start, 3)
+
+        if result.returncode != 0:
+            # The CLI ran but failed (auth, bad flag, internal error) — a tool-level OS error.
+            return ModelCallResult.error(reason_class=RC_OS_ERROR, elapsed_s=elapsed)
+
+        try:
+            doc = json.loads(result.stdout)
+        except (json.JSONDecodeError, ValueError):
+            return ModelCallResult.error(reason_class=RC_NON_JSON_BODY, elapsed_s=elapsed)
+        if not isinstance(doc, dict):
+            return ModelCallResult.error(reason_class=RC_BAD_ENVELOPE, elapsed_s=elapsed)
+        envelope = cast("dict[str, object]", doc)
+        resolved = resolved_model_of(envelope, requested=alias)
+
+        # is_error guard BEFORE trusting `result` (production _parse_envelope): an is_error
+        # envelope's `result` is an ERROR MESSAGE, not model text, and can co-occur with exit code
+        # 0. Scoring it as a model answer silently corrupts the ledger. A max-turns/length subtype =
+        # truncated (partial answer cut off); anything else = a generic CLI error.
+        if envelope.get("is_error") is True:
+            if _is_truncation_subtype(envelope.get("subtype")):
+                return ModelCallResult.error(
+                    reason_class=RC_TRUNCATED, resolved_model=resolved, elapsed_s=elapsed
+                )
+            return ModelCallResult.error(
+                reason_class=RC_OS_ERROR, resolved_model=resolved, elapsed_s=elapsed
+            )
+
+        text_raw = envelope.get("result")
+        if not isinstance(text_raw, str):
+            # Missing/renamed ``result`` on a non-error envelope -> it carries no usable text.
+            return ModelCallResult.error(reason_class=RC_BAD_ENVELOPE, elapsed_s=elapsed)
+
+        if not text_raw.strip():
+            return ModelCallResult.no_response_result(resolved_model=resolved, elapsed_s=elapsed)
+        return ModelCallResult.success(
+            response_raw=text_raw, resolved_model=resolved, elapsed_s=elapsed
+        )
     except subprocess.TimeoutExpired:
         return ModelCallResult.error(
             reason_class=RC_TIMEOUT, elapsed_s=round(time.monotonic() - start, 3)
@@ -286,44 +333,13 @@ def claude_call(
         return ModelCallResult.error(
             reason_class=RC_OS_ERROR, elapsed_s=round(time.monotonic() - start, 3)
         )
-    elapsed = round(time.monotonic() - start, 3)
-
-    if result.returncode != 0:
-        # The CLI ran but failed (auth, bad flag, internal error) — a tool-level OS error.
-        return ModelCallResult.error(reason_class=RC_OS_ERROR, elapsed_s=elapsed)
-
-    try:
-        doc = json.loads(result.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return ModelCallResult.error(reason_class=RC_NON_JSON_BODY, elapsed_s=elapsed)
-    if not isinstance(doc, dict):
-        return ModelCallResult.error(reason_class=RC_BAD_ENVELOPE, elapsed_s=elapsed)
-    envelope = cast("dict[str, object]", doc)
-    resolved = resolved_model_of(envelope, requested=alias)
-
-    # is_error guard BEFORE trusting `result` (production _parse_envelope): an is_error envelope's
-    # `result` is an ERROR MESSAGE, not model text, and can co-occur with exit code 0. Scoring it
-    # as a model answer silently corrupts the ledger. A max-turns/length subtype = truncated
-    # (partial answer cut off); anything else = a generic CLI error.
-    if envelope.get("is_error") is True:
-        if _is_truncation_subtype(envelope.get("subtype")):
-            return ModelCallResult.error(
-                reason_class=RC_TRUNCATED, resolved_model=resolved, elapsed_s=elapsed
-            )
+    except Exception:
+        # Any OTHER unclassified failure anywhere in the post-budget body (a non-OSError transport
+        # error, a runner_factory bug, a post-processing fault in resolved_model_of / success()) ->
+        # a structured os_error result, never a raised exception (see the block comment above).
         return ModelCallResult.error(
-            reason_class=RC_OS_ERROR, resolved_model=resolved, elapsed_s=elapsed
+            reason_class=RC_OS_ERROR, elapsed_s=round(time.monotonic() - start, 3)
         )
-
-    text_raw = envelope.get("result")
-    if not isinstance(text_raw, str):
-        # Missing/renamed ``result`` on a non-error envelope -> it carries no usable text.
-        return ModelCallResult.error(reason_class=RC_BAD_ENVELOPE, elapsed_s=elapsed)
-
-    if not text_raw.strip():
-        return ModelCallResult.no_response_result(resolved_model=resolved, elapsed_s=elapsed)
-    return ModelCallResult.success(
-        response_raw=text_raw, resolved_model=resolved, elapsed_s=elapsed
-    )
 
 
 def claude_call_batch(

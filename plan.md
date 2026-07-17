@@ -74,7 +74,7 @@ measure-twice is the engine either way; `mt run --suite <path> --out <dir>` work
 - `run_id` = `run_<YYYYMMDDTHHMMSSZ>_<6hex>` (UTC stamp + `os.urandom` hex).
 - `manifest.json`: `{run_id, suite, suite_hash, roster, samples_per_cell, judges, started_utc, config_source, budgets, preregistration}`.
 - `rows.jsonl`, one row per (model × item × sample): `{run_id, model, model_id_resolved, item_id, sample_k, response_raw, parsed, score, scorer, judge_scores, elapsed_s, error}`.
-- **Resume:** a cell is complete iff a row with non-null `score` (or a terminal `error`) exists; `mt run --resume <run_id>` skips complete cells. A torn trailing line (crash mid-append) is detected and truncated on resume.
+- **Resume:** a cell is complete iff a **terminal row exists** for it — i.e. the model was already called (a captured response, a force-scored-0 no-response, or a terminal `error`); `mt run --resume <run_id>` skips complete cells. Because scoring is re-runnable offline (Decision 10), a captured-but-not-yet-scored response (`score` still null) is complete for resume — resume exists to avoid re-**calling** models, and `mt score` fills scores in later without a re-call. A torn trailing line (crash mid-append) is detected and truncated on resume.
 - **Re-run/dedup semantics:** re-running the same suite@hash × roster mints a NEW run (append-only history); reports resolve latest-per-(suite_hash, model) by manifest timestamp unless `--run` pins one.
 
 ### Evidence ledger (`data/ledger/claims.jsonl`)
@@ -294,6 +294,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** `measure_twice/runner.py`, `mt run` + `mt score` wiring, `tests/test_runner.py`
 - **Done when:** with stub clients: full sweep completes; kill-mid-run then `--resume` skips exactly the completed cells; budget-exceeded aborts resumably; **integration test drives `mt run` through the CLI entry point** (production caller) on `suites/smoke.json` with stub factories
 - **Depends on:** 2, 3
+- **Status:** DONE (2026-07-17)
 
 <!-- autofix-applied: 2026-07-16 -->
 ### Step 5: Deterministic scoring + verdict spine + frozen anchors

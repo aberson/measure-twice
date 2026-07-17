@@ -15,6 +15,7 @@ Failure -> switchboard reason_class (imported via :mod:`base`, plan §8 D6):
   * connection refused / DNS (``URLError``)      -> ``unreachable``
   * socket timeout (``TimeoutError``)            -> ``timeout``
   * other ``OSError``                            -> ``os_error``
+  * non-UTF-8 / other unclassified transport exc -> ``non_json_body`` (never raised; contract)
   * HTTP body not JSON                           -> ``non_json_body``
   * JSON present but envelope/message missing    -> ``bad_envelope``
   * non-empty content at ``finish_reason=length``-> ``truncated``
@@ -161,6 +162,16 @@ def local_chat(
     except (TimeoutError, urllib.error.URLError, OSError) as exc:
         elapsed = round(time.monotonic() - start, 3)
         return ModelCallResult.error(reason_class=_classify_transport_error(exc), elapsed_s=elapsed)
+    except Exception:
+        # Honor the docstring's "Never raises on a transport/envelope failure": a non-OSError
+        # transport/decode failure (e.g. a ``UnicodeDecodeError`` — a ``ValueError``, not
+        # ``OSError`` — from ``body.decode("utf-8")`` on a non-UTF-8 local response) would otherwise
+        # propagate uncaught and abort the whole sweep. A body that will not decode is an unusable
+        # envelope -> ``non_json_body``. ``KeyboardInterrupt`` / ``SystemExit`` (BaseException, not
+        # Exception) still propagate.
+        return ModelCallResult.error(
+            reason_class=RC_NON_JSON_BODY, elapsed_s=round(time.monotonic() - start, 3)
+        )
     elapsed = round(time.monotonic() - start, 3)
 
     try:
