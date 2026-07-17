@@ -1,0 +1,9 @@
+# Derived / local — suites and data/ledger stay git-tracked (plan §3)
+data/runs/
+data/reports/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
