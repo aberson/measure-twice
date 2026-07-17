@@ -283,6 +283,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** `measure_twice/adapters/{local,claude_cli}.py`, `tests/test_adapters.py` (stub factories, offline)
 - **Done when:** offline tests cover happy path + every error class (unreachable/timeout/non-json/truncated/empty) for both adapters; envelope contract test pins the claude CLI JSON shape; zero live calls in the test suite
 - **Depends on:** 1
+- **Status:** DONE (2026-07-17)
 
 <!-- autofix-applied: 2026-07-16 -->
 ### Step 4: Runner — sweep, append-only JSONL, resume, budgets
