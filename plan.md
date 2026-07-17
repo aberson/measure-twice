@@ -239,12 +239,12 @@ uv run mt claims list
 
 Built via `/build-phase` per phase, one worktree-isolated `/build-step` per step, `--reviewers code` default. Phase map:
 
-| Phase | Steps | Theme | Closing manual step |
-|---|---|---|---|
-| A | 1–7 | Core engine | M1 (local smoke) |
-| B | 8–9 | Evidence ledger + tier map | — |
-| C | 10–14 | Domains investigation + flagship dataset | M2 (calibration review) |
-| D | 15–17 | Profiling + first measurements | M3 (walkthrough) |
+| Phase | Steps | Theme | Closing manual step | Umbrella |
+|---|---|---|---|---|
+| A | 1–7 | Core engine | M1 (local smoke) | #21 |
+| B | 8–9 | Evidence ledger + tier map | — | #22 |
+| C | 10–14 | Domains investigation + flagship dataset | M2 (calibration review) | #23 |
+| D | 15–17 | Profiling + first measurements | M3 (walkthrough) | #24 |
 
 Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-expedite`.
 
