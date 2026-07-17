@@ -257,7 +257,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 1: Scaffold package, config module, switchboard path dep
 - **Problem:** Create the uv/hatchling project (`measure_twice/` at root), `mt` + `measure-twice` CLI entry points, `config.py` with resolution order (explicit → `$MEASURE_TWICE_CONFIG` → `<cwd>/measure-twice.json` → defaults), recorded `config_source`, default roster/budgets, and the switchboard path dependency (`[tool.uv.sources] switchboard = { path = "../switchboard" }`).
 - **Type:** code
-- **Issue:** #
+- **Issue:** #1
 - **Flags:** --reviewers code
 - **Produces:** `pyproject.toml`, `measure_twice/{__init__,config,cli}.py`, `tests/test_config.py`
 - **Done when:** `uv run mt --version` exits 0; `from switchboard.harness import aggregate_agreement` succeeds in a test; config tests prove abort-on-malformed and correct resolution order; pytest/ruff/mypy --strict green
@@ -266,7 +266,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 2: Suite schema, loader, content hash
 - **Problem:** Implement the suite JSON schema (§3), fail-loud loader, canonical-JSON item hash, `_SAFE_NAME_RE` name checks (imported from switchboard, not re-declared), `mt validate`, plus `suites/smoke.json` (2 trivial verdict items) as fixture.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #2
 - **Flags:** --reviewers code
 - **Produces:** `measure_twice/suite.py`, `suites/smoke.json`, `tests/test_suite.py`
 - **Done when:** round-trip + stable-hash tests pass; malformed suites (bad name, missing expected, dup ids) each raise with a distinct error; `mt validate suites/smoke.json` exits 0 via the CLI entry point
@@ -275,7 +275,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 3: Model adapters (local + claude CLI) with DI seams
 - **Problem:** `adapters/local.py` (OpenAI-compat chat vs `localhost:8080`; switchboard defer taxonomy; reasoning-model handling per switchboard CLAUDE.md gotchas) and `adapters/claude_cli.py` (`claude -p --model <alias> --output-format json`; envelope unwrap; resolved-model-id capture; call counting; bounded pool). Both behind client-factory DI seams; no-response sentinel defined here.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #3
 - **Flags:** --reviewers code
 - **Produces:** `measure_twice/adapters/{local,claude_cli}.py`, `tests/test_adapters.py` (stub factories, offline)
 - **Done when:** offline tests cover happy path + every error class (unreachable/timeout/non-json/truncated/empty) for both adapters; envelope contract test pins the claude CLI JSON shape; zero live calls in the test suite
@@ -284,7 +284,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 4: Runner — sweep, append-only JSONL, resume, budgets
 - **Problem:** `runner.py`: sweep suite × roster × samples through the adapters; write manifest + append rows as produced; cell-complete resume with torn-line truncation; budget abort; no-response force-scored 0 before any judging; sequential local / small-pool claude scheduling.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #4
 - **Flags:** --reviewers code
 - **Produces:** `measure_twice/runner.py`, `mt run` + `mt score` wiring, `tests/test_runner.py`
 - **Done when:** with stub clients: full sweep completes; kill-mid-run then `--resume` skips exactly the completed cells; budget-exceeded aborts resumably; **integration test drives `mt run` through the CLI entry point** (production caller) on `suites/smoke.json` with stub factories
@@ -293,7 +293,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 5: Deterministic scoring + verdict spine + frozen anchors
 - **Problem:** `scoring/deterministic.py` (verdict/exact scorers; judge-core §5.6-conformant parse: robust extract → validate → coerce → parse-failure→scored-0-recorded, never crash), 0–100 suite normalization, and the first frozen anchor pairs (`tests/anchors/`) with the CI ordering gate `score(good) > score(garbage)` per scorer.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #5
 - **Flags:** --reviewers code
 - **Produces:** `measure_twice/scoring/deterministic.py`, `tests/anchors/*`, `tests/test_scoring.py`, `docs/methodology/01-deterministic-scoring-and-anchors.md`
 - **Done when:** anchor ordering gate green; parse-fail paths covered; re-scoring stored raw rows via `mt score` matches first-pass scores byte-for-byte
@@ -302,7 +302,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 6: LLM rubric judge — k=3 median + per-judge parse gate
 - **Problem:** `scoring/judge.py`: `SCORE:`/`RATIONALE:` two-line contract, k=3 samples per judge, median of parsed samples, clamp 0–10, per-judge parse-fail-rate gate (>0.5 → abort run), parse-fail vs invoke-error kept distinct. Judges are Claude via the claude_cli adapter.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #6
 - **Flags:** --reviewers code
 - **Produces:** `measure_twice/scoring/judge.py`, rubric anchor pair, `tests/test_judge.py`, `docs/methodology/02-llm-judges.md`
 - **Done when:** offline tests prove median math (incl. even-parse-count), gate fires per-judge not pooled, rubric anchor ordering holds via stubbed judges
@@ -311,7 +311,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 7: Reports + claude-path smoke gate
 - **Problem:** `report.py` (per-run markdown, cross-run comparison keyed on equal suite hash) and `mt smoke --claude`: run `suites/smoke.json` against haiku for real — 1 real request per item, no mocks, end-to-end suite→runner→scorer→report. This is the pipeline smoke gate that must pass before any long sweep.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #7
 - **Flags:** --reviewers code
 - **Produces:** `measure_twice/report.py`, `mt smoke`, `tests/test_report.py`
 - **Done when:** `uv run mt smoke --claude` exits 0 in under 60s producing a scored report with 0 parse failures; report renders for a stub multi-model run
@@ -322,7 +322,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 8: Ledger module + `mt claims`
 - **Problem:** `ledger.py` + `mt claims list|audit|render`: claims.jsonl schema (§3), quote-sha256 staleness audit against live source files, markdown rendering of the ledger grouped by status, MEASURED-row invariants (≥1 evidence run + preregistration sentence, enforced on write).
 - **Type:** code
-- **Issue:** #
+- **Issue:** #8
 - **Flags:** --reviewers code
 - **Produces:** `measure_twice/ledger.py`, `tests/test_ledger.py` (incl. a fixture where a cited source mutates → audit flips row to STALE)
 - **Done when:** ledger round-trips; audit catches the mutated-source fixture; write of a MEASURED row without evidence/preregistration is rejected
@@ -331,7 +331,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 9: Populate the ledger + author the tier benchmark map
 - **Problem:** Convert the seed recon (`docs/research/tier-skills-benchmark-map.md`) into ledger rows — every tier-offload/tier-escalate/model-preference decision becomes a claim with real `file:lines` citations and honest status (expect ~1 MEASURED [A3 arms], 1-2 PARTIAL [cost incident, endpoint timings], the rest ASSERTED) — and author `docs/tier-benchmark-map.md`: the narrative map ("what's pinned and why"), with tables rendered from the ledger by `mt claims render` so doc and data cannot drift.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #9
 - **Flags:** --reviewers code
 - **Produces:** populated `data/ledger/claims.jsonl` (≥15 claims), `docs/tier-benchmark-map.md`, `docs/methodology/03-claims-and-evidence.md`
 - **Done when:** `mt claims audit` passes fresh; every row's citation resolves; map's tables regenerate byte-identical from `mt claims render`; ≥15 claims covering both skills' rules, the three canonical Fable seeds, and the top-3 asserted-not-measured items from the recon
@@ -342,7 +342,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 10: Benchmark-domains investigation
 - **Problem:** Research and write `docs/investigations/benchmark-domains.md`: a taxonomy of benchmark domains relevant to this workspace (judging/grading, code authorship, planning, extraction, instruction-following, synthesis…); item-design patterns per domain; difficulty-calibration methods (classical difficulty indices, IRT-lite, adaptive item replacement); anti-saturation techniques; judge-circularity and contamination guards; and a decision record picking the item-design patterns for the flagship suite. Use web research (via the pinned deep-research workflow where appropriate) + the seed docs in `docs/research/`.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #10
 - **Flags:** --reviewers code
 - **Produces:** `docs/investigations/benchmark-domains.md`, `docs/methodology/04-domain-taxonomy.md`
 - **Done when:** doc contains all six required sections above, ≥10 cited external sources, and an explicit decision record; a fresh model could design flagship items from it alone
@@ -351,7 +351,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 11: Item-authoring pipeline
 - **Problem:** `author.py` + `mt author harvest|stub`: harvesters that mine real workspace artifacts into candidate items with provenance (skill-eval golden corpora at `.claude/skills/*/evals/golden/`, review-deep style/correctness verdict fixtures, git-history code snippets), plus `stub` mode emitting schema-valid item templates (id, tags, expected, difficulty_prior, provenance) for agent/operator authorship. Content-hash dedup across candidates.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #11
 - **Flags:** --reviewers code
 - **Produces:** `measure_twice/author.py`, `tests/test_author.py` (fixture-driven)
 - **Done when:** harvest on committed fixtures yields ≥20 schema-valid candidates with provenance; dedup collapses a planted duplicate; stub output passes `mt validate`
@@ -360,7 +360,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 12: Flagship dataset v0 — tier-judging-v0
 - **Problem:** Author `suites/tier-judging-v0.json`: ≥100 `verdict`/`exact` items in the tier-routing judging domain (style calls, correctness calls, grading decisions) with curated gold answers, tags (lens, difficulty bucket, provenance class), `difficulty_prior` spread targeting the [5,95] band, per Step 10's decision record; plus flagship instrument anchors (gold/garbage response pairs through the real scorers).
 - **Type:** code
-- **Issue:** #
+- **Issue:** #12
 - **Flags:** --reviewers code
 - **Produces:** `suites/tier-judging-v0.json`, flagship anchor pairs, `docs/methodology/05-item-authoring.md`
 - **Done when:** `mt validate` passes; ≥100 items; every tag has ≥8 items (min-n); difficulty_prior histogram spans ≥4 buckets; anchor ordering gate green
@@ -369,7 +369,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 13: Calibration sweep (observation run)
 - **Problem:** Run the full default roster (general-35b, coder-30b, haiku, sonnet, opus) over tier-judging-v0 via `mt run` — the first real end-to-end observation run. Local endpoint must be started by the operator first (`start-offload.ps1`); Claude portion budgeted ≤400 calls, tranche-resumable. Capture a findings note (timings, defer/error rates, anything surprising) — findings capture is a deliverable, not a side effect.
 - **Type:** wait
-- **Issue:** #
+- **Issue:** #13
 - **Produces:** complete `data/runs/<run_id>/` for 5 models × ≥100 items, `docs/methodology/06-first-sweep-findings.md`
 - **Done when:** rows.jsonl has a terminal row for every (model, item) cell; defer/error rate per model recorded; findings note written
 - **Depends on:** 7, 12
@@ -377,7 +377,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 14: Discriminative calibration + dataset iteration
 - **Problem:** `analyze/calibrate.py` + `mt calibrate`: per-item empirical difficulty, saturation flags, per-model 0–100 scores, [5,95] acceptance-band verdict, and the pre-registered kill criterion (§4). Then iterate tier-judging-v0 → v1: replace saturated items (re-running only replaced items against the roster), until the acceptance band holds.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #14
 - **Flags:** --reviewers code
 - **Produces:** `measure_twice/analyze/calibrate.py`, `suites/tier-judging-v1.json`, calibration report under `data/reports/`, `docs/methodology/07-discriminative-calibration.md`
 - **Done when:** calibrate report renders from Step 13 data; v1 suite passes the acceptance band on real run data (all 5 models strictly inside [5,95]); kill criterion evaluated and documented; unit tests on fixture runs cover saturation + band logic
@@ -388,7 +388,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 15: Capability profiling
 - **Problem:** `analyze/profile.py` + `mt profile <model>`: per-tag accuracy deltas vs roster mean across stored equal-hash runs, min-n ≥ 8 guard, strongest/weakest tag ranking per model, biggest per-tag cross-model gaps. Render a cross-model comparison report from the Phase C runs.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #15
 - **Flags:** --reviewers code
 - **Produces:** `measure_twice/analyze/profile.py`, profile reports under `data/reports/`, `tests/test_profile.py`
 - **Done when:** fixture-run tests cover delta + min-n logic; real profiles render for all 5 roster models from Phase C data via the CLI
@@ -397,7 +397,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 16: First ledger measurements (observation run)
 - **Problem:** Convert the top asserted claims to MEASURED/PARTIAL with pre-registered runs: (a) style-lens local agreement — general-35b vs Claude verdicts on the style-tagged flagship slice, aggregated via `switchboard.harness.aggregate_agreement` (kill >0.20); (b) "Correctness/Bugs must stay Claude" — same shadow comparison on correctness-tagged items; (c) haiku-vs-sonnet on style (validates the existing review-deep Haiku pin). Each measurement gets its one-sentence preregistration in the ledger BEFORE the run. Update ledger rows + re-render the tier map.
 - **Type:** wait
-- **Issue:** #
+- **Issue:** #16
 - **Produces:** measurement runs under `data/runs/`, updated `data/ledger/claims.jsonl` + regenerated `docs/tier-benchmark-map.md`, `docs/methodology/08-first-measurements.md`
 - **Done when:** ≥3 ledger rows flipped from ASSERTED with run-id evidence + preregistration; agreement math traced to switchboard's function (imported, not re-implemented); findings note records each verdict incl. any DO-NOT-CHANGE outcomes
 - **Depends on:** 14, 9
@@ -405,7 +405,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 ### Step 17: Methodology rollup + README
 - **Problem:** Write `docs/methodology/README.md` (index + the "what each instrument can and cannot tell you" rollup — the learning deliverable), project `README.md` (what/why/quickstart), and update this plan's step statuses.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #17
 - **Flags:** --reviewers code
 - **Produces:** `README.md`, `docs/methodology/README.md`, plan status updates
 - **Done when:** every methodology note 01–08 is indexed with a one-line takeaway; README quickstart commands verified against the real CLI (`--help` output quoted, not imagined)
@@ -417,7 +417,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 
 ### Step M1: Local-endpoint smoke
 - **Source step:** Step 7 (Phase A close-out)
-- **Issue:** #
+- **Issue:** #18
 - **Commands:**
   ```powershell
   powershell -ExecutionPolicy Bypass -NoProfile -File c:\Users\abero\dev\switchboard\scripts\start-offload.ps1
@@ -436,7 +436,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 
 ### Step M2: Calibration review (learning moment)
 - **Source step:** Step 14
-- **Issue:** #
+- **Issue:** #19
 - **Commands:**
   ```powershell
   cd c:\Users\abero\dev\measure-twice
@@ -453,7 +453,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 
 ### Step M3: v1 walkthrough
 - **Source step:** Step 17
-- **Issue:** #
+- **Issue:** #20
 - **Commands:**
   ```powershell
   cd c:\Users\abero\dev\measure-twice
