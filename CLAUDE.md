@@ -48,7 +48,7 @@ Suites carry ALL item content (no prompt templates in adapters — the fallback-
 
 ## Current state
 
-Plan written (2026-07-15), no code yet. Next: `/plan-expedite --plan measure-twice/plan.md`, then `/build-phase` Phase A (Steps 1–7).
+Prep complete (2026-07-17), no code yet: repo public, issues #1–#20 + umbrellas #21–#24 synced, plan-review/plan-wrap READY (Steps 2/4/5 stakes-routed `--reviewers deep`). Next: `/build-phase --plan plan.md --phase A` (Steps 1–7; goal pair in `dev/.claude/task-state/handoff-prompt.md`). Build on the pinned Opus default.
 
 ## Environment requirements
 
