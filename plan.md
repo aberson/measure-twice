@@ -273,6 +273,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** `measure_twice/suite.py`, `suites/smoke.json`, `tests/test_suite.py`
 - **Done when:** round-trip + stable-hash tests pass; malformed suites (bad name, missing expected, dup ids) each raise with a distinct error; `mt validate suites/smoke.json` exits 0 via the CLI entry point
 - **Depends on:** 1
+- **Status:** DONE (2026-07-17)
 
 ### Step 3: Model adapters (local + claude CLI) with DI seams
 - **Problem:** `adapters/local.py` (OpenAI-compat chat vs `localhost:8080`; switchboard defer taxonomy; reasoning-model handling per switchboard CLAUDE.md gotchas) and `adapters/claude_cli.py` (`claude -p --model <alias> --output-format json`; envelope unwrap; resolved-model-id capture; call counting; bounded pool). Both behind client-factory DI seams; no-response sentinel defined here.

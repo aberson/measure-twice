@@ -1,0 +1,25 @@
+{
+  "suite": "smoke",
+  "version": 1,
+  "description": "Trivial 2-item verdict suite: a fixture that exercises the loader, the item hash, and the `mt validate` CLI path end-to-end. Not a real benchmark.",
+  "domain": "smoke",
+  "scoring": {"type": "verdict", "labels": ["pass", "flag"]},
+  "items": [
+    {
+      "id": "001-smoke-pass",
+      "tags": ["smoke", "trivial"],
+      "prompt": "Reply with the single word: pass",
+      "expected": "pass",
+      "difficulty_prior": 0.0,
+      "provenance": "authored"
+    },
+    {
+      "id": "002-smoke-flag",
+      "tags": ["smoke", "trivial"],
+      "prompt": "Reply with the single word: flag",
+      "expected": "flag",
+      "difficulty_prior": 0.0,
+      "provenance": "authored"
+    }
+  ]
+}

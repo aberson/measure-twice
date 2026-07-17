@@ -14,9 +14,31 @@ import sys
 from collections.abc import Callable, Sequence
 
 from measure_twice import __version__
+from measure_twice.suite import SuiteError, load_suite
 
 # A subcommand handler: consumes the parsed namespace, returns a process exit code.
 Handler = Callable[[argparse.Namespace], int]
+
+
+def _handle_validate(args: argparse.Namespace) -> int:
+    """``mt validate <suite.json>``: schema-check a suite and print its item-hash on success.
+
+    Exit 0 on a valid suite (after printing the canonical item hash); NON-ZERO on any violation —
+    the ``SuiteError`` is caught and printed to stderr, and the loader's fail-loud contract means
+    a printed hash certifies a fully-validated instrument, never a partially-loaded one.
+
+    The item hash is computed INSIDE the try/except and BEFORE any "valid" line is printed, so a
+    hash failure surfaces as a caught error, never a raw traceback after a premature success line.
+    """
+    try:
+        suite = load_suite(args.suite)
+        item_hash = suite.item_hash
+    except SuiteError as exc:
+        print(f"validate: {exc}", file=sys.stderr)
+        return 1
+    print(f"{suite.suite}: valid ({len(suite.items)} items, scoring={suite.scoring.type})")
+    print(f"item_hash: {item_hash}")
+    return 0
 
 
 def _build_parser() -> tuple[
@@ -42,6 +64,20 @@ def _build_parser() -> tuple[
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
     handlers: dict[str, Handler] = {}
+
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help="validate a suite JSON file (schema check + print its item-hash)",
+        description="Schema-check a suite JSON file and print its canonical item-hash. "
+        "Exits non-zero on any schema violation.",
+    )
+    validate_parser.add_argument(
+        "suite",
+        metavar="<suite.json>",
+        help="path to the suite JSON file to validate",
+    )
+    handlers["validate"] = _handle_validate
+
     # Later steps: subparsers.add_parser("<command>", ...); handlers["<command>"] = <handler>.
     return parser, subparsers, handlers
 
