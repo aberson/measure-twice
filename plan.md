@@ -137,7 +137,7 @@ All under `measure_twice/` (package at root, switchboard convention).
 - `config.py` — run config resolution: explicit `--config` → `$MEASURE_TWICE_CONFIG` → `<cwd>/measure-twice.json` → built-in defaults. The resolved source is recorded in every run manifest; a live run (`mt run`, `mt smoke`) **aborts** if the local endpoint is named in the roster but unreachable, or if the claude CLI is not invocable — startup checks, not warnings (measurement-validity § fail loud). Default roster: `general-35b`, `coder-30b` (local), `haiku`, `sonnet`, `opus` (claude CLI aliases). Budgets: `max_calls` per run (default 500), per-model timeout.
 - `suite.py` — schema, loader (abort on violation), canonical-JSON item hash, `validate` entry.
 - `adapters/local.py` — OpenAI-compatible chat call against `localhost:8080` reusing switchboard's error taxonomy (defer `reason_class` values: `unreachable, timeout, os_error, non_json_body, bad_envelope, truncated, bad_verdict` — `switchboard/switchboard/client.py`); reasoning-model handling (read `choices[0].message.content`, ignore `reasoning_content`; `max_tokens ≥ 2000` for verdicts — switchboard CLAUDE.md gotcha).
-- `adapters/claude_cli.py` — `claude -p --model <alias> --output-format json` subprocess; unwraps the JSON envelope; records the resolved model id from the envelope (drift detection); counts calls against the run budget; bounded parallelism (small pool), sequential against the local endpoint.
+- `adapters/claude_cli.py` — `claude -p --model <alias> --output-format json` subprocess; the prompt is passed via **stdin, never argv** (Windows argv >32K raises WinError 206 — `feedback_subprocess_large_arg_stdin_windows`); unwraps the JSON envelope; records the resolved model id from the envelope (drift detection); counts calls against the run budget; bounded parallelism (small pool), sequential against the local endpoint.
 - Both adapters take a **client-factory DI seam** so the whole engine is offline-testable (readiness_bench pattern).
 - `runner.py` — sweep suite × roster × samples; append rows as produced; resume; budget abort; no-response force-0.
 - `scoring/deterministic.py` — verdict/exact scorers + the §5.6-conformant parse spine.
@@ -263,11 +263,12 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Done when:** `uv run mt --version` exits 0; `from switchboard.harness import aggregate_agreement` succeeds in a test; config tests prove abort-on-malformed and correct resolution order; pytest/ruff/mypy --strict green
 - **Depends on:** none
 
+<!-- autofix-applied: 2026-07-16 -->
 ### Step 2: Suite schema, loader, content hash
 - **Problem:** Implement the suite JSON schema (§3), fail-loud loader, canonical-JSON item hash, `_SAFE_NAME_RE` name checks (imported from switchboard, not re-declared), `mt validate`, plus `suites/smoke.json` (2 trivial verdict items) as fixture.
 - **Type:** code
 - **Issue:** #2
-- **Flags:** --reviewers code
+- **Flags:** --reviewers deep
 - **Produces:** `measure_twice/suite.py`, `suites/smoke.json`, `tests/test_suite.py`
 - **Done when:** round-trip + stable-hash tests pass; malformed suites (bad name, missing expected, dup ids) each raise with a distinct error; `mt validate suites/smoke.json` exits 0 via the CLI entry point
 - **Depends on:** 1
@@ -281,20 +282,22 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Done when:** offline tests cover happy path + every error class (unreachable/timeout/non-json/truncated/empty) for both adapters; envelope contract test pins the claude CLI JSON shape; zero live calls in the test suite
 - **Depends on:** 1
 
+<!-- autofix-applied: 2026-07-16 -->
 ### Step 4: Runner — sweep, append-only JSONL, resume, budgets
 - **Problem:** `runner.py`: sweep suite × roster × samples through the adapters; write manifest + append rows as produced; cell-complete resume with torn-line truncation; budget abort; no-response force-scored 0 before any judging; sequential local / small-pool claude scheduling.
 - **Type:** code
 - **Issue:** #4
-- **Flags:** --reviewers code
+- **Flags:** --reviewers deep
 - **Produces:** `measure_twice/runner.py`, `mt run` + `mt score` wiring, `tests/test_runner.py`
 - **Done when:** with stub clients: full sweep completes; kill-mid-run then `--resume` skips exactly the completed cells; budget-exceeded aborts resumably; **integration test drives `mt run` through the CLI entry point** (production caller) on `suites/smoke.json` with stub factories
 - **Depends on:** 2, 3
 
+<!-- autofix-applied: 2026-07-16 -->
 ### Step 5: Deterministic scoring + verdict spine + frozen anchors
 - **Problem:** `scoring/deterministic.py` (verdict/exact scorers; judge-core §5.6-conformant parse: robust extract → validate → coerce → parse-failure→scored-0-recorded, never crash), 0–100 suite normalization, and the first frozen anchor pairs (`tests/anchors/`) with the CI ordering gate `score(good) > score(garbage)` per scorer.
 - **Type:** code
 - **Issue:** #5
-- **Flags:** --reviewers code
+- **Flags:** --reviewers deep
 - **Produces:** `measure_twice/scoring/deterministic.py`, `tests/anchors/*`, `tests/test_scoring.py`, `docs/methodology/01-deterministic-scoring-and-anchors.md`
 - **Done when:** anchor ordering gate green; parse-fail paths covered; re-scoring stored raw rows via `mt score` matches first-pass scores byte-for-byte
 - **Depends on:** 4
