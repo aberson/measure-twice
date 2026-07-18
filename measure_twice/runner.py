@@ -76,6 +76,7 @@ __all__ = [
     "ScoreResult",
     "Scorer",
     "collect_only_scorer",
+    "load_run_suite",
     "run",
     "score_run",
 ]
@@ -433,7 +434,13 @@ def _build_row(run_id: str, cell: _Cell, result: ModelCallResult, scorer: Scorer
             error=None,
         )
     # SCORER SEAM: a real, scoreable response -> consult the injected scorer (Step-4 default is
-    # collect-only: parsed/score/scorer stay None, raw is captured for offline `mt score`).
+    # collect-only: parsed/score/scorer stay None, raw is captured for offline `mt score`). The
+    # scorer is NOT wrapped in a catch-all: the deterministic scorer's contract is that a hostile
+    # MODEL RESPONSE never raises (extract_verdict_label folds JSONDecodeError/ValueError/
+    # RecursionError -> parse_fail; exact matching cannot raise) and a bad suite regex fails loud at
+    # LOAD, so the only way the scorer raises here is a genuine programming bug — which must crash
+    # LOUDLY (surface in tests), never masked into a data-destroying error row. Rows are appended
+    # as-produced with --resume, so even a crash loses no persisted data.
     outcome = scorer(cell.item, result.response_raw)
     return RunRow(
         run_id=run_id,
@@ -738,6 +745,37 @@ def run(
     )
 
 
+def _open_run(run_id: str, out_dir: str | Path) -> tuple[Path, Suite]:
+    """Resolve + open a stored run: traversal-guarded run dir, validated suite snapshot, hash check.
+
+    The ONE owner of the open-a-run prologue shared by :func:`load_run_suite` and :func:`score_run`
+    (resolve + manifest + snapshot + hash-check), so a future hash-check edit can't drift between
+    them (NIT 2). Fail loud (``RunError``) on an invalid/traversing ``run_id``, a missing dir/
+    snapshot, or a snapshot/manifest hash mismatch.
+    """
+    run_dir = _resolve_run_dir(Path(out_dir), run_id)
+    if not run_dir.is_dir():
+        raise RunError(f"cannot open run: run dir not found: {run_dir}")
+    manifest = _read_manifest(run_dir)
+    suite = _read_suite_snapshot(run_dir)
+    if suite.item_hash != str(manifest["suite_hash"]):
+        raise RunError("suite snapshot hash does not match manifest (corrupt run store)")
+    return run_dir, suite
+
+
+def load_run_suite(run_id: str, out_dir: str | Path) -> Suite:
+    """Open a stored run's suite snapshot (the instrument it measured), traversal-guarded.
+
+    The scorer for a suite depends on its ``scoring`` spec (a verdict scorer needs the labels), but
+    ``mt score <run_id>`` is NOT re-handed the suite — it re-scores from the run store. This exposes
+    the per-run snapshot so the CLI can pick the deterministic scorer from the run's own scoring
+    type (Step 5), sharing :func:`_open_run`'s traversal guard + hash check with :func:`score_run`.
+    Fail loud: an invalid/traversing ``run_id``, a missing run dir/snapshot, or a snapshot/manifest
+    hash mismatch all raise :class:`RunError`.
+    """
+    return _open_run(run_id, out_dir)[1]
+
+
 def score_run(
     *,
     run_id: str,
@@ -753,14 +791,9 @@ def score_run(
     path is required (and none can drift under it). In Step 4 the default scorer is collect-only, so
     real responses stay unscored/pending; Step 5 plugs its deterministic scorer in at this seam.
     """
-    # Validate the untrusted positional run_id + containment BEFORE any path join (BLOCK 4).
-    run_dir = _resolve_run_dir(Path(out_dir), run_id)
-    if not run_dir.is_dir():
-        raise RunError(f"cannot score: run dir not found: {run_dir}")
-    manifest = _read_manifest(run_dir)
-    suite = _read_suite_snapshot(run_dir)
-    if suite.item_hash != str(manifest["suite_hash"]):
-        raise RunError("suite snapshot hash does not match manifest (corrupt run store)")
+    # Open the run through the shared prologue (validates the untrusted run_id + containment BEFORE
+    # any path join, reads the manifest + snapshot, and hash-checks — one owner, NIT 2).
+    run_dir, suite = _open_run(run_id, out_dir)
     items_by_id = {item.id: item for item in suite.items}
 
     rows, _torn = _read_rows(run_dir)
@@ -780,7 +813,12 @@ def score_run(
             raise RunError(
                 f"row references unknown item_id {row.item_id!r} (not in the suite snapshot)"
             )
-        # SCORER SEAM (Decision 10): re-score the stored raw response — no model call.
+        # SCORER SEAM (Decision 10): re-score the stored raw response — no model call. This is
+        # NON-DESTRUCTIVE: only parsed/score/scorer are replaced; ``response_raw`` is preserved
+        # verbatim (durable evidence — a re-score must never overwrite the stored raw with "").
+        # The scorer is not wrapped in a catch-all (see _build_row): a hostile stored response never
+        # raises, a bad suite regex fails loud at load, so a raise here is a genuine bug that must
+        # surface, not be masked into a row that clobbers the stored raw.
         outcome = scorer(item, row.response_raw)
         rescored.append(
             replace(row, parsed=outcome.parsed, score=outcome.score, scorer=outcome.scorer)

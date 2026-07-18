@@ -305,6 +305,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** `measure_twice/scoring/deterministic.py`, `tests/anchors/*`, `tests/test_scoring.py`, `docs/methodology/01-deterministic-scoring-and-anchors.md`
 - **Done when:** anchor ordering gate green; parse-fail paths covered; re-scoring stored raw rows via `mt score` matches first-pass scores byte-for-byte
 - **Depends on:** 4
+- **Status:** DONE (2026-07-17)
 
 ### Step 6: LLM rubric judge — k=3 median + per-judge parse gate
 - **Problem:** `scoring/judge.py`: `SCORE:`/`RATIONALE:` two-line contract, k=3 samples per judge, median of parsed samples, clamp 0–10, per-judge parse-fail-rate gate (>0.5 → abort run), parse-fail vs invoke-error kept distinct. Judges are Claude via the claude_cli adapter.

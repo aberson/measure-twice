@@ -1,0 +1,28 @@
+{
+  "_comment": [
+    "FROZEN scorer calibration anchors (measurement-validity.md § calibrate with anchors before",
+    "comparing candidates). One known-good / known-garbage pair per DETERMINISTIC scorer. The CI",
+    "ordering gate (tests/anchors/test_anchors_gate.py) asserts score(good) > score(garbage) for",
+    "each pair, FOREVER: a scorer that cannot rank a known-good response above a known-garbage one",
+    "cannot pick winners. DO NOT edit ad hoc -- these define what 'the instrument works' means; a",
+    "change silently redefines the calibration baseline. The rubric scorer's anchor is Step 6's job",
+    "(scoring/judge.py), added when the LLM judge lands. Each pair drives make_deterministic_scorer,",
+    "so the gate exercises the PRODUCTION scoring path, not a re-implementation."
+  ],
+  "pairs": [
+    {
+      "scorer": "verdict",
+      "labels": ["flag", "pass"],
+      "expected": "flag",
+      "good": "VERDICT: flag\nRATIONALE: the handler dereferences a pointer that a prior branch left null.\n",
+      "garbage": "I have a lot of opinions about this diff, but I never actually commit to a call here.\n"
+    },
+    {
+      "scorer": "exact",
+      "labels": null,
+      "expected": "Paris",
+      "good": "  PARIS\n",
+      "garbage": "The capital in question is definitely somewhere in France, possibly Lyon."
+    }
+  ]
+}

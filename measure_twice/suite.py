@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import MISSING, asdict, dataclass, fields
 from pathlib import Path
@@ -47,6 +48,24 @@ from switchboard.config import _SAFE_NAME_RE  # type: ignore[import-untyped]
 
 # v1 scoring types (plan §4). ``verdict``/``exact`` are deterministic; ``rubric`` is the LLM judge.
 ALLOWED_SCORING_TYPES: frozenset[str] = frozenset({"verdict", "exact", "rubric"})
+
+# The exact-scoring regex-mode compile contract, owned HERE (the low layer) so the load-time
+# validator (``Suite.__post_init__``) and the score-time matcher
+# (``scoring.deterministic.exact_match``) compile a pattern the IDENTICAL way — same ``.strip()``
+# normalization, same flags — with no cross-layer drift. ``scoring`` imports this; ``suite`` never
+# imports ``scoring`` (one-way dependency, no cycle). Flags: case-insensitive + ``.`` spans
+# newlines, matching the literal mode's trim+casefold spirit.
+_EXACT_REGEX_FLAGS = re.IGNORECASE | re.DOTALL
+
+
+def compile_exact_pattern(expected: str) -> re.Pattern[str]:
+    """Compile an ``exact`` regex ``expected`` (``.strip()``-ed, with :data:`_EXACT_REGEX_FLAGS`).
+
+    Raises ``re.error`` on an uncompilable pattern; callers map that to their own fail-loud sentinel
+    (``SuiteError`` at load, ``ScoringError`` at score). One source of truth for the compile so a
+    pattern that validates at load is byte-for-byte the pattern that matches at score time.
+    """
+    return re.compile(expected.strip(), _EXACT_REGEX_FLAGS)
 
 
 class SuiteError(ValueError):
@@ -161,19 +180,44 @@ def _reject_unknown_and_missing(
 
 @dataclass(frozen=True, slots=True)
 class ScoringSpec:
-    """How a suite's items are scored: a ``type`` from :data:`ALLOWED_SCORING_TYPES` plus, for
-    label-based scoring (e.g. ``verdict``), an optional list of the permitted ``labels``."""
+    """How a suite's items are scored: a ``type`` from :data:`ALLOWED_SCORING_TYPES`, plus, for
+    label-based scoring (``verdict``), the permitted ``labels``, and, for ``exact`` scoring, an
+    optional ``regex`` flag selecting full-match regex mode instead of literal equality.
+
+    ``labels`` must be casefold-DISTINCT: the deterministic verdict matcher is case-insensitive, so
+    case-variant duplicates (``["Flag", "flag"]``) would make one occurrence match both patterns and
+    silently score every correct answer a parse-fail — the exact "silent parse-fail drags the mean
+    to zero" failure measurement-validity warns about, mass-produced. So it is rejected at load
+    (fail loud), the same stance as the parse-fail-marker collision. ``regex`` is meaningful only
+    for ``exact`` and is rejected on any other type (a modifier that would silently do nothing).
+    """
 
     type: str
     labels: list[str] | None = None
+    regex: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.type, str) or self.type not in ALLOWED_SCORING_TYPES:
             raise SuiteError(
                 f"scoring.type must be one of {sorted(ALLOWED_SCORING_TYPES)}, got {self.type!r}"
             )
+        if not isinstance(self.regex, bool):
+            raise SuiteError(f"scoring.regex must be a bool, got {self.regex!r}")
+        if self.regex and self.type != "exact":
+            raise SuiteError(
+                f"scoring.regex is only valid for exact scoring, not type {self.type!r}"
+            )
         if self.labels is not None:
             _validate_str_list(self.labels, "scoring.labels")
+            seen: dict[str, str] = {}
+            for label in self.labels:
+                key = label.casefold()
+                if key in seen:
+                    raise SuiteError(
+                        "scoring.labels contains case-variant duplicate label(s): "
+                        f"{seen[key]!r} and {label!r} collide case-insensitively"
+                    )
+                seen[key] = label
 
     @classmethod
     def from_mapping(cls, data: object) -> ScoringSpec:
@@ -258,6 +302,21 @@ class Suite:
             seen.add(item.id)
         if dupes:
             raise SuiteError(f"duplicate item id(s): {sorted(dupes)}")
+        # Fail loud at LOAD on a bad regex `expected` (scoring.regex=true): compile every item's
+        # pattern here, exactly like verdict labels are validated at load, so an uncompilable
+        # pattern aborts BEFORE any run — never a score-time exception. This is the ONLY input-
+        # independent raise path the deterministic scorer had; validating it here removes it. Both
+        # load_suite and the per-run suite-snapshot reload go through this constructor, so a corrupt
+        # snapshot with a bad pattern also fails loud when `mt score` reopens it.
+        if self.scoring.regex:
+            for item in self.items:
+                try:
+                    compile_exact_pattern(item.expected)
+                except re.error as exc:
+                    raise SuiteError(
+                        f"item {item.id!r} expected {item.expected!r} is not a valid regex "
+                        f"(scoring.regex=true): {exc}"
+                    ) from exc
 
     @property
     def item_hash(self) -> str:
