@@ -4,7 +4,15 @@ Subcommands are added at the single extension point below (``_build_parser``): r
 subparser and a handler keyed by the same command name. Each handler takes the parsed
 ``argparse.Namespace`` and returns an ``int`` exit code, so dispatch stays uniform and ``main``
 never grows a per-command branch. Registered so far: ``validate`` (Step 2), ``run`` + ``score``
-(Step 4).
+(Step 4), ``report`` + ``smoke`` (Step 7).
+
+``mt smoke`` is the end-to-end pipeline gate: it runs the 2-item smoke suite through the FULL
+production path (suite -> runner -> deterministic scorer -> report) with one REAL request per item,
+and its EXIT CODE is the gate (0 iff a scored report with zero parse failures/errors/no-response).
+The same :class:`CliDeps` seam that makes ``run``/``score`` offline-testable makes ``smoke``'s
+wiring offline-testable: an injected stub adapter factory both provides the canned responses AND
+signals the test path, so the real reachability preflights (claude-CLI-on-PATH / endpoint-up, never
+auto-spawn — Decision 12) are skipped and ZERO live calls happen in the suite.
 
 Dependency-injection seam (offline tests): ``run`` and ``score`` reach the adapters + the scorer
 through a :class:`CliDeps` bundle. Production leaves the deps ``None`` so each command AUTO-SELECTS
@@ -19,7 +27,10 @@ with ZERO live calls.
 from __future__ import annotations
 
 import argparse
+import shutil
+import socket
 import sys
+import urllib.parse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +39,15 @@ from measure_twice import __version__, runner
 from measure_twice.adapters.claude_cli import BudgetExhaustedError, CallBudget, RunnerFactory
 from measure_twice.adapters.local import TransportFactory
 from measure_twice.config import ConfigError, load_config
+from measure_twice.report import (
+    ReportError,
+    RunReport,
+    build_comparison,
+    build_run_report,
+    render_comparison,
+    render_run_report,
+    run_report_jsonl,
+)
 from measure_twice.runner import RunError, Scorer, collect_only_scorer
 from measure_twice.scoring import (
     JUDGE_SAMPLE_K,
@@ -41,6 +61,18 @@ from measure_twice.suite import ScoringSpec, SuiteError, load_suite
 
 # A subcommand handler: consumes the parsed namespace, returns a process exit code.
 Handler = Callable[[argparse.Namespace], int]
+
+# The canonical 2-item smoke suite, resolved PACKAGE-relative (``<repo>/suites/smoke.json``) so
+# ``mt smoke`` finds it regardless of the operator's cwd. ``--suite`` overrides it.
+_SMOKE_SUITE_PATH = Path(__file__).resolve().parent.parent / "suites" / "smoke.json"
+
+# The single claude tier / single local model ``mt smoke`` sweeps (1 model x 2 items = 2 calls).
+_SMOKE_CLAUDE_MODEL = "haiku"
+_SMOKE_LOCAL_MODEL = "general-35b"
+
+# A short TCP-connect probe for the ``mt smoke --local`` reachability preflight — a liveness check,
+# NOT a model call and NOT an auto-spawn (Decision 12: the local endpoint is operator-started).
+_LOCAL_PROBE_TIMEOUT_S = 2.0
 
 # The stderr note printed when a rubric suite is SWEPT (mt run): the sweep only collects raw
 # responses; the LLM judge scores them at `mt score` time (the per-judge gate is run-level, so
@@ -261,6 +293,161 @@ def _handle_score(args: argparse.Namespace, deps: CliDeps) -> int:
     return _score_cellwise(args.run_id, out_dir, scorer)
 
 
+def _handle_report(args: argparse.Namespace) -> int:
+    """``mt report <run_id> [--compare <run_id>...] [--jsonl] [--out <dir>]``: render a run report.
+
+    Without ``--compare``: the per-run markdown report (or per-model JSONL with ``--jsonl``). With
+    ``--compare``: the cross-run comparison table over the given runs, which FAILS LOUD (non-zero
+    exit) if their suite hashes differ — a changed hash is a different instrument (plan §3), never a
+    silent cross-instrument comparison. Prints the rendering to stdout AND writes it under
+    ``<out>/reports/`` (plan §7); a :class:`ReportError` surfaces as a clean non-zero exit.
+    """
+    out_dir = Path(args.out)
+    try:
+        if args.compare:
+            comparison = build_comparison([args.run_id, *args.compare], out_dir)
+            rendered = render_comparison(comparison)
+            dest_name = f"compare-{args.run_id}.md"
+        elif args.jsonl:
+            rendered = run_report_jsonl(build_run_report(args.run_id, out_dir))
+            dest_name = f"{args.run_id}.jsonl"
+        else:
+            rendered = render_run_report(build_run_report(args.run_id, out_dir))
+            dest_name = f"{args.run_id}.md"
+    except ReportError as exc:
+        print(f"report: {exc}", file=sys.stderr)
+        return 1
+    print(rendered)
+    reports_dir = out_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    dest = reports_dir / dest_name
+    dest.write_text(rendered if rendered.endswith("\n") else rendered + "\n", encoding="utf-8")
+    print(f"wrote {dest}", file=sys.stderr)
+    return 0
+
+
+def _local_endpoint_unreachable(base_url: str) -> str | None:
+    """A short TCP-connect liveness probe of the local endpoint; a message if it is unreachable.
+
+    Returns ``None`` when a socket connects (the operator-started endpoint is up), else a clear
+    fail-loud message. This NEVER auto-spawns the endpoint (Decision 12) — it only observes.
+    """
+    parts = urllib.parse.urlsplit(base_url)
+    host = parts.hostname or "localhost"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=_LOCAL_PROBE_TIMEOUT_S):
+            return None
+    except OSError:
+        return (
+            f"local endpoint unreachable at {base_url}; it is operator-started and is NEVER "
+            "auto-spawned (Decision 12) — start it "
+            "(`..\\switchboard\\scripts\\start-offload.ps1`) then retry"
+        )
+
+
+def _smoke_gate(mode: str, report: RunReport, result: runner.RunResult) -> int:
+    """The exit-code gate: 0 iff the smoke run produced a scored report with ZERO failures.
+
+    A smoke run is the pipeline's end-to-end health check, so ANY unhealthy signal fails it: a
+    budget abort, an error/defer row, a no-response row, a verdict parse failure, or an empty
+    (no-scored-row) report. On any of these the gate prints what failed and returns 1; else PASS and
+    returns 0. The rendered report itself is printed by the caller BEFORE this gate runs.
+    """
+    problems: list[str] = []
+    if result.aborted:
+        problems.append(f"sweep aborted (budget {result.budget_used}/{result.budget_max})")
+    if report.total_error:
+        problems.append(f"{report.total_error} error/defer row(s)")
+    if report.total_no_response:
+        problems.append(f"{report.total_no_response} no-response row(s)")
+    if report.total_parse_fail:
+        problems.append(f"{report.total_parse_fail} parse failure(s)")
+    if report.total_scored == 0:
+        problems.append("no scored rows (empty report)")
+    if problems:
+        print(f"smoke [{mode}]: FAIL - " + "; ".join(problems), file=sys.stderr)
+        return 1
+    print(
+        f"smoke [{mode}]: PASS - {report.total_scored} cell(s) scored, "
+        "0 parse failures, 0 errors, 0 no-response"
+    )
+    return 0
+
+
+def _handle_smoke(args: argparse.Namespace, deps: CliDeps) -> int:
+    """``mt smoke [--claude|--local]``: the end-to-end pipeline smoke gate (exit code IS the gate).
+
+    Runs the 2-item smoke suite through the FULL production path (suite -> runner -> deterministic
+    scorer -> report) with ONE REAL request per item, no mocks: ``--claude`` (the default) sweeps
+    ``haiku`` via the claude adapter, ``--local`` sweeps ``general-35b`` via the local adapter. Exit
+    0 iff a scored report is produced with zero parse failures / errors / no-response cells; else a
+    clear non-zero exit (see :func:`_smoke_gate`).
+
+    Fail-loud reachability preflights (Decision 12, ``measurement-validity.md`` § fail loud):
+    ``--claude`` aborts if the ``claude`` CLI is not on PATH; ``--local`` aborts (never auto-spawns)
+    if the operator-started endpoint is unreachable. Both preflights are SKIPPED when a stub adapter
+    factory is injected (the DI seam) — so the smoke WIRING is fully offline-testable with ZERO live
+    calls, while production runs the real preflight + real adapters.
+    """
+    mode = "local" if args.local else "claude"
+    try:
+        config = load_config(args.config)
+        suite = load_suite(args.suite)
+    except (ConfigError, SuiteError) as exc:
+        print(f"smoke: {exc}", file=sys.stderr)
+        return 1
+
+    if mode == "claude":
+        roster = [_SMOKE_CLAUDE_MODEL]
+        if deps.claude_runner_factory is None and shutil.which("claude") is None:
+            print(
+                "smoke: the `claude` CLI is not on PATH / not invocable; `mt smoke --claude` needs "
+                "the authenticated claude CLI",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        roster = [_SMOKE_LOCAL_MODEL]
+        if deps.local_transport_factory is None:
+            unreachable = _local_endpoint_unreachable(config.local_base_url)
+            if unreachable is not None:
+                print(f"smoke: {unreachable}", file=sys.stderr)
+                return 1
+
+    # The REAL deterministic scorer (smoke tests the true scorer wiring, not an injected stub), so a
+    # canned-but-unparseable response genuinely trips the parse-fail gate.
+    try:
+        scorer, _note = _select_scorer(suite.scoring)
+    except ScoringError as exc:
+        print(f"smoke: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        result = runner.run(
+            suite=suite,
+            config=config,
+            out_dir=Path(args.out),
+            roster=roster,
+            samples_per_cell=1,
+            max_calls=len(roster) * len(suite.items),  # exactly the needed cells
+            scorer=scorer,
+            local_transport_factory=deps.local_transport_factory,
+            claude_runner_factory=deps.claude_runner_factory,
+        )
+    except RunError as exc:
+        print(f"smoke: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        report = build_run_report(result.run_id, Path(args.out))
+    except ReportError as exc:
+        print(f"smoke: could not produce a report: {exc}", file=sys.stderr)
+        return 1
+    print(render_run_report(report))
+    return _smoke_gate(mode, report, result)
+
+
 def _build_parser(
     deps: CliDeps,
 ) -> tuple[
@@ -272,8 +459,9 @@ def _build_parser(
     and adding its handler to ``handlers`` (keyed by the same command name). ``subparsers`` is
     bound and returned — not discarded — so a step can register a subcommand without a second
     ``add_subparsers`` call (which would raise ``ValueError``). ``deps`` is threaded into the
-    ``run``/``score`` handlers (bound via small closures) so the DI seam reaches them without
-    changing the uniform ``Handler`` signature.
+    handlers that need the DI seam — ``run``, ``score``, and ``smoke`` (each bound via a small
+    closure) — so the seam reaches them without changing the uniform ``Handler`` signature;
+    ``validate`` and ``report`` are read-only/offline and take no ``deps``.
     """
     parser = argparse.ArgumentParser(
         prog="mt",
@@ -364,6 +552,74 @@ def _build_parser(
         return _handle_score(args, deps)
 
     handlers["score"] = _score
+
+    report_parser = subparsers.add_parser(
+        "report",
+        help="render a per-run markdown report, or a cross-run comparison (--compare)",
+        description="Render a stored run's per-model report (0-100 suite score + item/no-response/"
+        "parse-fail/error counts), or a cross-run comparison table with --compare. Cross-run "
+        "comparison requires EQUAL suite hashes (a changed hash is a different instrument); a "
+        "mismatch fails loud.",
+    )
+    report_parser.add_argument("run_id", metavar="<run_id>", help="the run id to report on")
+    report_parser.add_argument(
+        "--compare",
+        nargs="+",
+        metavar="<run_id>",
+        help="also-compare run id(s); renders a cross-run table (equal suite hash required)",
+    )
+    report_parser.add_argument(
+        "--jsonl",
+        action="store_true",
+        help="emit per-model JSONL instead of markdown (ignored with --compare)",
+    )
+    report_parser.add_argument(
+        "--out",
+        default="data",
+        metavar="<dir>",
+        help="data home the run(s) live under (default: data)",
+    )
+    handlers["report"] = _handle_report
+
+    smoke_parser = subparsers.add_parser(
+        "smoke",
+        help="end-to-end pipeline smoke gate (2 real calls; exit code is the gate)",
+        description="Run the 2-item smoke suite end-to-end (suite -> runner -> scorer -> report) "
+        "with one REAL request per item. Exit 0 iff a scored report is produced with zero parse "
+        "failures/errors/no-response. --claude (default) sweeps haiku; --local sweeps the "
+        "operator-started local endpoint (never auto-spawned).",
+    )
+    smoke_mode = smoke_parser.add_mutually_exclusive_group()
+    smoke_mode.add_argument(
+        "--claude",
+        action="store_true",
+        help="sweep the smoke suite against haiku via the claude CLI (default)",
+    )
+    smoke_mode.add_argument(
+        "--local",
+        action="store_true",
+        help="sweep the smoke suite against the operator-started local endpoint",
+    )
+    smoke_parser.add_argument(
+        "--suite",
+        default=str(_SMOKE_SUITE_PATH),
+        metavar="<path>",
+        help="suite to smoke (default: the canonical 2-item smoke suite)",
+    )
+    smoke_parser.add_argument(
+        "--out",
+        default="data",
+        metavar="<dir>",
+        help="data home; the smoke run is written under <dir>/runs/ (default: data)",
+    )
+    smoke_parser.add_argument(
+        "--config", metavar="<path>", help="explicit config path (else the resolution order)"
+    )
+
+    def _smoke(args: argparse.Namespace) -> int:
+        return _handle_smoke(args, deps)
+
+    handlers["smoke"] = _smoke
 
     # Later steps: subparsers.add_parser("<command>", ...); handlers["<command>"] = <handler>.
     return parser, subparsers, handlers

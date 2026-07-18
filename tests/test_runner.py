@@ -24,11 +24,10 @@ import urllib.error
 from pathlib import Path
 
 import pytest
+from conftest import StubAdapters, _iid  # shared offline stub scaffolding (tests/conftest.py)
 
 from measure_twice.adapters import claude_cli
 from measure_twice.adapters.base import RC_OS_ERROR, RC_UNREACHABLE
-from measure_twice.adapters.claude_cli import RunnerFactory, SubprocessResult
-from measure_twice.adapters.local import TransportFactory
 from measure_twice.cli import CliDeps, main
 from measure_twice.config import ENV_VAR, RunConfig
 from measure_twice.runner import (
@@ -69,12 +68,7 @@ MANIFEST_KEYS = {
 }
 
 
-# --- Builders ----------------------------------------------------------------------------
-
-
-def _iid(prompt: str) -> str:
-    """Recover an item id from a test prompt (``PROMPT::<id>``), or the prompt itself if plain."""
-    return prompt.split("::")[1] if "::" in prompt else prompt
+# --- Builders (StubAdapters / _openai_body / _claude_stdout / _iid live in conftest.py) ----
 
 
 def _suite(item_ids: list[str], *, name: str = "testsuite", scoring_type: str = "verdict") -> Suite:
@@ -96,85 +90,10 @@ def _suite(item_ids: list[str], *, name: str = "testsuite", scoring_type: str = 
     )
 
 
-def _openai_body(content: str, *, model: str = "local-x", finish_reason: str = "stop") -> str:
-    return json.dumps(
-        {
-            "id": "c",
-            "object": "chat.completion",
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": content},
-                    "finish_reason": finish_reason,
-                }
-            ],
-        }
-    )
-
-
-def _claude_stdout(result_text: str, *, model: str = "claude-x") -> str:
-    return json.dumps(
-        {
-            "type": "result",
-            "subtype": "success",
-            "is_error": False,
-            "result": result_text,
-            "model": model,
-        }
-    )
-
-
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     return [
         json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
-
-
-class StubAdapters:
-    """Offline stub factories for both adapters, sharing a call recorder.
-
-    ``local`` / ``claude`` are ``prompt -> behavior`` callables; a behavior returns the text to
-    echo (``""`` yields the no-response state), a ``BaseException`` to raise (transport failure ->
-    reason_class), or a ready-made :class:`SubprocessResult` (claude only). Default behavior echoes
-    a constant, so a suite whose prompts carry no ``::`` id (e.g. suites/smoke.json) still works.
-    """
-
-    def __init__(self, *, local=None, claude=None) -> None:
-        self.local_behavior = local if local is not None else (lambda prompt: "loc-answer")
-        self.claude_behavior = claude if claude is not None else (lambda prompt: "cl-answer")
-        self.local_calls: list[str] = []
-        self.claude_calls: list[str] = []
-
-    def local_factory(self) -> TransportFactory:
-        def factory() -> object:
-            def transport(url: str, data: bytes, timeout: float) -> str:
-                body = json.loads(data.decode("utf-8"))
-                prompt = body["messages"][0]["content"]
-                self.local_calls.append(prompt)
-                out = self.local_behavior(prompt)
-                if isinstance(out, BaseException):
-                    raise out
-                return _openai_body(out)
-
-            return transport
-
-        return factory  # type: ignore[return-value]
-
-    def claude_factory(self) -> RunnerFactory:
-        def factory() -> object:
-            def runner(argv: object, input_text: str, timeout: float) -> SubprocessResult:
-                self.claude_calls.append(input_text)
-                out = self.claude_behavior(input_text)
-                if isinstance(out, BaseException):
-                    raise out
-                if isinstance(out, SubprocessResult):
-                    return out
-                return SubprocessResult(0, _claude_stdout(out), "")
-
-            return runner
-
-        return factory  # type: ignore[return-value]
 
 
 # --- Full sweep --------------------------------------------------------------------------

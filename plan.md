@@ -325,6 +325,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** `measure_twice/report.py`, `mt smoke`, `tests/test_report.py`
 - **Done when:** `uv run mt smoke --claude` exits 0 in under 60s producing a scored report with 0 parse failures; report renders for a stub multi-model run
 - **Depends on:** 6
+- **Status:** DONE (2026-07-17)
 
 **Phase B — Evidence ledger + tier map**
 
