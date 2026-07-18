@@ -177,7 +177,7 @@ measure-twice/
   measure_twice/
     __init__.py
     config.py  suite.py  runner.py  ledger.py  author.py  report.py  cli.py
-    adapters/   local.py  claude_cli.py
+    adapters/   base.py  local.py  claude_cli.py
     scoring/    deterministic.py  judge.py
     analyze/    calibrate.py  profile.py  agreement.py
   suites/                      # cross-cutting suites (tier-judging-v*.json, smoke.json)
@@ -247,6 +247,8 @@ Built via `/build-phase` per phase, one worktree-isolated `/build-step` per step
 | D | 15–17 | Profiling + first measurements | M3 (walkthrough) | #24 |
 
 Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-expedite`.
+
+**Phase A — Core engine: COMPLETE (2026-07-17).** Steps 1–7 shipped + merged to `master` (issues #1–#7 closed; commits `54238fc`..`9cfd676`). 257 tests passing; `mypy --strict` / `ruff` / `ruff format --check` all clean; the live `mt smoke --claude` pipeline gate passed end-to-end (haiku 100.0, 0 parse-failures / 0 errors / 0 no-response). Each step's inline `**Status:** DONE` line records its completion. Next: **M1** local-endpoint smoke (#18, operator-run); Phases B–D pending.
 
 ### Automated Steps
 

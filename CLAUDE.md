@@ -48,7 +48,7 @@ Suites carry ALL item content (no prompt templates in adapters — the fallback-
 
 ## Current state
 
-Prep complete (2026-07-17), no code yet: repo public, issues #1–#20 + umbrellas #21–#24 synced, plan-review/plan-wrap READY (Steps 2/4/5 stakes-routed `--reviewers deep`). Next: `/build-phase --plan plan.md --phase A` (Steps 1–7; goal pair in `dev/.claude/task-state/handoff-prompt.md`). Build on the pinned Opus default.
+**Phase A (core engine) COMPLETE** (2026-07-17): Steps 1–7 shipped + merged to master (issues #1–#7 closed) — `config` resolver, `suite` schema + canonical item-hash + `mt validate`, model `adapters` (local OpenAI-compat + `claude` CLI, both behind DI seams), the sweep `runner` (append-only JSONL, cell-level resume, budgets, no-response force-0), deterministic verdict/exact `scoring` + the §5.6 parse spine + frozen anchors, the k=3-median rubric `judge` (per-judge parse-fail gate), and `report` + `mt smoke`. 257 tests, mypy --strict / ruff / format all clean; the live `mt smoke --claude` pipeline gate passes end-to-end (haiku 100.0, 0 parse-fails). Next (operator handoff): **M1** local-endpoint smoke (#18), then Phases B–D. Build on the pinned Opus default.
 
 ## Environment requirements
 

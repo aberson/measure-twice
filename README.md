@@ -2,7 +2,7 @@
 
 A local benchmarking toolkit for deciding **which model should do which job — with measurements instead of assertions**. It provides a Python package + `mt` CLI to author benchmark suites, sweep them across a roster of models (local OpenAI-compatible endpoints and Claude tiers), score results through calibrated instruments, and keep an **evidence ledger** that ties every model-routing claim to the run that backs it (or honestly marks it `ASSERTED`). The flagship deliverable is a *discriminative* dataset: scored 0–100, designed and iterated so no roster model saturates either end.
 
-> **Status:** plan-complete, pre-code. The full design lives in [`plan.md`](plan.md); build starts with Phase A (core engine).
+> **Status:** Phase A (core engine) complete — issues #1–#7 closed. 257 tests passing, 0 type errors, 0 lint violations; the live `mt smoke --claude` pipeline gate passes end-to-end (haiku 100.0, 0 parse-failures). Next: M1 local-endpoint smoke, then Phases B–D. Full design: [`plan.md`](plan.md).
 
 ## Why
 
