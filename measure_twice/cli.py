@@ -7,11 +7,13 @@ never grows a per-command branch. Registered so far: ``validate`` (Step 2), ``ru
 (Step 4).
 
 Dependency-injection seam (offline tests): ``run`` and ``score`` reach the adapters + the scorer
-through a :class:`CliDeps` bundle. Production leaves ``scorer=None`` so each command AUTO-SELECTS a
-deterministic scorer from the suite's ``scoring`` type (Step 5: verdict/exact -> the deterministic
-scorer; rubric -> collect-only until Step 6's judge lands); tests pass a ``CliDeps`` with stub
-factories and, where a scored path is exercised, an explicit stub ``scorer`` (which overrides
-auto-selection) so the whole ``mt run`` path is driven end to end with ZERO live calls.
+through a :class:`CliDeps` bundle. Production leaves the deps ``None`` so each command AUTO-SELECTS
+from the suite's ``scoring`` type: ``mt run`` sweeps + scores verdict/exact via the deterministic
+scorer (rubric is collected unscored, then judged at ``mt score`` time — the per-judge gate is
+run-level); ``mt score`` re-scores verdict/exact via the deterministic scorer and routes a rubric
+run through the k=3 median LLM judge PASS. Tests inject stub adapter factories + an explicit stub
+``scorer`` (deterministic path) or ``judge_caller`` (rubric path) so the whole path runs offline
+with ZERO live calls.
 """
 
 from __future__ import annotations
@@ -23,21 +25,29 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from measure_twice import __version__, runner
-from measure_twice.adapters.claude_cli import RunnerFactory
+from measure_twice.adapters.claude_cli import BudgetExhaustedError, CallBudget, RunnerFactory
 from measure_twice.adapters.local import TransportFactory
 from measure_twice.config import ConfigError, load_config
 from measure_twice.runner import RunError, Scorer, collect_only_scorer
-from measure_twice.scoring import ScoringError, make_deterministic_scorer
+from measure_twice.scoring import (
+    JUDGE_SAMPLE_K,
+    JudgeCaller,
+    ScoringError,
+    default_judge_caller,
+    make_deterministic_scorer,
+    make_rubric_run_scorer,
+)
 from measure_twice.suite import ScoringSpec, SuiteError, load_suite
 
 # A subcommand handler: consumes the parsed namespace, returns a process exit code.
 Handler = Callable[[argparse.Namespace], int]
 
-# The stderr note printed when a rubric suite is swept before Step 6's judge exists: responses are
-# collected unscored and can be re-scored later (Decision 10) once the judge lands.
+# The stderr note printed when a rubric suite is SWEPT (mt run): the sweep only collects raw
+# responses; the LLM judge scores them at `mt score` time (the per-judge gate is run-level, so
+# judging is a whole-run pass — Decision 10 re-runnable scoring).
 _RUBRIC_DEFER_NOTE = (
-    "note: rubric scoring is the LLM judge (Step 6); responses collected unscored — "
-    "re-score with `mt score <run_id>` once the judge lands"
+    "note: rubric scoring is the LLM judge; responses collected unscored — "
+    "run `mt score <run_id>` to judge them (k=3 median + per-judge parse-fail gate)"
 )
 
 
@@ -50,21 +60,29 @@ class CliDeps:
     a scored path, an explicit ``scorer`` so the CLI path is fully offline. ``scorer`` — when not
     ``None`` — overrides auto-selection for BOTH ``mt run`` (score-as-swept) and ``mt score``
     (re-score stored rows), so a stub scorer drives either command deterministically.
+
+    ``judge_caller`` is the rubric-judge DI seam: ``mt score`` on a rubric run routes through the
+    k=3 median judge pass, and a stub ``judge_caller`` (returning canned judge outputs) drives it
+    with ZERO live ``claude`` calls. Production leaves it ``None`` and builds the real
+    ``claude_call``-backed caller from the resolved config.
     """
 
     local_transport_factory: TransportFactory | None = None
     claude_runner_factory: RunnerFactory | None = None
     scorer: Scorer | None = None
+    judge_caller: JudgeCaller | None = None
 
 
 def _select_scorer(scoring: ScoringSpec) -> tuple[Scorer, str | None]:
-    """Pick the deterministic scorer for a suite's scoring type; rubric defers to Step 6.
+    """Pick the ``mt run`` scorer for a suite's scoring type; rubric is collected for `mt score`.
 
     Returns ``(scorer, note)``: verdict/exact -> the deterministic scorer (note ``None``); rubric ->
-    the collect-only scorer + a deferral note (so ``mt run`` still COLLECTS raw responses for a
-    later ``mt score``, and ``mt score`` leaves them pending — a clean documented behavior, never a
-    crash). A verdict suite with no labels (or one reserving the parse-fail marker) raises
-    :class:`~measure_twice.scoring.ScoringError`, surfaced by the handler as a clean non-zero exit.
+    the collect-only scorer + a deferral note (so ``mt run`` still COLLECTS raw responses, which the
+    k=3 median judge PASS scores at ``mt score`` time — the per-judge gate is run-level, so judging
+    is a whole-run pass, not a per-cell sweep scorer). A verdict suite with no labels (or one
+    reserving the parse-fail marker) raises :class:`~measure_twice.scoring.ScoringError`, surfaced
+    by the handler as a clean non-zero exit. Used by ``mt run`` only — ``mt score`` routes rubric to
+    :func:`_score_rubric` directly.
     """
     if scoring.type == "rubric":
         return collect_only_scorer, _RUBRIC_DEFER_NOTE
@@ -155,40 +173,92 @@ def _handle_run(args: argparse.Namespace, deps: CliDeps) -> int:
     return 0
 
 
-def _handle_score(args: argparse.Namespace, deps: CliDeps) -> int:
-    """``mt score <run_id>``: (re)score a stored run's raw responses WITHOUT re-calling models.
+def _print_score_summary(run_id: str, result: runner.ScoreResult) -> None:
+    """Print the shared ``<run_id>: <N> rows, <M> scored, <K> no-response`` one-liner."""
+    print(
+        f"{run_id}: {result.total} rows, {result.scored} scored, {result.no_response} no-response"
+    )
 
-    Applies the scorer to each stored real response (force-0 no-response rows stay 0, error rows
-    stay untouched), rewrites the scored fields, and prints
-    ``<run_id>: <N> rows, <M> scored, <K> no-response``. The scorer is auto-selected from the run's
-    OWN suite snapshot (the suite isn't re-supplied on this command) unless a stub is injected.
-    """
-    out_dir = Path(args.out)
-    if deps.scorer is not None:
-        scorer = deps.scorer
-    else:
-        try:
-            suite = runner.load_run_suite(args.run_id, out_dir)
-        except RunError as exc:
-            print(f"score: {exc}", file=sys.stderr)
-            return 1
-        try:
-            scorer, note = _select_scorer(suite.scoring)
-        except ScoringError as exc:
-            print(f"score: {exc}", file=sys.stderr)
-            return 1
-        if note is not None:
-            print(note, file=sys.stderr)
+
+def _score_cellwise(run_id: str, out_dir: Path, scorer: Scorer) -> int:
+    """Run the per-cell deterministic (re)score path + print its summary; map RunError to exit 1."""
     try:
-        result = runner.score_run(run_id=args.run_id, out_dir=out_dir, scorer=scorer)
+        result = runner.score_run(run_id=run_id, out_dir=out_dir, scorer=scorer)
     except RunError as exc:
         print(f"score: {exc}", file=sys.stderr)
         return 1
-    print(
-        f"{args.run_id}: {result.total} rows, {result.scored} scored, "
-        f"{result.no_response} no-response"
-    )
+    _print_score_summary(run_id, result)
     return 0
+
+
+def _score_rubric(args: argparse.Namespace, deps: CliDeps, out_dir: Path) -> int:
+    """(Re)score a rubric run via the k=3 median judge PASS (run-level per-judge parse-fail gate).
+
+    The judges + budget come from the resolved config (``--config`` else the resolution order); the
+    judge-caller is the injected stub (offline tests) or the real ``claude_call``-backed default. A
+    broken judge trips the per-judge gate: :class:`~measure_twice.scoring.judge.JudgeParseFailError`
+    (a ``ScoringError``) surfaces as a clean non-zero exit and the run store is left untouched (the
+    gate fires BEFORE any rewrite — ``score_run_batch``). A budget exhausted mid-pass likewise
+    aborts before any rewrite (a resumable interruption), so re-running with more budget is safe.
+    """
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        print(f"score: {exc}", file=sys.stderr)
+        return 1
+    judge_caller = deps.judge_caller
+    if judge_caller is None:
+        judge_caller = default_judge_caller(
+            config, CallBudget(config.max_calls), runner_factory=deps.claude_runner_factory
+        )
+    run_scorer = make_rubric_run_scorer(
+        judges=config.judges, judge_caller=judge_caller, k=JUDGE_SAMPLE_K
+    )
+    try:
+        result = runner.score_run_batch(run_id=args.run_id, out_dir=out_dir, run_scorer=run_scorer)
+    except (ScoringError, RunError) as exc:  # ScoringError covers JudgeParseFailError (the gate).
+        print(f"score: {exc}", file=sys.stderr)
+        return 1
+    except BudgetExhaustedError as exc:
+        # The default judge-caller consumes the call budget per sample; if it runs out mid-pass the
+        # store is untouched (the abort is before any rewrite). Surface a clean, resumable exit.
+        print(
+            f"score: judge call budget exhausted ({exc}); re-run with a larger budget",
+            file=sys.stderr,
+        )
+        return 1
+    _print_score_summary(args.run_id, result)
+    return 0
+
+
+def _handle_score(args: argparse.Namespace, deps: CliDeps) -> int:
+    """``mt score <run_id>``: (re)score a stored run's raw responses WITHOUT re-calling the models.
+
+    Auto-selects the scorer from the run's OWN suite snapshot (the suite isn't re-supplied): a
+    verdict/exact suite goes through the per-cell deterministic scorer; a rubric suite goes through
+    the k=3 median LLM judge PASS (:func:`_score_rubric` — which DOES make fresh judge calls, but
+    never re-invokes the models under test). An injected ``deps.scorer`` overrides auto-selection
+    for the deterministic path (the rubric path uses ``deps.judge_caller`` instead). Prints
+    ``<run_id>: <N> rows, <M> scored, <K> no-response``.
+    """
+    out_dir = Path(args.out)
+    if deps.scorer is not None:
+        return _score_cellwise(args.run_id, out_dir, deps.scorer)
+    try:
+        suite = runner.load_run_suite(args.run_id, out_dir)
+    except RunError as exc:
+        print(f"score: {exc}", file=sys.stderr)
+        return 1
+    if suite.scoring.type == "rubric":
+        return _score_rubric(args, deps, out_dir)
+    try:
+        scorer, note = _select_scorer(suite.scoring)
+    except ScoringError as exc:
+        print(f"score: {exc}", file=sys.stderr)
+        return 1
+    if note is not None:
+        print(note, file=sys.stderr)
+    return _score_cellwise(args.run_id, out_dir, scorer)
 
 
 def _build_parser(
@@ -283,6 +353,11 @@ def _build_parser(
         default="data",
         metavar="<dir>",
         help="data home the run lives under (default: data)",
+    )
+    score_parser.add_argument(
+        "--config",
+        metavar="<path>",
+        help="explicit config path for rubric judging (judges + budget); else the resolution order",
     )
 
     def _score(args: argparse.Namespace) -> int:

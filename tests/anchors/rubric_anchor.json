@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "FROZEN rubric-judge calibration anchor (measurement-validity.md § calibrate with anchors",
+    "before comparing candidates) — the LLM-judge counterpart to scorer_anchors.json. A single",
+    "known-good / known-garbage response pair for one rubric item. The CI ordering gate",
+    "(tests/anchors/test_rubric_anchor_gate.py) drives BOTH responses through the PRODUCTION rubric",
+    "path (scoring.judge.judge_run, k=3) with a STUBBED judge that scores by content -- high for the",
+    "good response, low for the garbage one -- and asserts score(good) > score(garbage), FOREVER.",
+    "The judge is stubbed (ZERO live claude calls) because this gate proves the SCORING PIPELINE",
+    "discriminates (k=3 median -> 0-10 -> normalize -> ordering), not that a live model grades well.",
+    "For a rubric suite the item's 'expected' field IS the rubric text (suites carry all content).",
+    "DO NOT edit ad hoc -- this defines what 'the rubric instrument discriminates' means."
+  ],
+  "prompt": "Explain what a base case is in a recursive function and why it matters.",
+  "rubric": "Award 9-10 for a correct explanation naming the base case AND the shrinking step; 0-2 for a vague or wrong non-answer.",
+  "good": "A base case is the condition that stops the recursion; each recursive call must shrink the input toward it, otherwise the calls never terminate.",
+  "garbage": "idk recursion is when a function does stuff and calls itself a bunch i think",
+  "high_score_line": "SCORE: 9\nRATIONALE: names the base case and the shrinking step.",
+  "low_score_line": "SCORE: 2\nRATIONALE: vague non-answer, no base case named."
+}

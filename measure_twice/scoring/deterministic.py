@@ -15,9 +15,11 @@ Two zero-model-call scorers back the flagship dataset's tier-ordering claims (pl
     step exists — every response deterministically matches or does not — so exact never emits
     ``PARSE_FAIL_MARKER``; its ``parsed`` field is the match verdict (``"match"`` / ``"no_match"``).
 
-``rubric`` scoring is the LLM judge and is **Step 6's** job (``scoring/judge.py``); this module's
-dispatcher (:func:`make_deterministic_scorer`) raises a clear ``NotImplementedError`` for it,
-keeping the seam clean for Step 6 to fill without touching this file.
+``rubric`` scoring is the LLM judge (``scoring/judge.py``) — a RUN-LEVEL pass, not a per-cell
+scorer, because its per-judge parse-fail gate accumulates across the whole run. This module's
+per-cell dispatcher (:func:`make_deterministic_scorer`) therefore raises a clear
+``NotImplementedError`` for ``rubric``: the runner/CLI routes a rubric suite to the judge pass
+(``scoring.judge.make_rubric_run_scorer`` -> ``runner.score_run_batch``) instead of this dispatcher.
 
 Purity / determinism (plan Decision 10, the Done-when: ``mt score`` re-scoring is byte-identical to
 inline scoring): every scorer is a pure function of ``(item, raw response)`` — no randomness, no
@@ -359,7 +361,7 @@ def suite_score(item_scores: Sequence[float]) -> float:
     return 100.0 * statistics.mean(item_scores)
 
 
-# --- The dispatcher (the runner/CLI seam; keeps rubric clean for Step 6) ------------------------
+# --- The dispatcher (the runner/CLI seam; rubric routes to the run-level judge pass) ------------
 
 
 def make_deterministic_scorer(scoring: ScoringSpec) -> Scorer:
@@ -372,10 +374,11 @@ def make_deterministic_scorer(scoring: ScoringSpec) -> Scorer:
     * ``"exact"`` -> the exact scorer, in literal or ``regex`` mode per ``scoring.regex`` (the
       suite-schema field wired through here, so the regex capability is reachable from a real suite,
       not dead — plan §4's "string/regex match").
-    * ``"rubric"`` -> ``NotImplementedError``: rubric scoring is the LLM judge (Step 6,
-      ``scoring/judge.py``). The runner/CLI must route a rubric suite away from this dispatcher
-      (collect-only until Step 6) rather than call it — this raise is the seam marker, not a
-      supported path.
+    * ``"rubric"`` -> ``NotImplementedError``: rubric scoring is the LLM judge
+      (``scoring/judge.py``), a RUN-LEVEL pass (its per-judge parse-fail gate accumulates across the
+      whole run), so it is not a per-cell :data:`Scorer`. The runner/CLI routes a rubric suite to
+      the judge pass (``scoring.judge.make_rubric_run_scorer`` -> ``runner.score_run_batch``) rather
+      than call this dispatcher — this raise is the seam marker, not a supported path.
 
     The returned scorer is pure and closes only over immutable label data, so it is safe to reuse
     across a whole sweep and to re-apply offline in ``mt score``.
@@ -408,8 +411,9 @@ def make_deterministic_scorer(scoring: ScoringSpec) -> Scorer:
 
     if scoring.type == "rubric":
         raise NotImplementedError(
-            "rubric scoring is the LLM judge (Step 6, scoring/judge.py); "
-            "make_deterministic_scorer handles only verdict/exact"
+            "rubric scoring is the LLM judge (scoring/judge.py), a run-level pass via "
+            "make_rubric_run_scorer -> runner.score_run_batch; make_deterministic_scorer "
+            "handles only the per-cell verdict/exact scorers"
         )
 
     # Unreachable in practice: ScoringSpec.__post_init__ already rejects any unknown type.

@@ -72,6 +72,7 @@ __all__ = [
     "RunError",
     "RunResult",
     "RunRow",
+    "RunScorer",
     "ScoreOutcome",
     "ScoreResult",
     "Scorer",
@@ -79,6 +80,7 @@ __all__ = [
     "load_run_suite",
     "run",
     "score_run",
+    "score_run_batch",
 ]
 
 # Which roster names route to the claude adapter; everything else is treated as a local model
@@ -827,4 +829,62 @@ def score_run(
             n_scored += 1
 
     _rewrite_rows(run_dir, rescored)
+    return ScoreResult(total=len(rows), scored=n_scored, no_response=n_no_response)
+
+
+# A RUN-LEVEL scorer: given ALL of a run's rows plus the suite's items-by-id, return the rescored
+# rows (same length + order). It is the seam :func:`score_run_batch` drives — the shape a scorer
+# that needs whole-run state (not just one cell) requires. The rubric judge (Step 6,
+# ``scoring/judge.py``) is its first user: the per-judge parse-fail gate accumulates across every
+# row and aborts ONCE a judge crosses the threshold, so it cannot be expressed as the per-cell
+# :data:`Scorer` (which sees one response at a time and cannot populate ``judge_scores``). The
+# callable MAY raise to abort the whole (re)score — :func:`score_run_batch` invokes it BEFORE any
+# file rewrite, so a fail-loud abort (e.g. the gate firing) never corrupts the run store.
+RunScorer = Callable[[Sequence[RunRow], Mapping[str, Item]], Sequence[RunRow]]
+
+
+def score_run_batch(
+    *,
+    run_id: str,
+    out_dir: str | Path,
+    run_scorer: RunScorer,
+) -> ScoreResult:
+    """Re-open a stored run and (re)score its rows through a RUN-LEVEL :data:`RunScorer`.
+
+    The whole-run counterpart to :func:`score_run` (which drives a per-cell :data:`Scorer`): a
+    scorer needing state across the entire run — the rubric judge's per-judge parse-fail gate, which
+    only fires once every row has been judged — receives every row at once and returns the rescored
+    set. Like :func:`score_run` it re-scores from the stored raw responses WITHOUT re-calling the
+    swept models (Decision 10); a rubric ``run_scorer`` DOES make fresh judge (Claude) calls, but
+    never re-invokes the models under test.
+
+    Ordering is fail-loud by construction: ``run_scorer`` is called (and may raise — e.g.
+    :class:`~measure_twice.scoring.judge.JudgeParseFailError`) BEFORE ``rows.jsonl`` is rewritten,
+    so an aborted (re)score leaves the run store byte-for-byte untouched — no partial write. The
+    rescored set must have exactly one row per input row (same length); a mismatch is a bug and
+    raises :class:`RunError` rather than silently truncating the store. ``response_raw`` on each row
+    is the ``run_scorer``'s to preserve (the rubric scorer only replaces the scored fields).
+    """
+    run_dir, suite = _open_run(run_id, out_dir)
+    items_by_id = {item.id: item for item in suite.items}
+    rows, _torn = _read_rows(run_dir)
+
+    # Call the run-level scorer BEFORE any rewrite: a raise here (the per-judge gate) must abort
+    # with the run store untouched. The gate's job is to refuse to emit poisoned scores, so a
+    # partial rewrite of some-scored/some-not rows would be exactly the silent-degradation the gate
+    # exists to prevent.
+    rescored = list(run_scorer(rows, items_by_id))
+    if len(rescored) != len(rows):
+        raise RunError(
+            f"run_scorer returned {len(rescored)} rows for {len(rows)} input rows "
+            "(a run-level scorer must return exactly one row per input row)"
+        )
+
+    _rewrite_rows(run_dir, rescored)
+    n_scored = sum(
+        1
+        for r in rescored
+        if r.error is None and r.scorer != NO_RESPONSE_SCORER and r.score is not None
+    )
+    n_no_response = sum(1 for r in rescored if r.scorer == NO_RESPONSE_SCORER)
     return ScoreResult(total=len(rows), scored=n_scored, no_response=n_no_response)

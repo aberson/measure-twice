@@ -315,6 +315,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** `measure_twice/scoring/judge.py`, rubric anchor pair, `tests/test_judge.py`, `docs/methodology/02-llm-judges.md`
 - **Done when:** offline tests prove median math (incl. even-parse-count), gate fires per-judge not pooled, rubric anchor ordering holds via stubbed judges
 - **Depends on:** 5
+- **Status:** DONE (2026-07-17)
 
 ### Step 7: Reports + claude-path smoke gate
 - **Problem:** `report.py` (per-run markdown, cross-run comparison keyed on equal suite hash) and `mt smoke --claude`: run `suites/smoke.json` against haiku for real — 1 real request per item, no mocks, end-to-end suite→runner→scorer→report. This is the pipeline smoke gate that must pass before any long sweep.

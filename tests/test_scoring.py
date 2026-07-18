@@ -195,8 +195,10 @@ def test_make_deterministic_scorer_dispatch_verdict_and_exact() -> None:
     assert e(_item("paris"), "Paris").score == 1.0
 
 
-def test_rubric_dispatch_raises_not_implemented_for_step6() -> None:
-    with pytest.raises(NotImplementedError, match="Step 6"):
+def test_rubric_dispatch_raises_not_implemented_pointing_to_judge_pass() -> None:
+    # The per-cell deterministic dispatcher does not score rubric — that is the run-level judge pass
+    # (scoring/judge.py). The raise is the seam marker; the CLI routes rubric there instead.
+    with pytest.raises(NotImplementedError, match="run-level pass"):
         make_deterministic_scorer(ScoringSpec(type="rubric"))
 
 
@@ -574,11 +576,11 @@ def test_load_run_suite_returns_snapshot(tmp_path: Path) -> None:
     assert reloaded.scoring.type == "verdict"
 
 
-def test_cli_run_rubric_suite_defers_to_step6(
+def test_cli_run_rubric_suite_defers_to_mt_score(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A rubric suite does NOT crash mt run: responses are collected unscored (pending) with a
-    clear stderr note deferring to Step 6's judge."""
+    clear stderr note deferring the judging to `mt score` (Step 6's LLM judge landed there)."""
     rubric_suite = {
         "suite": "rub",
         "version": 1,
@@ -609,4 +611,4 @@ def test_cli_run_rubric_suite_defers_to_step6(
     rows = [json.loads(line) for line in (run_dir / "rows.jsonl").read_text().splitlines()]
     assert len(rows) == 1
     assert rows[0]["score"] is None and rows[0]["scorer"] is None  # collected unscored (pending)
-    assert "Step 6" in capsys.readouterr().err  # the deferral note was surfaced
+    assert "mt score" in capsys.readouterr().err  # the deferral note points at `mt score`
