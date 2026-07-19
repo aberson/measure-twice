@@ -62,6 +62,7 @@ class StubAdapters:
         self.local_behavior = local if local is not None else (lambda prompt: "loc-answer")
         self.claude_behavior = claude if claude is not None else (lambda prompt: "cl-answer")
         self.local_calls: list[str] = []
+        self.local_timeouts: list[float] = []
         self.claude_calls: list[str] = []
 
     def local_factory(self) -> TransportFactory:
@@ -70,6 +71,7 @@ class StubAdapters:
                 body = json.loads(data.decode("utf-8"))
                 prompt = body["messages"][0]["content"]
                 self.local_calls.append(prompt)
+                self.local_timeouts.append(timeout)
                 out = self.local_behavior(prompt)
                 if isinstance(out, BaseException):
                     raise out

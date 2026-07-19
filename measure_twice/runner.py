@@ -495,6 +495,7 @@ def _sweep_local(
             cell.item.prompt,
             model=cell.model,
             config=config,
+            timeout=config.local_timeout_s,
             transport_factory=transport_factory,
         )
         _append_row(fh, _build_row(run_id, cell, result, scorer))

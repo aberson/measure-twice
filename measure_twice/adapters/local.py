@@ -33,7 +33,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from typing import Final, cast
+from typing import cast
 
 from measure_twice.adapters.base import (
     RC_BAD_ENVELOPE,
@@ -45,7 +45,7 @@ from measure_twice.adapters.base import (
     ModelCallResult,
     resolved_model_of,
 )
-from measure_twice.config import RunConfig
+from measure_twice.config import DEFAULT_LOCAL_TIMEOUT_S, RunConfig
 
 # A transport: given the POST url, the JSON request-body bytes, and a timeout (seconds), return
 # the decoded response-body text. It may raise ``TimeoutError`` / ``urllib.error.URLError`` /
@@ -55,10 +55,9 @@ Transport = Callable[[str, bytes, float], str]
 TransportFactory = Callable[[], Transport]
 
 # The local endpoint is called SEQUENTIALLY (single-GPU llama-swap), so one shared timeout is
-# fine. RunConfig carries no timeout field in v1 (frozen this step); this named default is the
-# fallback and any caller/runner may override it per call. A config-level ``local_timeout_s`` is a
-# clean future addition — thread it into the ``timeout`` parameter without a signature change.
-DEFAULT_LOCAL_TIMEOUT_S: Final[float] = 120.0
+# fine. ``DEFAULT_LOCAL_TIMEOUT_S`` is the one-source-of-truth fallback (defined in config,
+# imported above and used by ``local_chat`` below); the runner threads ``config.local_timeout_s``
+# per call, and any direct caller may still override it via the ``timeout=`` parameter.
 
 
 def _urllib_post(url: str, data: bytes, timeout: float) -> str:

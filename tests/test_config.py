@@ -16,10 +16,12 @@ import pytest
 from measure_twice import __version__
 from measure_twice.cli import main
 from measure_twice.config import (
+    ALLOWED_CONFIG_FIELDS,
     DEFAULT_CLAUDE_POOL,
     DEFAULT_JUDGES,
     DEFAULT_LOCAL_BASE_URL,
     DEFAULT_LOCAL_MAX_TOKENS,
+    DEFAULT_LOCAL_TIMEOUT_S,
     DEFAULT_MAX_CALLS,
     DEFAULT_ROSTER,
     DEFAULT_SAMPLES_PER_CELL,
@@ -272,3 +274,30 @@ def test_cli_version_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
 def test_cli_no_command_returns_nonzero() -> None:
     """A bare invocation with no subcommand has nothing to do -> non-zero exit."""
     assert main([]) == 1
+
+
+def test_local_timeout_s_default_matches_constant() -> None:
+    """Default local_timeout_s is DEFAULT_LOCAL_TIMEOUT_S (one source of truth), not a literal."""
+    assert RunConfig().local_timeout_s == DEFAULT_LOCAL_TIMEOUT_S == 120.0
+
+
+def test_local_timeout_s_from_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A config file may raise the local timeout (e.g. for cold model loads > the 120s default)."""
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    p = tmp_path / "measure-twice.json"
+    _write_json(p, {"local_timeout_s": 300})
+    cfg = load_config(str(p))
+    assert cfg.local_timeout_s == 300
+    assert "local_timeout_s" in ALLOWED_CONFIG_FIELDS  # auto-derived allow-list picks it up
+
+
+@pytest.mark.parametrize("bad", [0, -1, -0.5, "abc", True, None])
+def test_local_timeout_s_invalid_rejected(bad: object) -> None:
+    """Non-positive / non-numeric / bool timeouts fail loud (measurement-validity)."""
+    with pytest.raises(ConfigError, match="local_timeout_s"):
+        RunConfig(local_timeout_s=bad)  # type: ignore[arg-type]
+
+
+def test_local_timeout_s_accepts_float() -> None:
+    """A fractional-second timeout is a valid positive number."""
+    assert RunConfig(local_timeout_s=90.5).local_timeout_s == 90.5

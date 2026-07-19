@@ -134,7 +134,7 @@ Goal: a dataset scored 0–100 on which **no roster model scores 0 or 100**.
 
 All under `measure_twice/` (package at root, switchboard convention).
 
-- `config.py` — run config resolution: explicit `--config` → `$MEASURE_TWICE_CONFIG` → `<cwd>/measure-twice.json` → built-in defaults. The resolved source is recorded in every run manifest; a live run (`mt run`, `mt smoke`) **aborts** if the local endpoint is named in the roster but unreachable, or if the claude CLI is not invocable — startup checks, not warnings (measurement-validity § fail loud). Default roster: `general-35b`, `coder-30b` (local), `haiku`, `sonnet`, `opus` (claude CLI aliases). Budgets: `max_calls` per run (default 500), per-model timeout.
+- `config.py` — run config resolution: explicit `--config` → `$MEASURE_TWICE_CONFIG` → `<cwd>/measure-twice.json` → built-in defaults. The resolved source is recorded in every run manifest; a live run (`mt run`, `mt smoke`) **aborts** if the local endpoint is named in the roster but unreachable, or if the claude CLI is not invocable — startup checks, not warnings (measurement-validity § fail loud). Default roster: `general-35b`, `coder-30b` (local), `haiku`, `sonnet`, `opus` (claude CLI aliases). Budgets: `max_calls` per run (default 500); `local_timeout_s` per local call (default 120s — the runner threads it into the local adapter; raise it via config when cold model loads exceed the default, per §M1).
 - `suite.py` — schema, loader (abort on violation), canonical-JSON item hash, `validate` entry.
 - `adapters/local.py` — OpenAI-compatible chat call against `localhost:8080` reusing switchboard's error taxonomy (defer `reason_class` values: `unreachable, timeout, os_error, non_json_body, bad_envelope, truncated, bad_verdict` — `switchboard/switchboard/client.py`); reasoning-model handling (read `choices[0].message.content`, ignore `reasoning_content`; `max_tokens ≥ 2000` for verdicts — switchboard CLAUDE.md gotcha).
 - `adapters/claude_cli.py` — `claude -p --model <alias> --output-format json` subprocess; the prompt is passed via **stdin, never argv** (Windows argv >32K raises WinError 206 — `feedback_subprocess_large_arg_stdin_windows`); unwraps the JSON envelope; records the resolved model id from the envelope (drift detection); counts calls against the run budget; bounded parallelism (small pool), sequential against the local endpoint.
@@ -505,6 +505,7 @@ After all Automated Steps of a phase complete, the orchestrator prints the phase
   "roster": ["general-35b", "coder-30b", "haiku", "sonnet", "opus"],
   "local_base_url": "http://localhost:8080/v1",
   "local_max_tokens": 2000,
+  "local_timeout_s": 120,
   "claude_pool": 2,
   "samples_per_cell": 1,
   "judges": ["sonnet"],

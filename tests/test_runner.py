@@ -842,3 +842,24 @@ def test_claude_mid_wave_partial_refusal_resumes(tmp_path: Path) -> None:
         "a",
         "b",
     }
+
+
+def test_runner_threads_local_timeout_from_config(tmp_path: Path) -> None:
+    """run() passes config.local_timeout_s (not the hardcoded 120s default) to the local transport.
+
+    Integration through the production caller (run -> _sweep_local -> local_chat -> transport):
+    a stub transport records the timeout it received; a non-default config.local_timeout_s must
+    reach it, so the operator-tunable knob actually takes effect on a real sweep.
+    """
+    suite = _suite(["a", "b"])
+    stub = StubAdapters()
+    result = run(
+        suite=suite,
+        config=RunConfig(local_timeout_s=45.0),
+        out_dir=tmp_path,
+        roster=["general-35b"],  # a local model -> the local adapter path
+        local_transport_factory=stub.local_factory(),
+    )
+    assert not result.aborted
+    assert stub.local_timeouts  # the local transport was actually exercised
+    assert all(t == 45.0 for t in stub.local_timeouts)  # config value threaded, not the default

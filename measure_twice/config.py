@@ -56,6 +56,11 @@ from switchboard.config import (  # type: ignore[import-untyped]
 DEFAULT_ROSTER: list[str] = ["general-35b", "coder-30b", "haiku", "sonnet", "opus"]
 DEFAULT_LOCAL_BASE_URL = "http://localhost:8080/v1"
 DEFAULT_LOCAL_MAX_TOKENS = 2000
+# Per-call timeout (seconds) for the local endpoint. 120s comfortably covers a WARM
+# reasoning-model verdict (~16-60s); raise it via config when COLD model loads are expected
+# to exceed it (a large model swapping into VRAM can take minutes — plan §M1). The local
+# adapter imports this as its fallback default; the runner threads config.local_timeout_s per call.
+DEFAULT_LOCAL_TIMEOUT_S: float = 120.0
 DEFAULT_CLAUDE_POOL = 2
 DEFAULT_SAMPLES_PER_CELL = 1
 DEFAULT_JUDGES: list[str] = ["sonnet"]
@@ -101,6 +106,12 @@ def _validate_int_at_least(value: object, label: str, minimum: int) -> None:
         raise ConfigError(f"{label} must be an int >= {minimum}, got {value!r}")
 
 
+def _validate_positive_number(value: object, label: str) -> None:
+    # Seconds — accept int OR float; reject bool (an int subclass) and non-positive values.
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ConfigError(f"{label} must be a positive number of seconds, got {value!r}")
+
+
 def _validate_base_url(value: object) -> None:
     # Mirrors switchboard's base_url guard: http(s) only, no injection/path-traversal chars.
     if not isinstance(value, str) or not _BASE_URL_RE.match(value) or ".." in value:
@@ -121,6 +132,7 @@ class RunConfig:
     roster: list[str] = field(default_factory=lambda: list(DEFAULT_ROSTER))
     local_base_url: str = DEFAULT_LOCAL_BASE_URL
     local_max_tokens: int = DEFAULT_LOCAL_MAX_TOKENS
+    local_timeout_s: float = DEFAULT_LOCAL_TIMEOUT_S
     claude_pool: int = DEFAULT_CLAUDE_POOL
     samples_per_cell: int = DEFAULT_SAMPLES_PER_CELL
     judges: list[str] = field(default_factory=lambda: list(DEFAULT_JUDGES))
@@ -131,6 +143,7 @@ class RunConfig:
         _validate_name_list(self.roster, "roster")
         _validate_base_url(self.local_base_url)
         _validate_int_at_least(self.local_max_tokens, "local_max_tokens", MIN_LOCAL_MAX_TOKENS)
+        _validate_positive_number(self.local_timeout_s, "local_timeout_s")
         _validate_int_at_least(self.claude_pool, "claude_pool", 1)
         _validate_int_at_least(self.samples_per_cell, "samples_per_cell", 1)
         _validate_name_list(self.judges, "judges")
