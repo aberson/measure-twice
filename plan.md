@@ -339,6 +339,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** `measure_twice/ledger.py`, `tests/test_ledger.py` (incl. a fixture where a cited source mutates → audit flips row to STALE)
 - **Done when:** ledger round-trips; audit catches the mutated-source fixture; write of a MEASURED row without evidence/preregistration is rejected
 - **Depends on:** 1
+- **Status:** DONE (2026-08-09)
 
 ### Step 9: Populate the ledger + author the tier benchmark map
 - **Problem:** Convert the seed recon (`docs/research/tier-skills-benchmark-map.md`) into ledger rows — every tier-offload/tier-escalate/model-preference decision becomes a claim with real `file:lines` citations and honest status (expect ~1 MEASURED [A3 arms], 1-2 PARTIAL [cost incident, endpoint timings], the rest ASSERTED) — and author `docs/tier-benchmark-map.md`: the narrative map ("what's pinned and why"), with tables rendered from the ledger by `mt claims render` so doc and data cannot drift.
@@ -348,6 +349,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** populated `data/ledger/claims.jsonl` (≥15 claims), `docs/tier-benchmark-map.md`, `docs/methodology/03-claims-and-evidence.md`
 - **Done when:** `mt claims audit` passes fresh; every row's citation resolves; map's tables regenerate byte-identical from `mt claims render`; ≥15 claims covering both skills' rules, the three canonical Fable seeds, and the top-3 asserted-not-measured items from the recon
 - **Depends on:** 8
+- **Status:** DONE (2026-08-09)
 
 **Phase C — Domains investigation + flagship dataset**
 
@@ -359,6 +361,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** `docs/investigations/benchmark-domains.md`, `docs/methodology/04-domain-taxonomy.md`
 - **Done when:** doc contains all six required sections above, ≥10 cited external sources, and an explicit decision record; a fresh model could design flagship items from it alone
 - **Depends on:** none (parallel-safe with Phase B)
+- **Status:** DONE (2026-08-09)
 
 ### Step 11: Item-authoring pipeline
 - **Problem:** `author.py` + `mt author harvest|stub`: harvesters that mine real workspace artifacts into candidate items with provenance (skill-eval golden corpora at `.claude/skills/*/evals/golden/`, review-deep style/correctness verdict fixtures, git-history code snippets), plus `stub` mode emitting schema-valid item templates (id, tags, expected, difficulty_prior, provenance) for agent/operator authorship. Content-hash dedup across candidates.
@@ -368,6 +371,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** `measure_twice/author.py`, `tests/test_author.py` (fixture-driven)
 - **Done when:** harvest on committed fixtures yields ≥20 schema-valid candidates with provenance; dedup collapses a planted duplicate; stub output passes `mt validate`
 - **Depends on:** 2
+- **Status:** DONE (2026-08-09)
 
 ### Step 12: Flagship dataset v0 — tier-judging-v0
 - **Problem:** Author `suites/tier-judging-v0.json`: ≥100 `verdict`/`exact` items in the tier-routing judging domain (style calls, correctness calls, grading decisions) with curated gold answers, tags (lens, difficulty bucket, provenance class), `difficulty_prior` spread targeting the [5,95] band, per Step 10's decision record; plus flagship instrument anchors (gold/garbage response pairs through the real scorers).
@@ -377,6 +381,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Produces:** `suites/tier-judging-v0.json`, flagship anchor pairs, `docs/methodology/05-item-authoring.md`
 - **Done when:** `mt validate` passes; ≥100 items; every tag has ≥8 items (min-n); difficulty_prior histogram spans ≥4 buckets; anchor ordering gate green
 - **Depends on:** 10, 11
+- **Status:** DONE (2026-08-09)
 
 ### Step 13: Calibration sweep (observation run)
 - **Problem:** Run the full default roster (general-35b, coder-30b, haiku, sonnet, opus) over tier-judging-v0 via `mt run` — the first real end-to-end observation run. Local endpoint must be started by the operator first (`start-offload.ps1`); Claude portion budgeted ≤400 calls, tranche-resumable. Capture a findings note (timings, defer/error rates, anything surprising) — findings capture is a deliverable, not a side effect.

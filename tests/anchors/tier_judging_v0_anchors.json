@@ -1,0 +1,17 @@
+{
+  "_comment": [
+    "FROZEN flagship verdict anchors for tier-judging-v0.",
+    "Each pair is tied to a real curated suite item and is scored by the production",
+    "deterministic verdict path in tests/test_tier_judging_v0.py. They prove that the",
+    "flagship scorer recognizes a known-good verdict and rejects its opposed garbage",
+    "verdict; they are not model-run results or routing evidence."
+  ],
+  "pairs": [
+    {"item_id": "tjv0-001", "good": "VERDICT: pass\nRATIONALE: public name is descriptive.", "garbage": "VERDICT: flag\nRATIONALE: opposite call."},
+    {"item_id": "tjv0-002", "good": "{\"verdict\": \"flag\", \"reason\": \"unused import\"}", "garbage": "{\"verdict\": \"pass\", \"reason\": \"opposite call\"}"},
+    {"item_id": "tjv0-015", "good": "pass", "garbage": "flag"},
+    {"item_id": "tjv0-016", "good": "answer: flag", "garbage": "answer: pass"},
+    {"item_id": "tjv0-088", "good": "classification = pass", "garbage": "classification = flag"},
+    {"item_id": "tjv0-093", "good": "VERDICT: flag", "garbage": "VERDICT: pass"}
+  ]
+}

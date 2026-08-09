@@ -4,7 +4,7 @@ Subcommands are added at the single extension point below (``_build_parser``): r
 subparser and a handler keyed by the same command name. Each handler takes the parsed
 ``argparse.Namespace`` and returns an ``int`` exit code, so dispatch stays uniform and ``main``
 never grows a per-command branch. Registered so far: ``validate`` (Step 2), ``run`` + ``score``
-(Step 4), ``report`` + ``smoke`` (Step 7).
+(Step 4), ``report`` + ``smoke`` (Step 7), ``claims`` (Phase B), and ``author`` (Step 11).
 
 ``mt smoke`` is the end-to-end pipeline gate: it runs the 2-item smoke suite through the FULL
 production path (suite -> runner -> deterministic scorer -> report) with one REAL request per item,
@@ -38,7 +38,21 @@ from pathlib import Path
 from measure_twice import __version__, runner
 from measure_twice.adapters.claude_cli import BudgetExhaustedError, CallBudget, RunnerFactory
 from measure_twice.adapters.local import TransportFactory
+from measure_twice.author import (
+    AuthorError,
+    harvest,
+    make_stub_file,
+    render_harvest,
+    write_new_file,
+)
 from measure_twice.config import ConfigError, load_config
+from measure_twice.ledger import (
+    LedgerError,
+    audit_ledger,
+    load_ledger,
+    render_claim_list,
+    render_ledger,
+)
 from measure_twice.report import (
     ReportError,
     RunReport,
@@ -69,6 +83,14 @@ _SMOKE_SUITE_PATH = Path(__file__).resolve().parent.parent / "suites" / "smoke.j
 # The single claude tier / single local model ``mt smoke`` sweeps (1 model x 2 items = 2 calls).
 _SMOKE_CLAUDE_MODEL = "haiku"
 _SMOKE_LOCAL_MODEL = "general-35b"
+
+# The tracked evidence ledger is separate from gitignored run/report output.  Keep this a relative
+# CLI default so an operator can point ``mt`` at an alternate project checkout by changing cwd.
+_DEFAULT_LEDGER_PATH = "data/ledger/claims.jsonl"
+
+# Authoring sources live in the shared dev workspace, one level above this project repository.
+# The CLI remains explicit/overridable so tests and operators can use a dedicated checkout.
+_DEFAULT_WORKSPACE_ROOT = str(Path(__file__).resolve().parents[2])
 
 # A short TCP-connect probe for the ``mt smoke --local`` reachability preflight — a liveness check,
 # NOT a model call and NOT an auto-spawn (Decision 12: the local endpoint is operator-started).
@@ -326,6 +348,78 @@ def _handle_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_claims(args: argparse.Namespace) -> int:
+    """``mt claims list|audit|render``: inspect, audit, or render the evidence ledger.
+
+    ``audit`` is intentionally the only mutating operation: it can only transition a claim to
+    ``STALE`` when the live cited quote changed or became unreadable.  It never invents a fresh hash
+    or restores a claim after a later file edit.  A stale result exits non-zero, so
+    ``mt claims audit`` is a genuine freshness gate for the tier benchmark map.
+    """
+    ledger_path = Path(args.ledger)
+    try:
+        if args.claims_action == "list":
+            print(render_claim_list(load_ledger(ledger_path)))
+            return 0
+        if args.claims_action == "render":
+            print(render_ledger(load_ledger(ledger_path)), end="")
+            return 0
+
+        result = audit_ledger(ledger_path, Path(args.workspace_root))
+    except LedgerError as exc:
+        print(f"claims {args.claims_action}: {exc}", file=sys.stderr)
+        return 1
+
+    stale = result.stale_claim_ids
+    if stale:
+        print(
+            f"claims audit: STALE - {len(stale)} stale claim(s), "
+            f"{len(result.newly_stale)} newly marked"
+        )
+        for issue in result.issues:
+            print(
+                f"  {issue.claim_id} [{issue.source.file}:{issue.source.lines}]: {issue.reason}",
+                file=sys.stderr,
+            )
+        return 1
+    print(f"claims audit: PASS - {result.fresh_count} claim(s) fresh")
+    return 0
+
+
+def _handle_author(args: argparse.Namespace) -> int:
+    """``mt author harvest|stub``: collect source-grounded candidates or create a new suite stub.
+
+    Harvest output is intentionally candidate data, not a score claim.  It goes to stdout unless
+    ``--output`` is supplied; the output writer refuses to overwrite an existing artifact.  Stub
+    output is a full suite JSON document and is immediately suitable for ``mt validate``; its
+    content announces that it still needs human curation before a run can be interpreted.
+    """
+    try:
+        if args.author_action == "harvest":
+            result = harvest(args.source, Path(args.workspace_root))
+            rendered = render_harvest(result)
+            if args.output is None:
+                print(rendered, end="")
+            else:
+                destination = write_new_file(args.output, rendered)
+                print(f"author harvest: wrote {destination}")
+            print(
+                f"author harvest: {len(result.candidates)} candidate(s), "
+                f"{result.duplicates_dropped} semantic duplicate(s) dropped",
+                file=sys.stderr,
+            )
+            return 0
+
+        destination = make_stub_file(
+            args.suite, args.output or Path("suites") / f"{args.suite}.json"
+        )
+    except AuthorError as exc:
+        print(f"author {args.author_action}: {exc}", file=sys.stderr)
+        return 1
+    print(f"author stub: wrote {destination}")
+    return 0
+
+
 def _local_endpoint_unreachable(base_url: str) -> str | None:
     """A short TCP-connect liveness probe of the local endpoint; a message if it is unreachable.
 
@@ -580,6 +674,76 @@ def _build_parser(
         help="data home the run(s) live under (default: data)",
     )
     handlers["report"] = _handle_report
+
+    claims_parser = subparsers.add_parser(
+        "claims",
+        help="list, audit, or render the quote-hashed tier-claim evidence ledger",
+        description="Operate on the strict JSONL claim ledger. `audit` reads each cited source "
+        "quote and marks drifted claims STALE; it exits non-zero until a human refreshes them.",
+    )
+    claims_parser.add_argument(
+        "--ledger",
+        default=_DEFAULT_LEDGER_PATH,
+        metavar="<path>",
+        help="claims JSONL path (default: data/ledger/claims.jsonl)",
+    )
+    claims_parser.add_argument(
+        "--workspace-root",
+        default=str(Path(__file__).resolve().parents[2]),
+        metavar="<path>",
+        help="workspace root containing cited files (default: the shared dev workspace)",
+    )
+    claims_actions = claims_parser.add_subparsers(
+        dest="claims_action", required=True, metavar="<action>"
+    )
+    claims_actions.add_parser("list", help="print one compact line per claim")
+    claims_actions.add_parser(
+        "audit", help="mark source-drifted claims STALE; non-zero if any stale"
+    )
+    claims_actions.add_parser("render", help="render deterministic Markdown grouped by status")
+    handlers["claims"] = _handle_claims
+
+    author_parser = subparsers.add_parser(
+        "author",
+        help="harvest source-grounded item candidates or create a suite template",
+        description="Harvest only known workspace artifacts into candidate items, or create a new "
+        "schema-valid suite template. Harvested candidates are not benchmark evidence until their "
+        "gold and production scorer are curated.",
+    )
+    author_actions = author_parser.add_subparsers(
+        dest="author_action", required=True, metavar="<action>"
+    )
+    harvest_parser = author_actions.add_parser(
+        "harvest",
+        help="collect candidates from goldens, review-deep, git, or all",
+    )
+    harvest_parser.add_argument(
+        "source",
+        choices=("goldens", "review-deep", "git", "all"),
+        help="closed source selector; never an executable path",
+    )
+    harvest_parser.add_argument(
+        "--workspace-root",
+        default=_DEFAULT_WORKSPACE_ROOT,
+        metavar="<path>",
+        help="shared workspace root containing .claude and .review-deep sources",
+    )
+    harvest_parser.add_argument(
+        "--output",
+        metavar="<path>",
+        help="write a fresh candidate JSON file instead of printing it (refuses overwrites)",
+    )
+    stub_parser = author_actions.add_parser(
+        "stub",
+        help="write one fresh, schema-valid suite template",
+    )
+    stub_parser.add_argument("suite", metavar="<name>", help="safe suite name for the template")
+    stub_parser.add_argument(
+        "--output",
+        metavar="<path>",
+        help="target suite JSON path (default: suites/<name>.json; refuses overwrites)",
+    )
+    handlers["author"] = _handle_author
 
     smoke_parser = subparsers.add_parser(
         "smoke",
