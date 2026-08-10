@@ -8,3 +8,6 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .plan-expedite-state
+# Local session/handoff scratch — carries absolute operator paths; must never be
+# published from this public repo.
+.claude/
