@@ -48,7 +48,17 @@ Suites carry ALL item content (no prompt templates in adapters — the fallback-
 
 ## Current state
 
-**Phase A (core engine) COMPLETE** (2026-07-17): Steps 1–7 shipped + merged to master (issues #1–#7 closed) — `config` resolver, `suite` schema + canonical item-hash + `mt validate`, model `adapters` (local OpenAI-compat + `claude` CLI, both behind DI seams), the sweep `runner` (append-only JSONL, cell-level resume, budgets, no-response force-0), deterministic verdict/exact `scoring` + the §5.6 parse spine + frozen anchors, the k=3-median rubric `judge` (per-judge parse-fail gate), and `report` + `mt smoke`. 257 tests, mypy --strict / ruff / format all clean; the live `mt smoke --claude` pipeline gate passes end-to-end (haiku 100.0, 0 parse-fails). Next (operator handoff): **M1** local-endpoint smoke (#18), then Phases B–D. Build on the pinned Opus default.
+**Phase A (core engine) COMPLETE** (2026-07-17): Steps 1–7 shipped + merged to master (issues #1–#7 closed) — `config` resolver, `suite` schema + canonical item-hash + `mt validate`, model `adapters` (local OpenAI-compat + `claude` CLI, both behind DI seams), the sweep `runner` (append-only JSONL, cell-level resume, budgets, no-response force-0), deterministic verdict/exact `scoring` + the §5.6 parse spine + frozen anchors, the k=3-median rubric `judge` (per-judge parse-fail gate), and `report` + `mt smoke`. Step M1 local-endpoint smoke (#18) is closed.
+
+**Steps 8–12 LANDED on master** (2026-08-10, merged as `12dbb6c`; issues #8–#12 closed) — the `ledger` module + `mt claims list|audit|render`, the populated 28-claim evidence ledger + rendered `docs/tier-benchmark-map.md`, the benchmark-domains investigation, the item-authoring pipeline (`author.py`), and flagship dataset v0 `suites/tier-judging-v0.json`. Full suite from the repo root: **295 passed, 0 failed, 0 skipped**.
+
+Ledger citations are quote-hashed against the *shared dev workspace*, so a file move outside this repo can orphan them: the skill-mesh Phase 7 cutover renamed `.claude/skills-gpt/<skill>/SKILL-core.md` → `.claude/skills/<skill>/core.md` and stranded 9 claims. They were re-anchored at source (identical quote text, same digests). `mt claims audit` is the real freshness gate — and note it *mutates* the ledger, writing `STALE` back for any claim it cannot verify. If `test_every_citation_is_current_and_the_map_is_exactly_rendered` fails, fix the citation, never the assertion.
+
+**Next: canonical `plan.md` Steps 13–17** — 13 calibration sweep (observation run), 14 discriminative calibration + dataset iteration, 15 capability profiling, 16 first ledger measurements (observation run), 17 methodology rollup + README. Steps 13 and 16 are operator observation runs needing the local endpoint up.
+
+> **Do NOT build `plans/benchmark-operations-surfaces-plan.md` (Steps 18–24) yet.** That plan is APPROVED but *blocked*: its surfaces (suite catalog, instrument fingerprints, comparable-run leaderboard, refresh selector, `/change-benchmark`, observatory contract, real benchmark smoke) all read measurement output that Steps 13–17 have not produced. Steps 13–17 have **not started**. Build 18–24 before them and the surfaces render an empty or fabricated benchmark.
+
+Build on the pinned Opus default.
 
 ## Environment requirements
 
