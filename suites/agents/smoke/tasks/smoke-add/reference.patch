@@ -1,0 +1,10 @@
+diff --git a/calculator.py b/calculator.py
+index 6990760..12c1e74 100644
+--- a/calculator.py
++++ b/calculator.py
+@@ -3,4 +3,4 @@
+
+ def add(left: int, right: int) -> int:
+     """Return the sum of ``left`` and ``right``."""
+-    return left - right
++    return left + right

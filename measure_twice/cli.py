@@ -4,7 +4,9 @@ Subcommands are added at the single extension point below (``_build_parser``): r
 subparser and a handler keyed by the same command name. Each handler takes the parsed
 ``argparse.Namespace`` and returns an ``int`` exit code, so dispatch stays uniform and ``main``
 never grows a per-command branch. Registered so far: ``validate`` (Step 2), ``run`` + ``score``
-(Step 4), ``report`` + ``smoke`` (Step 7), ``claims`` (Phase B), and ``author`` (Step 11).
+(Step 4), ``report`` + ``smoke`` (Step 7), ``claims`` (Phase B), ``author`` (Step 11), and nested
+``agent validate`` (Step 25's offline structural validation for coding-agent benchmark suites,
+model registries, and execution profiles).
 
 ``mt smoke`` is the end-to-end pipeline gate: it runs the 2-item smoke suite through the FULL
 production path (suite -> runner -> deterministic scorer -> report) with one REAL request per item,
@@ -32,12 +34,14 @@ import socket
 import sys
 import urllib.parse
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from measure_twice import __version__, runner
 from measure_twice.adapters.claude_cli import BudgetExhaustedError, CallBudget, RunnerFactory
 from measure_twice.adapters.local import TransportFactory
+from measure_twice.agent_bench import AgentCliDeps
+from measure_twice.agent_bench.cli import register_agent_cli
 from measure_twice.author import (
     AuthorError,
     harvest,
@@ -125,6 +129,7 @@ class CliDeps:
     claude_runner_factory: RunnerFactory | None = None
     scorer: Scorer | None = None
     judge_caller: JudgeCaller | None = None
+    agent: AgentCliDeps = field(default_factory=AgentCliDeps)
 
 
 def _select_scorer(scoring: ScoringSpec) -> tuple[Scorer, str | None]:
@@ -784,6 +789,10 @@ def _build_parser(
         return _handle_smoke(args, deps)
 
     handlers["smoke"] = _smoke
+
+    # The sibling coding-agent pipeline registers through this same parser/handler extension seam.
+    # Its CLI module never imports this root module, preserving one-way dependencies.
+    register_agent_cli(parser, subparsers, handlers, deps.agent)
 
     # Later steps: subparsers.add_parser("<command>", ...); handlers["<command>"] = <handler>.
     return parser, subparsers, handlers

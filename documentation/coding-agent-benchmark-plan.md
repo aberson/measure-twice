@@ -1140,12 +1140,13 @@ report paths do not require inference.
 - **Type:** code
 - **Issue:** #27
 - **Flags:** --reviewers deep --isolation worktree
-- **Files:** `measure_twice/agent_bench/{__init__,models,analysis,suite,cli}.py`,
+- **Files:** `measure_twice/agent_bench/{__init__,_wire,_win32_contained,models,analysis,suite,cli}.py`,
   `measure_twice/cli.py`, `profiles/agent-models-candidates.json`,
   `profiles/agent-execution-v1.json`, `analysis-plans/agent-smoke-v1.json`,
   `suites/agents/smoke/`, `docs/agent-benchmark/smoke-preregistration.md`,
-  `.gitignore`,
-  `tests/agent_bench/test_models.py`, `tests/agent_bench/test_analysis.py`,
+  `.gitignore`, `.gitattributes`,
+  `tests/agent_bench/__init__.py` (package marker preventing collection collisions with the legacy
+  `tests/test_suite.py` module), `tests/agent_bench/test_models.py`, `tests/agent_bench/test_analysis.py`,
   `tests/agent_bench/test_suite.py`,
   `tests/agent_bench/test_cli.py`, `tests/agent_bench/fixtures/wire/inputs/`
 - **Done when:** strict loaders reject unknown/missing keys, bad types, duplicate or unsafe IDs,

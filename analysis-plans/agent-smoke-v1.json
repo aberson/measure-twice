@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "analysis_id": "agent-smoke-v1",
+  "policy": "none",
+  "candidate_profile_id": null,
+  "reference_profile_id": null,
+  "scopes": [],
+  "margin_points": null,
+  "confidence": null,
+  "multiplicity": "none",
+  "bootstrap_iterations": 10000
+}

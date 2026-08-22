@@ -1,6 +1,11 @@
 # Derived / local — suites and data/ledger stay git-tracked (plan §3)
 data/runs/
 data/reports/
+data/agent-runs/
+data/agent-workspaces/
+data/agent-reports/
+data/agent-confirmations/
+data/exports/
 __pycache__/
 *.pyc
 .venv/

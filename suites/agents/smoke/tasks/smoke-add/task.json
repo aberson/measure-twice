@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "task_id": "smoke-add",
+  "family": "bug-repair",
+  "tags": [
+    "arithmetic",
+    "smoke"
+  ],
+  "cluster_id": "smoke-add",
+  "difficulty": "easy",
+  "prompt": "prompt.md",
+  "seed": "seed",
+  "oracle": "oracle",
+  "reference_patch": "reference.patch",
+  "allowed_changes": [
+    "calculator.py"
+  ],
+  "protected_paths": [
+    "README.md"
+  ],
+  "provenance": {
+    "source": "authored for the measure-twice agent pipeline smoke",
+    "license": null,
+    "authoring_identity": "openai-codex-step-25",
+    "authoring_assistance": [
+      "OpenAI Codex"
+    ],
+    "independent_reviewers": []
+  }
+}

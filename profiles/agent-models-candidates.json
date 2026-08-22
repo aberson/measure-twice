@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "name": "codex-luna",
+      "provider": "codex-cli",
+      "requested_model": "gpt-5.6-luna",
+      "effort": "high",
+      "execution_profile_id": "agent-execution-v1"
+    },
+    {
+      "name": "claude-sonnet",
+      "provider": "claude-cli",
+      "requested_model": "sonnet",
+      "effort": null,
+      "execution_profile_id": "agent-execution-v1"
+    }
+  ]
+}

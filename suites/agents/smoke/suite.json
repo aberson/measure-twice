@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "suite_id": "agent-smoke",
+  "version": "1.0.0",
+  "description": "One-task structural and real-pipeline coding-agent smoke instrument.",
+  "runtime": {
+    "language": "python",
+    "version": "3.12"
+  },
+  "evaluator_version": "python-pytest-v1",
+  "execution_profile_id": "agent-execution-v1",
+  "scoring_policy": "binary-heldout-v1",
+  "run_class": "smoke",
+  "tasks": [
+    "tasks/smoke-add/task.json"
+  ]
+}
