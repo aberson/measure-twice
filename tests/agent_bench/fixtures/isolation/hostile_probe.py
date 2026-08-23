@@ -36,6 +36,8 @@ def _udp(port: int) -> None:
         connection.settimeout(0.25)
         connection.connect(("127.0.0.1", port))
         connection.send(b"udp-canary")
+        if connection.recv(64) != b"udp-canary":
+            raise OSError("UDP canary received an unexpected response")
 
 
 def _dns() -> None:
@@ -49,6 +51,9 @@ def main() -> None:
     oracle_file = Path("/opt/measure-twice/oracle/oracle-sentinel.txt")
     oracle_before = oracle_file.read_text(encoding="utf-8")
     oracle_mutated = _succeeds(lambda: oracle_file.write_text("mutated", encoding="utf-8"))
+    runtime_file = Path("/opt/measure-twice/runtime/runtime-sentinel.txt")
+    runtime_before = runtime_file.read_text(encoding="utf-8")
+    runtime_mutated = _succeeds(lambda: runtime_file.write_text("mutated", encoding="utf-8"))
     proc_environment = Path("/proc/1/environ").read_bytes()
     result = {
         "credential_read": _succeeds(lambda: _read(payload["credential_path"])),
@@ -60,6 +65,8 @@ def main() -> None:
         "parent_credential_environment": payload["credential_value"].encode("utf-8")
         in proc_environment,
         "process_environment_credential": os.environ.get("CREDENTIAL_SENTINEL") is not None,
+        "runtime_before": runtime_before,
+        "runtime_mutated": runtime_mutated,
         "run_store_visible": Path("/run-store").exists(),
         "suite_visible": Path("/suite").exists(),
         "tcp_reached": _succeeds(lambda: _tcp(payload["tcp_port"])),

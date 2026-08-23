@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import _thread
+import array
 import json
 import os
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -11,12 +13,19 @@ import threading
 import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 import measure_twice.agent_bench.process as process_module
-from measure_twice.agent_bench._linux_capabilities import LinuxCapabilityError
+from measure_twice.agent_bench._linux_capabilities import (
+    LinuxCapabilityError,
+    LinuxPathCapability,
+)
 from measure_twice.agent_bench.process import (
+    EvaluatorScratch,
+    LinuxResourceGuard,
     ProcessContractError,
     ProcessExecutionError,
     ProcessRequest,
@@ -52,6 +61,280 @@ def _assert_linux_fd_baseline(
     assert _linux_fd_snapshot() == baseline
 
 
+def _handshake_scratch(tmp_path: Path) -> EvaluatorScratch:
+    """Build the smallest valid owned scratch configuration for handshake-only tests."""
+
+    source = tmp_path / "handshake-seed"
+    source.mkdir()
+    source_capability = LinuxPathCapability.acquire_absolute(source, expected="directory")
+    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    return EvaluatorScratch(
+        source=source_capability,
+        file_limit=1,
+        byte_limit=1,
+        tmpfs_bytes=2 * page_size,
+        tmpfs_inodes=10_002,
+    )
+
+
+def _send_fds(control: socket.socket, payload: bytes, fds: list[int]) -> None:
+    control.sendmsg(
+        [payload],
+        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))],
+    )
+
+
+class _HandshakeGuardState:
+    """Minimal cleanup-owning state used to exercise the real FD receive boundary."""
+
+    def __init__(self, capability: LinuxPathCapability, kill_fd: int) -> None:
+        self.capability = capability
+        self.kill_fd = kill_fd
+        self.validated = False
+        self.closed = False
+
+    def validate_before_release(self) -> None:
+        self.validated = True
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        os.close(self.kill_fd)
+        self.capability.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SCM_RIGHTS handshake invariant")
+def test_linux_evaluator_handshake_requires_three_cloexec_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual receive boundary gets exactly cgroup/scratch/kill FDs before release."""
+
+    baseline = _linux_fd_snapshot()
+    cgroup_directory = tmp_path / "cgroup"
+    scratch_directory = tmp_path / "scratch"
+    cgroup_directory.mkdir()
+    scratch_directory.mkdir()
+    kill_path = tmp_path / "kill"
+    kill_path.write_bytes(b"")
+    cgroup_fd = os.open(cgroup_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    scratch_fd = os.open(scratch_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    kill_fd = os.open(kill_path, os.O_WRONLY | os.O_CLOEXEC)
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    scratch = _handshake_scratch(tmp_path)
+    request = SimpleNamespace(
+        resource_guard=LinuxResourceGuard(1, 1, 100),
+        _evaluator_scratch=scratch,
+        timeout_s=1.0,
+    )
+    runtime = SimpleNamespace(resource_guard=None)
+    adopted: list[_HandshakeGuardState] = []
+
+    def adopt(
+        capability: LinuxPathCapability,
+        received_kill_fd: int,
+        _configuration: LinuxResourceGuard,
+        *,
+        scope_relative_path: str,
+    ) -> _HandshakeGuardState:
+        assert scope_relative_path == "/user.slice/test.scope"
+        state = _HandshakeGuardState(capability, received_kill_fd)
+        adopted.append(state)
+        return state
+
+    monkeypatch.setattr(
+        process_module._LinuxResourceGuardState,
+        "adopt",
+        staticmethod(adopt),
+    )
+    monkeypatch.setattr(process_module, "_validate_evaluator_tmpfs", lambda *_args: None)
+    monkeypatch.setattr(process_module, "copy_tree", lambda *_args, **_kwargs: None)
+    try:
+        _send_fds(child, b"MT26R", [cgroup_fd, scratch_fd, kill_fd])
+        received_scratch = process_module._receive_evaluator_handshake(
+            parent,
+            request,
+            runtime,
+            "/user.slice/test.scope",
+        )
+        try:
+            assert len(adopted) == 1
+            state = adopted[0]
+            assert runtime.resource_guard is state
+            assert state.validated is True
+            assert os.get_inheritable(state.capability.fd) is False
+            assert os.get_inheritable(state.kill_fd) is False
+            assert os.get_inheritable(received_scratch.fd) is False
+        finally:
+            received_scratch.close()
+            scratch.close()
+            adopted[0].close()
+            runtime.resource_guard = None
+    finally:
+        parent.close()
+        child.close()
+        os.close(cgroup_fd)
+        os.close(scratch_fd)
+        os.close(kill_fd)
+    _assert_linux_fd_baseline(baseline)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SCM_RIGHTS handshake invariant")
+@pytest.mark.parametrize(("payload", "fd_count"), [(b"wrong", 3), (b"MT26R", 2)])
+def test_linux_evaluator_handshake_rejects_malformed_message_before_release(
+    tmp_path: Path,
+    payload: bytes,
+    fd_count: int,
+) -> None:
+    baseline = _linux_fd_snapshot()
+    directory = tmp_path / "received"
+    directory.mkdir()
+    fds = [
+        os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        for _index in range(fd_count)
+    ]
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    scratch = _handshake_scratch(tmp_path)
+    request = SimpleNamespace(
+        resource_guard=LinuxResourceGuard(1, 1, 100),
+        _evaluator_scratch=scratch,
+        timeout_s=1.0,
+    )
+    runtime = SimpleNamespace(resource_guard=None)
+    try:
+        _send_fds(child, payload, fds)
+        with pytest.raises(ProcessExecutionError, match="invalid FD handshake"):
+            process_module._receive_evaluator_handshake(
+                parent,
+                request,
+                runtime,
+                "/user.slice/test.scope",
+            )
+        assert runtime.resource_guard is None
+    finally:
+        scratch.close()
+        parent.close()
+        child.close()
+        for fd in fds:
+            os.close(fd)
+    _assert_linux_fd_baseline(baseline)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux evaluator startup ownership invariant")
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["guard", "scratch-fd", "scratch-readback", "copy", "terminal-adoption"],
+)
+def test_linux_evaluator_post_handshake_failure_keeps_verified_guard_for_common_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    """Every failure after cgroup adoption leaves the pinned scope owned by runtime cleanup."""
+
+    baseline = _linux_fd_snapshot()
+    cgroup_directory = tmp_path / "cgroup"
+    scratch_directory = tmp_path / "scratch"
+    cgroup_directory.mkdir()
+    scratch_directory.mkdir()
+    kill_path = tmp_path / "kill"
+    kill_path.write_bytes(b"")
+    invalid_scratch = tmp_path / "not-a-directory"
+    invalid_scratch.write_bytes(b"x")
+    cgroup_fd = os.open(cgroup_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    scratch_fd = os.open(
+        invalid_scratch if failure_stage == "scratch-fd" else scratch_directory,
+        os.O_RDONLY | os.O_CLOEXEC | (0 if failure_stage == "scratch-fd" else os.O_DIRECTORY),
+    )
+    kill_fd = os.open(kill_path, os.O_WRONLY | os.O_CLOEXEC)
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    scratch = _handshake_scratch(tmp_path)
+    request = SimpleNamespace(
+        resource_guard=LinuxResourceGuard(1, 1, 100),
+        _evaluator_scratch=scratch,
+        timeout_s=1.0,
+    )
+    runtime = SimpleNamespace(resource_guard=None)
+    adopted: list[_HandshakeGuardState] = []
+
+    class FailingState(_HandshakeGuardState):
+        def validate_before_release(self) -> None:
+            super().validate_before_release()
+            if failure_stage == "guard":
+                raise ProcessExecutionError("injected guard readback mismatch")
+
+    def adopt(
+        capability: LinuxPathCapability,
+        received_kill_fd: int,
+        _configuration: LinuxResourceGuard,
+        *,
+        scope_relative_path: str,
+    ) -> _HandshakeGuardState:
+        assert scope_relative_path == "/user.slice/test.scope"
+        state = FailingState(capability, received_kill_fd)
+        adopted.append(state)
+        return state
+
+    monkeypatch.setattr(
+        process_module._LinuxResourceGuardState,
+        "adopt",
+        staticmethod(adopt),
+    )
+    if failure_stage == "scratch-readback":
+        monkeypatch.setattr(
+            process_module,
+            "_validate_evaluator_tmpfs",
+            lambda *_args: (_ for _ in ()).throw(
+                ProcessExecutionError("injected tmpfs readback mismatch")
+            ),
+        )
+    else:
+        monkeypatch.setattr(process_module, "_validate_evaluator_tmpfs", lambda *_args: None)
+    if failure_stage == "copy":
+        monkeypatch.setattr(
+            process_module,
+            "copy_tree",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                LinuxCapabilityError("injected copy failure")
+            ),
+        )
+    else:
+        monkeypatch.setattr(process_module, "copy_tree", lambda *_args, **_kwargs: None)
+    if failure_stage == "terminal-adoption":
+        monkeypatch.setattr(
+            EvaluatorScratch,
+            "adopt_terminal_tree",
+            lambda _self, capability: (
+                capability.close(),
+                (_ for _ in ()).throw(ProcessExecutionError("injected terminal adoption failure")),
+            )[1],
+        )
+    try:
+        _send_fds(child, b"MT26R", [cgroup_fd, scratch_fd, kill_fd])
+        with pytest.raises(ProcessExecutionError):
+            process_module._receive_evaluator_handshake(
+                parent,
+                request,
+                runtime,
+                "/user.slice/test.scope",
+            )
+        assert len(adopted) == 1
+        assert runtime.resource_guard is adopted[0]
+        assert adopted[0].closed is False
+    finally:
+        if adopted:
+            adopted[0].close()
+        runtime.resource_guard = None
+        scratch.close()
+        parent.close()
+        child.close()
+        os.close(cgroup_fd)
+        os.close(scratch_fd)
+        os.close(kill_fd)
+    _assert_linux_fd_baseline(baseline)
+
+
 def _request(
     tmp_path: Path,
     code: str,
@@ -75,6 +358,13 @@ def _request(
         resource_limits=resource_limits,
         tree_root=tree_root,
     )
+
+
+def _assert_path_stays_absent(path: Path, *, duration_s: float = 1.5) -> None:
+    deadline = time.monotonic() + duration_s
+    while time.monotonic() < deadline:
+        assert not path.exists()
+        time.sleep(0.02)
 
 
 def test_request_copies_mutable_inputs_and_is_frozen(tmp_path: Path) -> None:
@@ -151,6 +441,86 @@ def _delayed_marker_code(marker: Path) -> str:
     )
 
 
+def _release_marker_code(ready: Path, marker: Path, release: Path) -> str:
+    """Build a Linux child canary whose PID/start token can be resolved by its owner."""
+
+    return (
+        "import os,pathlib,time; "
+        f"ready=pathlib.Path({str(ready)!r}); "
+        f"marker=pathlib.Path({str(marker)!r}); "
+        f"release=pathlib.Path({str(release)!r}); "
+        "pid=os.getpid(); "
+        "stat_record=pathlib.Path(f'/proc/{pid}/stat').read_text(encoding='ascii'); "
+        "start_token=stat_record[stat_record.rfind(')')+2:].split()[19]; "
+        "ready.write_text(f'{pid}:{start_token}',encoding='ascii'); "
+        "\nwhile not release.exists(): time.sleep(.01)\n"
+        "marker.write_text('escaped',encoding='utf-8')"
+    )
+
+
+def _ready_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        namespace_pid, start_token = path.read_text(encoding="ascii").split(":", maxsplit=1)
+        return (int(namespace_pid), int(start_token))
+    except (OSError, ValueError):
+        return None
+
+
+def _nested_linux_pids(pid: int) -> tuple[int, ...]:
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+    except (FileNotFoundError, OSError, UnicodeError):
+        return ()
+    for line in status.splitlines():
+        if line.startswith("NSpid:"):
+            try:
+                return tuple(int(value) for value in line.split()[1:])
+            except ValueError:
+                return ()
+    return ()
+
+
+def _host_identity_for_live_child(
+    owner_pid: int, namespace_pid: int, start_token: int
+) -> tuple[int, int] | None:
+    pending = [owner_pid]
+    visited: set[int] = set()
+    while pending:
+        parent_pid = pending.pop()
+        if parent_pid in visited:
+            continue
+        visited.add(parent_pid)
+        for child_pid in process_module._posix_direct_children(parent_pid):
+            if child_pid not in visited:
+                pending.append(child_pid)
+            if process_module._pid_starttime(child_pid) == start_token and _nested_linux_pids(
+                child_pid
+            )[-1:] == (namespace_pid,):
+                return (child_pid, start_token)
+    return None
+
+
+def _wait_for_live_linux_identity(
+    path: Path, *, owner_pid: int, timeout_s: float = 5.0
+) -> tuple[int, int]:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        identity = _ready_identity(path)
+        if identity is not None:
+            host_identity = _host_identity_for_live_child(owner_pid, *identity)
+            if host_identity is not None:
+                return host_identity
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for live child identity: {path}")
+
+
+def _assert_linux_identity_gone(identity: tuple[int, int]) -> None:
+    host_pid, start_token = identity
+    assert process_module._pid_starttime(host_pid) != start_token, (
+        f"child process identity survived cleanup: pid={host_pid}, starttime={start_token}"
+    )
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux post-spawn cleanup invariant")
 @pytest.mark.parametrize("failing_thread", ["agent-bench-descendants", "agent-bench-stderr"])
 def test_linux_partial_thread_start_failure_reaps_process_and_closes_fds(
@@ -159,8 +529,11 @@ def test_linux_partial_thread_start_failure_reaps_process_and_closes_fds(
     failing_thread: str,
 ) -> None:
     baseline = _linux_fd_snapshot()
+    ready = tmp_path / f"{failing_thread}-ready"
     marker = tmp_path / f"{failing_thread}-escaped"
+    release = tmp_path / f"{failing_thread}-release"
     spawned: list[subprocess.Popen[bytes]] = []
+    ready_identity: tuple[int, int] | None = None
     original_popen = process_module.subprocess.Popen
     original_start = threading.Thread.start
 
@@ -170,20 +543,25 @@ def test_linux_partial_thread_start_failure_reaps_process_and_closes_fds(
         return proc
 
     def start_then_fail(thread: threading.Thread) -> None:
+        nonlocal ready_identity
         original_start(thread)
         if thread.name == failing_thread:
+            ready_identity = _wait_for_live_linux_identity(ready, owner_pid=spawned[0].pid)
             raise RuntimeError(f"injected {failing_thread} start failure")
 
     monkeypatch.setattr(process_module.subprocess, "Popen", recording_popen)
     monkeypatch.setattr(threading.Thread, "start", start_then_fail)
     with pytest.raises(RuntimeError, match="injected"):
-        run_process(_request(tmp_path, _delayed_marker_code(marker)))
+        run_process(_request(tmp_path, _release_marker_code(ready, marker, release)))
 
     assert len(spawned) == 1
     assert spawned[0].poll() is not None
     with pytest.raises(ChildProcessError):
         os.waitpid(spawned[0].pid, os.WNOHANG)
-    time.sleep(0.7)
+    assert ready_identity is not None
+    _assert_linux_identity_gone(ready_identity)
+    assert not marker.exists()
+    release.write_text("release", encoding="utf-8")
     assert not marker.exists()
     _assert_linux_fd_baseline(baseline)
 
@@ -575,31 +953,62 @@ def test_namespace_supervisor_preserves_exact_target_status(
     assert result.signal == signal_number
 
 
-def _tree_code(ready: Path, leaked: Path) -> str:
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux PID namespace procfs invariant")
+def test_linux_outer_pid_namespace_mounts_procfs_for_its_target(tmp_path: Path) -> None:
+    result = run_process(
+        _request(
+            tmp_path,
+            "import os,pathlib; "
+            "assert pathlib.Path('/proc/self').samefile(f'/proc/{os.getpid()}'); "
+            "print(os.getpid())",
+        )
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout.strip().isdigit()
+
+
+def _post_cleanup_write_code(leaked: Path, *, release: Path | None = None) -> str:
+    if release is None:
+        return f"time.sleep(1.0); open({str(leaked)!r},'w',encoding='utf-8').write('leaked')"
+    return (
+        f"release={str(release)!r}; deadline=time.monotonic()+10; "
+        "\nwhile not os.path.exists(release) and time.monotonic()<deadline: time.sleep(.01)\n"
+        f"if os.path.exists(release): "
+        f"open({str(leaked)!r},'w',encoding='utf-8').write('leaked')"
+    )
+
+
+def _tree_code(ready: Path, leaked: Path, *, release: Path | None = None) -> str:
     child = (
         "import os,sys,time; "
         "os.setsid() if os.name == 'posix' else None; "
         "open(sys.argv[1], 'w', encoding='utf-8').write('ready'); "
-        "time.sleep(1.0); "
-        "open(sys.argv[2], 'w', encoding='utf-8').write('leaked')"
+        f"{_post_cleanup_write_code(leaked, release=release)}"
     )
     return (
         "import subprocess,sys,time; "
         f"subprocess.Popen([sys.executable,'-I','-c',{child!r},{str(ready)!r},{str(leaked)!r}]); "
-        f"deadline=time.monotonic()+5; p={str(ready)!r}; "
-        "\nwhile not __import__('os').path.exists(p) "
-        "and time.monotonic()<deadline: time.sleep(.01)\n"
+        f"p={str(ready)!r}; "
+        "\nwhile not __import__('os').path.exists(p): time.sleep(.01)\n"
         "time.sleep(30)"
     )
 
 
-def _leader_exits_first_code(ready: Path, leaked: Path) -> str:
-    code = _tree_code(ready, leaked)
+def _leader_exits_first_code(ready: Path, leaked: Path, *, release: Path | None = None) -> str:
+    code = _tree_code(ready, leaked, release=release)
     return code.rsplit("time.sleep(30)", 1)[0] + "pass"
 
 
-def _double_fork_code(ready: Path, leaked: Path, *, hold_leader: bool) -> str:
+def _double_fork_code(
+    ready: Path,
+    leaked: Path,
+    *,
+    hold_leader: bool,
+    release: Path | None = None,
+) -> str:
     leader_tail = "time.sleep(30)" if hold_leader else "pass"
+    child_tail = _post_cleanup_write_code(leaked, release=release).replace("\n", "\n ")
     return (
         "import os,time\n"
         "pid=os.fork()\n"
@@ -609,11 +1018,10 @@ def _double_fork_code(ready: Path, leaked: Path, *, hold_leader: bool) -> str:
         f" open({str(ready)!r},'w',encoding='utf-8').write('ready')\n"
         " null=os.open(os.devnull,os.O_RDWR)\n"
         " [os.dup2(null,fd) for fd in (0,1,2)]\n"
-        " time.sleep(1.0)\n"
-        f" open({str(leaked)!r},'w',encoding='utf-8').write('leaked')\n"
+        f" {child_tail}\n"
         " os._exit(0)\n"
-        f"deadline=time.monotonic()+5; marker={str(ready)!r}\n"
-        "while not os.path.exists(marker) and time.monotonic()<deadline: time.sleep(.01)\n"
+        f"marker={str(ready)!r}\n"
+        "while not os.path.exists(marker): time.sleep(.01)\n"
         f"{leader_tail}\n"
     )
 
@@ -622,15 +1030,21 @@ def test_timeout_kills_detached_descendant_before_it_can_escape(tmp_path: Path) 
     fd_baseline = _linux_fd_snapshot() if sys.platform == "linux" else None
     ready = tmp_path / "ready"
     leaked = tmp_path / "leaked"
+    release = tmp_path / "release"
     result = run_process(
-        _request(tmp_path, _tree_code(ready, leaked), timeout_s=0.25, stream_limit_bytes=1024)
+        _request(
+            tmp_path,
+            _tree_code(ready, leaked, release=release),
+            timeout_s=5,
+            stream_limit_bytes=1024,
+        )
     )
 
     assert result.termination == "timeout"
     assert result.exit_code is None
     assert ready.is_file()
-    time.sleep(1.1)
-    assert not leaked.exists()
+    release.write_text("release", encoding="utf-8")
+    _assert_path_stays_absent(leaked)
     if fd_baseline is not None:
         _assert_linux_fd_baseline(fd_baseline)
 
@@ -639,42 +1053,92 @@ def test_timeout_kills_detached_descendant_before_it_can_escape(tmp_path: Path) 
 def test_namespace_owner_cleans_descendant_when_direct_child_exits(tmp_path: Path) -> None:
     ready = tmp_path / "orphan-ready"
     leaked = tmp_path / "orphan-leaked"
-    started = time.monotonic()
+    release = tmp_path / "orphan-release"
     result = run_process(
         _request(
             tmp_path,
-            _leader_exits_first_code(ready, leaked),
-            timeout_s=0.25,
+            _leader_exits_first_code(ready, leaked, release=release),
+            timeout_s=5,
             stream_limit_bytes=1024,
         )
     )
 
     assert result.termination == "exited"
     assert result.exit_code == 0
-    assert time.monotonic() - started < 0.9
     assert ready.is_file()
-    time.sleep(1.1)
-    assert not leaked.exists()
+    release.write_text("release", encoding="utf-8")
+    _assert_path_stays_absent(leaked)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux cleanup status-pipe invariant")
+def test_linux_cleanup_does_not_block_on_status_pipe_when_owner_survives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _UnreapableOuter:
+        stdin = None
+        stdout = None
+        stderr = None
+        pid = 1
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired("unshare", timeout)
+
+    read_fd, write_fd = os.pipe()
+    runtime = process_module._RunningProcess(
+        proc=cast("subprocess.Popen[bytes]", _UnreapableOuter()),
+        started=time.monotonic(),
+        process_group_id=1,
+        status_read_fd=read_fd,
+    )
+    monkeypatch.setattr(process_module, "_kill_tree", lambda *_args: None)
+    errors: list[BaseException] = []
+    completed = threading.Event()
+
+    def clean_up() -> None:
+        try:
+            process_module._cleanup_process(runtime, abnormal=True)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=clean_up, daemon=True)
+    worker.start()
+    blocked = not completed.wait(0.5)
+    try:
+        if blocked:
+            os.close(write_fd)
+            write_fd = -1
+        worker.join(timeout=2)
+    finally:
+        if write_fd >= 0:
+            os.close(write_fd)
+
+    assert not blocked
+    assert completed.is_set()
+    assert len(errors) == 1
+    assert "direct child survived whole-tree termination" in str(errors[0])
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux PID namespace descendant invariant")
 def test_descendant_owner_structurally_contains_every_reparented_session(
     tmp_path: Path,
 ) -> None:
-    ready_paths: list[Path] = []
-    leaked_paths: list[Path] = []
     for index in range(3):
         direct_ready = tmp_path / f"direct-ready-{index}"
         direct_leaked = tmp_path / f"direct-leaked-{index}"
         forked_ready = tmp_path / f"forked-ready-{index}"
         forked_leaked = tmp_path / f"forked-leaked-{index}"
+        release = tmp_path / f"release-{index}"
         detach = (
             "import os,time; os.setsid(); "
             f"open({str(direct_ready)!r},'w',encoding='utf-8').write('ready'); "
             "null=os.open(os.devnull,os.O_RDWR); "
             "[os.dup2(null,fd) for fd in (0,1,2)]; "
-            "time.sleep(.8); "
-            f"open({str(direct_leaked)!r},'w',encoding='utf-8').write('leaked')"
+            f"{_post_cleanup_write_code(direct_leaked, release=release)}"
         )
         double_fork = (
             "import os,time; "
@@ -685,46 +1149,44 @@ def test_descendant_owner_structurally_contains_every_reparented_session(
             f"open({str(forked_ready)!r},'w',encoding='utf-8').write('ready'); "
             "null=os.open(os.devnull,os.O_RDWR); "
             "[os.dup2(null,fd) for fd in (0,1,2)]; "
-            "time.sleep(.8); "
-            f"open({str(forked_leaked)!r},'w',encoding='utf-8').write('leaked')"
+            f"{_post_cleanup_write_code(forked_leaked, release=release)}"
         )
         leader = (
             "import os,subprocess,sys,time; "
             f"subprocess.Popen([sys.executable,'-I','-c',{detach!r}]); "
             f"subprocess.Popen([sys.executable,'-I','-c',{double_fork!r}]); "
             f"paths=({str(direct_ready)!r},{str(forked_ready)!r}); "
-            "deadline=time.monotonic()+5; "
-            "\nwhile not all(os.path.exists(path) for path in paths) "
-            "and time.monotonic()<deadline: time.sleep(.01)\n"
+            "\nwhile not all(os.path.exists(path) for path in paths): time.sleep(.01)\n"
         )
-        result = run_process(_request(tmp_path, leader, timeout_s=0.5, stream_limit_bytes=1024))
+        result = run_process(_request(tmp_path, leader, timeout_s=10, stream_limit_bytes=1024))
         assert result.termination == "exited"
-        ready_paths.extend((direct_ready, forked_ready))
-        leaked_paths.extend((direct_leaked, forked_leaked))
-
-    assert all(path.is_file() for path in ready_paths)
-    time.sleep(0.9)
-    assert not any(path.exists() for path in leaked_paths)
+        assert result.exit_code == 0
+        assert direct_ready.is_file()
+        assert forked_ready.is_file()
+        release.write_text("release", encoding="utf-8")
+        _assert_path_stays_absent(direct_leaked)
+        _assert_path_stays_absent(forked_leaked)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="double-fork requires Linux")
 def test_timeout_kills_double_fork_descendant(tmp_path: Path) -> None:
     ready = tmp_path / "double-fork-timeout-ready"
     leaked = tmp_path / "double-fork-timeout-leaked"
+    release = tmp_path / "double-fork-timeout-release"
 
     result = run_process(
         _request(
             tmp_path,
-            _double_fork_code(ready, leaked, hold_leader=True),
-            timeout_s=0.5,
+            _double_fork_code(ready, leaked, hold_leader=True, release=release),
+            timeout_s=5,
             stream_limit_bytes=1024,
         )
     )
 
     assert result.termination == "timeout"
     assert ready.is_file()
-    time.sleep(1.1)
-    assert not leaked.exists()
+    release.write_text("release", encoding="utf-8")
+    _assert_path_stays_absent(leaked)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="double-fork requires Linux")
@@ -732,6 +1194,7 @@ def test_keyboard_interrupt_kills_double_fork_tree_then_propagates(tmp_path: Pat
     fd_baseline = _linux_fd_snapshot() if sys.platform == "linux" else None
     ready = tmp_path / "interrupt-ready"
     leaked = tmp_path / "interrupt-leaked"
+    release = tmp_path / "interrupt-release"
     interrupt_sent = threading.Event()
 
     def interrupt_after_ready() -> None:
@@ -749,7 +1212,7 @@ def test_keyboard_interrupt_kills_double_fork_tree_then_propagates(tmp_path: Pat
             run_process(
                 _request(
                     tmp_path,
-                    _double_fork_code(ready, leaked, hold_leader=True),
+                    _double_fork_code(ready, leaked, hold_leader=True, release=release),
                     timeout_s=10,
                     stream_limit_bytes=1024,
                 )
@@ -759,23 +1222,37 @@ def test_keyboard_interrupt_kills_double_fork_tree_then_propagates(tmp_path: Pat
 
     assert interrupt_sent.is_set()
     assert ready.is_file()
-    time.sleep(1.1)
-    assert not leaked.exists()
+    release.write_text("release", encoding="utf-8")
+    _assert_path_stays_absent(leaked)
     if fd_baseline is not None:
         _assert_linux_fd_baseline(fd_baseline)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux monitor fail-closed invariant")
-def test_descendant_monitor_exception_fails_closed_and_kills_target(tmp_path: Path) -> None:
+def test_descendant_monitor_exception_fails_closed_and_kills_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     baseline = _linux_fd_snapshot()
+    ready = tmp_path / "monitor-failure-ready"
     marker = tmp_path / "monitor-failure-escaped"
+    release = tmp_path / "monitor-failure-release"
     (tmp_path / "scan-me").write_text("seed", encoding="utf-8")
+    ready_identity: tuple[int, int] | None = None
+    spawned: list[subprocess.Popen[bytes]] = []
+    original_popen = process_module.subprocess.Popen
+
+    def recording_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        proc = original_popen(*args, **kwargs)  # type: ignore[arg-type]
+        spawned.append(proc)
+        return proc
 
     def fail_tree_scan(_relative: str) -> None:
+        nonlocal ready_identity
+        ready_identity = _wait_for_live_linux_identity(ready, owner_pid=spawned[0].pid)
         raise RuntimeError("injected live monitor failure")
 
     request = ProcessRequest.create(
-        argv=(PYTHON, "-I", "-c", _delayed_marker_code(marker)),
+        argv=(PYTHON, "-I", "-c", _release_marker_code(ready, marker, release)),
         stdin="",
         cwd=tmp_path.resolve(),
         environment={},
@@ -786,10 +1263,15 @@ def test_descendant_monitor_exception_fails_closed_and_kills_target(tmp_path: Pa
         _tree_before_open=fail_tree_scan,
     )
 
+    monkeypatch.setattr(process_module.subprocess, "Popen", recording_popen)
     with pytest.raises(ProcessExecutionError, match="Linux descendant monitor failed"):
         run_process(request)
 
-    time.sleep(0.7)
+    assert len(spawned) == 1
+    assert ready_identity is not None
+    _assert_linux_identity_gone(ready_identity)
+    assert not marker.exists()
+    release.write_text("release", encoding="utf-8")
     assert not marker.exists()
     _assert_linux_fd_baseline(baseline)
 

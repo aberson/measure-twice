@@ -22,7 +22,7 @@ EXECUTION = ROOT / "profiles" / "agent-execution-v1.json"
 THREE_MODELS = Path(__file__).parent / "fixtures" / "wire" / "inputs" / "agent-models-three.json"
 
 SELECTED_PROFILE_HASH = "6b10e22d3f89e7f541ea3efb358367084de934b9b2a76f6b1fefe06012da27c2"
-EXECUTION_PROFILE_HASH = "44e1aad9c48fa5f8d7ffeeaf31e8b6d43f567a8bfdd622f68ed9fac29a436669"
+EXECUTION_PROFILE_HASH = "815525c081252c97689370d068ae0fb2595c0a7ba2e98333d08fb40b92697420"
 
 
 def _payload(path: Path) -> dict[str, object]:
@@ -201,6 +201,9 @@ def test_execution_profile_frozen_defaults_and_hash() -> None:
     assert profile.ceilings.evaluator_processes == 64
     assert profile.ceilings.evaluator_files == 10_000
     assert profile.ceilings.evaluator_file_bytes == 10_485_760
+    assert profile.ceilings.evaluator_cpu_bandwidth_percent == 100
+    assert profile.ceilings.evaluator_tmpfs_bytes == 67_108_864
+    assert profile.ceilings.evaluator_tmpfs_inodes == 20_001
 
 
 def test_execution_profile_hash_covers_nested_policy(tmp_path: Path) -> None:

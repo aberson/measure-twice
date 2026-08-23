@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "id": "agent-execution-v1",
   "qualification_limits": {
     "agent_timeout_s": 60,
@@ -57,7 +57,10 @@
     "evaluator_memory_bytes": 1073741824,
     "evaluator_processes": 64,
     "evaluator_files": 10000,
-    "evaluator_file_bytes": 10485760
+    "evaluator_file_bytes": 10485760,
+    "evaluator_cpu_bandwidth_percent": 100,
+    "evaluator_tmpfs_bytes": 67108864,
+    "evaluator_tmpfs_inodes": 20001
   },
   "retry": {
     "eligible": [
@@ -69,7 +72,7 @@
     "retry_after_cap_s": 60,
     "default_delay_s": 5
   },
-  "sandbox_contract_version": "linux-bwrap-v1",
+  "sandbox_contract_version": "linux-bwrap-v2",
   "schedule_algorithm": "schedule-v1",
   "analysis_algorithm": "bootstrap-v1"
 }

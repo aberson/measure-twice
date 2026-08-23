@@ -166,6 +166,8 @@ if [ "$skipped" -ne 0 ]; then
     exit 3
 fi
 '@
+    # A Windows CRLF checkout preserves CRLF inside the here-string; Bash requires LF syntax.
+    $runner = $runner.Replace("`r`n", "`n")
 
     [System.IO.File]::WriteAllBytes(
         $runnerFile,

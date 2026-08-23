@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import os
 import platform
 import stat
@@ -35,6 +36,7 @@ _EXT4_SUPER_MAGIC: Final[int] = 0xEF53
 _MAX_ANCESTRY_DEPTH: Final[int] = 4096
 _MAX_TREE_DIRECTORIES: Final[int] = 10_000
 _MAX_DIRECTORY_ENTRIES: Final[int] = 10_000
+_COPY_CHUNK_BYTES: Final[int] = 1024 * 1024
 
 _O_CLOEXEC: Final[int] = int(getattr(os, "O_CLOEXEC", 0x80000))
 _O_DIRECTORY: Final[int] = int(getattr(os, "O_DIRECTORY", 0x10000))
@@ -43,6 +45,9 @@ _O_NONBLOCK: Final[int] = int(getattr(os, "O_NONBLOCK", 0x800))
 
 CapabilityKind = Literal["directory", "regular", "any"]
 TreeLimitName = Literal["file-count", "file-bytes"]
+TreePolicyViolation = Literal[
+    "invalid-name", "special-file", "structural-shape", "symlink", "unreadable"
+]
 
 
 class LinuxCapabilityError(RuntimeError):
@@ -61,6 +66,42 @@ class LinuxTreeLimitError(LinuxCapabilityError):
         self.limit_name = limit_name
         self.file_count = file_count
         self.size_bytes = size_bytes
+
+
+class LinuxTreeDriftError(LinuxCapabilityError):
+    """A held source tree changed during one descriptor-relative traversal.
+
+    A live evaluator sample can discard this inconclusive observation and retry later.  Copy and
+    post-cleanup terminal validation deliberately remain strict callers of the same primitive.
+    """
+
+
+class LinuxTreePolicyError(LinuxCapabilityError):
+    """A stable tree entry violates evaluator result-tree policy.
+
+    This is distinct from an I/O/capability failure and from concurrent namespace drift: a
+    terminal evaluator result containing a symlink, special/unreadable entry, or structural
+    policy violation is attributable to the submitted model output.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        violation: TreePolicyViolation,
+        *,
+        path: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.violation = violation
+        self.path = path
+
+
+class _OpenAt2Error(LinuxCapabilityError):
+    """Private errno-preserving openat2 failure used only for traversal classification."""
+
+    def __init__(self, error_number: int) -> None:
+        super().__init__(f"could not acquire FD capability with openat2: errno {error_number}")
+        self.error_number = error_number
 
 
 class _OpenHow(ctypes.Structure):
@@ -163,9 +204,7 @@ def _openat2(
         raise LinuxCapabilityUnavailableError(
             "Linux openat2 beneath/no-symlink semantics are unavailable"
         )
-    raise LinuxCapabilityError(
-        f"could not acquire FD capability with openat2: errno {error_number}"
-    )
+    raise _OpenAt2Error(error_number)
 
 
 def _filesystem_magic(fd: int) -> int:
@@ -187,7 +226,7 @@ def _kind_matches(mode: int, expected: CapabilityKind) -> bool:
         return stat.S_ISDIR(mode)
     if expected == "regular":
         return stat.S_ISREG(mode)
-    return stat.S_ISDIR(mode) or stat.S_ISREG(mode)
+    return True
 
 
 class LinuxPathCapability:
@@ -195,6 +234,7 @@ class LinuxPathCapability:
 
     __slots__ = (
         "_closed",
+        "_exclusive_copy_destination",
         "_fd",
         "_lock",
         "display_path",
@@ -204,9 +244,19 @@ class LinuxPathCapability:
         "st_mode",
     )
 
-    def __init__(self, fd: int, *, display_path: str) -> None:
+    def __init__(
+        self,
+        fd: int,
+        *,
+        display_path: str,
+        exclusive_copy_destination: bool = False,
+    ) -> None:
         _require_linux()
         try:
+            # SCM_RIGHTS intentionally transfers a fresh descriptor without preserving the
+            # sender's FD_CLOEXEC bit.  Capabilities can arrive over that boundary, so make
+            # every owned descriptor non-inheritable before inspecting or retaining it.
+            os.set_inheritable(fd, False)
             metadata = os.fstat(fd)
             filesystem_magic = _filesystem_magic(fd)
         except BaseException:
@@ -214,6 +264,7 @@ class LinuxPathCapability:
             raise
         self._fd = fd
         self._closed = False
+        self._exclusive_copy_destination = exclusive_copy_destination
         self._lock = threading.Lock()
         self.display_path = display_path
         self.st_dev = metadata.st_dev
@@ -248,14 +299,12 @@ class LinuxPathCapability:
                 )
             finally:
                 parent.close()
-            capability = cls(fd, display_path=display)
-            if not _kind_matches(capability.st_mode, expected):
-                capability.close()
-                raise LinuxCapabilityError(f"capability object has the wrong type for {display!r}")
-            if executable and not capability.st_mode & 0o111:
-                capability.close()
-                raise LinuxCapabilityError(f"capability object is not executable: {display!r}")
-            return capability
+            return cls._from_open_fd(
+                fd,
+                display_path=display,
+                expected=expected,
+                executable=executable,
+            )
         root_fd = os.open("/", os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC)
         try:
             relative = display.removeprefix("/")
@@ -275,21 +324,34 @@ class LinuxPathCapability:
                 )
         finally:
             os.close(root_fd)
-        capability = cls(fd, display_path=display)
-        if not _kind_matches(capability.st_mode, expected):
-            capability.close()
-            raise LinuxCapabilityError(f"capability object has the wrong type for {display!r}")
-        if executable and not capability.st_mode & 0o111:
-            capability.close()
-            raise LinuxCapabilityError(f"capability object is not executable: {display!r}")
-        return capability
+        return cls._from_open_fd(
+            fd,
+            display_path=display,
+            expected=expected,
+            executable=executable,
+        )
 
     @classmethod
-    def _from_open_fd(cls, fd: int, *, display_path: str, expected: CapabilityKind) -> Self:
-        capability = cls(fd, display_path=display_path)
+    def _from_open_fd(
+        cls,
+        fd: int,
+        *,
+        display_path: str,
+        expected: CapabilityKind,
+        executable: bool = False,
+        exclusive_copy_destination: bool = False,
+    ) -> Self:
+        capability = cls(
+            fd,
+            display_path=display_path,
+            exclusive_copy_destination=exclusive_copy_destination,
+        )
         if not _kind_matches(capability.st_mode, expected):
             capability.close()
             raise LinuxCapabilityError(f"capability object has the wrong type for {display_path!r}")
+        if executable and not capability.st_mode & 0o111:
+            capability.close()
+            raise LinuxCapabilityError(f"capability object is not executable: {display_path!r}")
         return capability
 
     @property
@@ -311,6 +373,21 @@ class LinuxPathCapability:
     def filesystem_name(self) -> str:
         return "ext4" if self.filesystem_magic == _EXT4_SUPER_MAGIC else hex(self.filesystem_magic)
 
+    def _mark_exclusive_copy_destination(self) -> None:
+        """Mark a validated release-barrier-private directory as a copy destination.
+
+        This internal capability bit is minted only by the evaluator tmpfs validation path.  It is
+        propagated through duplicate/reopen/child operations so every directory created below the
+        private root retains the same structural non-concurrency invariant.
+        """
+
+        if not stat.S_ISDIR(self.st_mode):
+            raise LinuxCapabilityError("only a directory can be an exclusive copy destination")
+        with self._lock:
+            if self._closed:
+                raise LinuxCapabilityError("Linux path capability is closed")
+            self._exclusive_copy_destination = True
+
     def duplicate(self) -> Self:
         """Create an explicit independently-owned duplicate of the same kernel object."""
 
@@ -322,6 +399,7 @@ class LinuxPathCapability:
             duplicated_fd,
             display_path=self.display_path,
             expected=("directory" if stat.S_ISDIR(self.st_mode) else "regular"),
+            exclusive_copy_destination=self._exclusive_copy_destination,
         )
 
     def reopen_directory(self) -> Self:
@@ -338,6 +416,7 @@ class LinuxPathCapability:
             fd,
             display_path=self.display_path,
             expected="directory",
+            exclusive_copy_destination=self._exclusive_copy_destination,
         )
         if reopened.identity != self.identity:
             reopened.close()
@@ -376,7 +455,12 @@ class LinuxPathCapability:
                 flags=flags,
                 allow_symlinks=False,
             )
-        return type(self)._from_open_fd(fd, display_path=display_path, expected=expected)
+        return type(self)._from_open_fd(
+            fd,
+            display_path=display_path,
+            expected=expected,
+            exclusive_copy_destination=self._exclusive_copy_destination,
+        )
 
     def open_parent(self) -> Self:
         """Open the held directory's current ``..`` object under the ownership lock."""
@@ -478,6 +562,56 @@ class _EnumeratedEntry:
     st_dev: int
     st_ino: int
     st_mode: int
+    st_size: int
+    st_mtime_ns: int
+    st_ctime_ns: int
+    st_nlink: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CopiedEntry:
+    """One destination identity retained until the complete copy has been verified."""
+
+    entry: _EnumeratedEntry
+    is_directory: bool
+    children: tuple[Self, ...] = ()
+
+
+def _entry_from_stat(name: str, metadata: os.stat_result) -> _EnumeratedEntry:
+    return _EnumeratedEntry(
+        name=_component_text(name, label="directory entry"),
+        st_dev=metadata.st_dev,
+        st_ino=metadata.st_ino,
+        st_mode=metadata.st_mode,
+        st_size=metadata.st_size,
+        st_mtime_ns=metadata.st_mtime_ns,
+        st_ctime_ns=metadata.st_ctime_ns,
+        st_nlink=metadata.st_nlink,
+    )
+
+
+def _entry_matches_stat(entry: _EnumeratedEntry, metadata: os.stat_result) -> bool:
+    return (
+        entry.st_dev == metadata.st_dev
+        and entry.st_ino == metadata.st_ino
+        and entry.st_mode == metadata.st_mode
+        and entry.st_size == metadata.st_size
+        and entry.st_mtime_ns == metadata.st_mtime_ns
+        and entry.st_ctime_ns == metadata.st_ctime_ns
+        and entry.st_nlink == metadata.st_nlink
+    )
+
+
+def _is_tree_drift_oserror(error: OSError) -> bool:
+    return error.errno in {errno.ENOENT, getattr(errno, "ESTALE", -1)}
+
+
+def _is_tree_policy_oserror(error: OSError) -> bool:
+    return error.errno in {errno.EACCES, errno.EPERM}
+
+
+def _entry_policy_violation(mode: int) -> TreePolicyViolation:
+    return "symlink" if stat.S_ISLNK(mode) else "special-file"
 
 
 def _enumerate_directory(capability: LinuxPathCapability) -> tuple[_EnumeratedEntry, ...]:
@@ -487,37 +621,62 @@ def _enumerate_directory(capability: LinuxPathCapability) -> tuple[_EnumeratedEn
         with os.scandir(scan_capability.fd) as iterator:
             for entry in iterator:
                 if len(entries) >= _MAX_DIRECTORY_ENTRIES:
-                    raise LinuxCapabilityError(
-                        "directory enumeration exceeded the structural entry bound"
+                    raise LinuxTreePolicyError(
+                        "directory enumeration exceeded the structural entry bound",
+                        "structural-shape",
+                        path="",
                     )
                 try:
                     metadata = entry.stat(follow_symlinks=False)
                 except OSError as exc:
+                    if _is_tree_drift_oserror(exc):
+                        raise LinuxTreeDriftError(
+                            f"FD-relative entry changed while being enumerated: {entry.name!r}"
+                        ) from exc
+                    if _is_tree_policy_oserror(exc):
+                        raise LinuxTreePolicyError(
+                            f"FD-relative entry is unreadable: {entry.name!r}",
+                            "unreadable",
+                            path=entry.name,
+                        ) from exc
                     raise LinuxCapabilityError(
                         f"could not inspect FD-relative entry {entry.name!r}"
                     ) from exc
-                entries.append(
-                    _EnumeratedEntry(
-                        name=_component_text(entry.name, label="directory entry"),
-                        st_dev=metadata.st_dev,
-                        st_ino=metadata.st_ino,
-                        st_mode=metadata.st_mode,
-                    )
-                )
+                try:
+                    entries.append(_entry_from_stat(entry.name, metadata))
+                except LinuxCapabilityError as exc:
+                    raise LinuxTreePolicyError(
+                        f"FD-relative entry name violates tree policy: {entry.name!r}",
+                        "invalid-name",
+                        path=entry.name,
+                    ) from exc
     except OSError as exc:
+        if _is_tree_drift_oserror(exc):
+            raise LinuxTreeDriftError(
+                "FD-relative directory changed while being enumerated"
+            ) from exc
+        if _is_tree_policy_oserror(exc):
+            raise LinuxTreePolicyError(
+                "FD-relative directory is unreadable", "unreadable", path=""
+            ) from exc
         raise LinuxCapabilityError("could not enumerate pinned directory capability") from exc
     finally:
         scan_capability.close()
     return tuple(sorted(entries, key=lambda value: value.name.encode("utf-8")))
 
 
-def open_verified_child(
+def _open_verified_destination_child(
     parent: LinuxPathCapability,
     entry: _EnumeratedEntry,
     *,
     display_path: str,
 ) -> LinuxPathCapability:
-    """Open one enumerated component and bind its identity to the opened object."""
+    """Open one already-created child while validating an exclusive private destination tree."""
+
+    if not parent._exclusive_copy_destination:
+        raise LinuxCapabilityError(
+            "destination child validation requires an exclusive private capability"
+        )
 
     if stat.S_ISLNK(entry.st_mode) or not (
         stat.S_ISDIR(entry.st_mode) or stat.S_ISREG(entry.st_mode)
@@ -534,16 +693,337 @@ def open_verified_child(
         raise LinuxCapabilityError(
             f"FD-relative entry changed or became unreadable: {display_path!r}"
         ) from exc
-    if (
-        child.st_dev != entry.st_dev
-        or child.st_ino != entry.st_ino
-        or stat.S_IFMT(child.st_mode) != stat.S_IFMT(entry.st_mode)
-    ):
+    try:
+        held_metadata = os.fstat(child.fd)
+    except OSError as exc:
+        child.close()
+        raise LinuxCapabilityError(
+            f"could not inspect FD-relative entry after open: {display_path!r}"
+        ) from exc
+    if not _entry_matches_stat(entry, held_metadata):
         child.close()
         raise LinuxCapabilityError(
             f"FD-relative entry identity changed before open: {display_path!r}"
         )
+    try:
+        named_metadata = os.stat(entry.name, dir_fd=parent.fd, follow_symlinks=False)
+    except OSError as exc:
+        child.close()
+        raise LinuxCapabilityError(
+            f"FD-relative entry changed after open: {display_path!r}"
+        ) from exc
+    if not _entry_matches_stat(entry, named_metadata):
+        child.close()
+        raise LinuxCapabilityError(f"FD-relative entry changed after open: {display_path!r}")
     return child
+
+
+def _verify_held_child_name(
+    parent: LinuxPathCapability,
+    entry: _EnumeratedEntry,
+    child: LinuxPathCapability,
+    *,
+    display_path: str,
+) -> None:
+    """Prove a held child still has its original verified parent-directory binding."""
+
+    try:
+        held_metadata = os.fstat(child.fd)
+        named_metadata = os.stat(entry.name, dir_fd=parent.fd, follow_symlinks=False)
+    except OSError as exc:
+        if _is_tree_drift_oserror(exc):
+            raise LinuxTreeDriftError(
+                f"FD-relative entry changed after acquisition: {display_path!r}"
+            ) from exc
+        if _is_tree_policy_oserror(exc):
+            raise LinuxTreePolicyError(
+                f"FD-relative entry is unreadable: {display_path!r}",
+                "unreadable",
+                path=display_path,
+            ) from exc
+        raise LinuxCapabilityError(
+            f"could not inspect FD-relative entry after acquisition: {display_path!r}"
+        ) from exc
+    if not _entry_matches_stat(entry, held_metadata) or not _entry_matches_stat(
+        entry,
+        named_metadata,
+    ):
+        raise LinuxTreeDriftError(f"FD-relative entry changed after acquisition: {display_path!r}")
+
+
+def _acquire_current_child(
+    parent: LinuxPathCapability,
+    name: str,
+    *,
+    display_path: str,
+) -> tuple[_EnumeratedEntry, LinuxPathCapability]:
+    """Open a child before snapshotting it, then bind its live name to that FD.
+
+    A directory stream may retain a name after its original object has been unlinked.  On ext4
+    the inode can be reused immediately, so a naked ``DirEntry.stat()`` tuple is not a durable
+    authority.  Acquire the descriptor first; the held object's metadata is the only snapshot
+    used for a later visit, and the no-follow parent lookup proves the name still denotes it.
+    """
+
+    component = _component_text(name, label="directory entry")
+    try:
+        child = parent.open_beneath(component, expected="any", display_path=display_path)
+    except LinuxCapabilityUnavailableError:
+        raise
+    except _OpenAt2Error as exc:
+        if exc.error_number in {errno.ENOENT, getattr(errno, "ESTALE", -1)}:
+            raise LinuxTreeDriftError(
+                f"FD-relative entry changed before acquisition: {display_path!r}"
+            ) from exc
+        if exc.error_number in {errno.EACCES, errno.EPERM}:
+            raise LinuxTreePolicyError(
+                f"FD-relative entry is unreadable: {display_path!r}",
+                "unreadable",
+                path=display_path,
+            ) from exc
+        try:
+            failed_metadata = os.stat(
+                component,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except OSError as inspect_error:
+            if _is_tree_drift_oserror(inspect_error):
+                raise LinuxTreeDriftError(
+                    f"FD-relative entry changed before acquisition: {display_path!r}"
+                ) from exc
+            raise LinuxCapabilityError(
+                f"could not inspect FD-relative entry before acquisition: {display_path!r}"
+            ) from inspect_error
+        if stat.S_ISLNK(failed_metadata.st_mode) or not (
+            stat.S_ISDIR(failed_metadata.st_mode) or stat.S_ISREG(failed_metadata.st_mode)
+        ):
+            raise LinuxTreePolicyError(
+                f"FD-relative entry is a symlink or special file: {display_path!r}",
+                _entry_policy_violation(failed_metadata.st_mode),
+                path=display_path,
+            ) from exc
+        raise LinuxCapabilityError(
+            f"could not acquire FD-relative entry: {display_path!r}"
+        ) from exc
+    except LinuxCapabilityError as exc:
+        # This lookup classifies a failed acquisition only; it never supplies authority for a
+        # successful visit.  The latter always comes from the held descriptor below.
+        try:
+            failed_metadata = os.stat(
+                component,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except OSError as inspect_error:
+            if _is_tree_drift_oserror(inspect_error):
+                raise LinuxTreeDriftError(
+                    f"FD-relative entry changed before acquisition: {display_path!r}"
+                ) from exc
+            raise LinuxCapabilityError(
+                f"could not inspect FD-relative entry before acquisition: {display_path!r}"
+            ) from inspect_error
+        if failed_metadata is not None and (
+            stat.S_ISLNK(failed_metadata.st_mode)
+            or not (stat.S_ISDIR(failed_metadata.st_mode) or stat.S_ISREG(failed_metadata.st_mode))
+        ):
+            raise LinuxTreePolicyError(
+                f"FD-relative entry is a symlink or special file: {display_path!r}",
+                _entry_policy_violation(failed_metadata.st_mode),
+                path=display_path,
+            ) from exc
+        raise LinuxCapabilityError(
+            f"FD-relative entry changed or became unreadable: {display_path!r}"
+        ) from exc
+    try:
+        held_metadata = os.fstat(child.fd)
+        entry = _entry_from_stat(component, held_metadata)
+        if not (stat.S_ISDIR(held_metadata.st_mode) or stat.S_ISREG(held_metadata.st_mode)):
+            raise LinuxTreePolicyError(
+                f"FD-relative entry is a symlink or special file: {display_path!r}",
+                _entry_policy_violation(held_metadata.st_mode),
+                path=display_path,
+            )
+        named_metadata = os.stat(component, dir_fd=parent.fd, follow_symlinks=False)
+    except OSError as exc:
+        child.close()
+        if _is_tree_drift_oserror(exc):
+            raise LinuxTreeDriftError(
+                f"FD-relative entry changed after acquisition: {display_path!r}"
+            ) from exc
+        if _is_tree_policy_oserror(exc):
+            raise LinuxTreePolicyError(
+                f"FD-relative entry is unreadable: {display_path!r}",
+                "unreadable",
+                path=display_path,
+            ) from exc
+        raise LinuxCapabilityError(
+            f"could not inspect FD-relative entry after open: {display_path!r}"
+        ) from exc
+    except BaseException:
+        child.close()
+        raise
+    if not _entry_matches_stat(entry, named_metadata):
+        child.close()
+        raise LinuxTreeDriftError(f"FD-relative entry changed after acquisition: {display_path!r}")
+    return entry, child
+
+
+def _metadata_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        metadata.st_nlink,
+    )
+
+
+def _verify_directory_metadata(
+    directory: LinuxPathCapability,
+    *,
+    initial_metadata: os.stat_result,
+    display_path: str,
+) -> None:
+    """Require that no source-directory namespace or metadata mutation preceded a visit."""
+
+    try:
+        current_metadata = os.fstat(directory.fd)
+    except OSError as exc:
+        if _is_tree_drift_oserror(exc):
+            raise LinuxTreeDriftError(
+                f"FD-relative source directory changed while being visited: {display_path!r}"
+            ) from exc
+        raise LinuxCapabilityError(
+            f"could not verify FD-relative source directory {display_path!r}"
+        ) from exc
+    if _metadata_fingerprint(current_metadata) != _metadata_fingerprint(initial_metadata):
+        raise LinuxTreeDriftError(
+            f"FD-relative source directory changed while being visited: {display_path!r}"
+        )
+
+
+def _verify_directory_snapshot(
+    directory: LinuxPathCapability,
+    expected: tuple[_EnumeratedEntry, ...],
+    *,
+    initial_metadata: os.stat_result,
+    display_path: str,
+) -> None:
+    """Require a source directory's names and metadata to remain coherent through a visit."""
+
+    _verify_directory_metadata(
+        directory,
+        initial_metadata=initial_metadata,
+        display_path=display_path,
+    )
+    observed = _enumerate_directory(directory)
+    if observed != expected:
+        raise LinuxTreeDriftError(
+            f"FD-relative source directory entries changed while being visited: {display_path!r}"
+        )
+
+
+def _stream_verified_children(
+    directory: LinuxPathCapability,
+    *,
+    relative_parent: str,
+    before_open: Callable[[str], None] | None,
+    visit: Callable[[_EnumeratedEntry, LinuxPathCapability, str], None],
+    omit_names: frozenset[str] = frozenset(),
+) -> None:
+    """Acquire each child before it can be freed, verify its name, then visit while held."""
+
+    try:
+        initial_metadata = os.fstat(directory.fd)
+    except OSError as exc:
+        if _is_tree_drift_oserror(exc):
+            raise LinuxTreeDriftError(
+                "FD-relative source directory changed while being visited: "
+                f"{directory.display_path!r}"
+            ) from exc
+        raise LinuxCapabilityError(
+            f"could not inspect FD-relative source directory {directory.display_path!r}"
+        ) from exc
+    entries: list[_EnumeratedEntry] = []
+    scan_capability = directory.reopen_directory()
+    try:
+        with os.scandir(scan_capability.fd) as iterator:
+            for raw_entry in iterator:
+                if len(entries) >= _MAX_DIRECTORY_ENTRIES:
+                    raise LinuxTreePolicyError(
+                        "directory enumeration exceeded the structural entry bound",
+                        "structural-shape",
+                    )
+                try:
+                    name = _component_text(raw_entry.name, label="directory entry")
+                except LinuxCapabilityError as exc:
+                    raise LinuxTreePolicyError(
+                        f"FD-relative entry name violates tree policy: {raw_entry.name!r}",
+                        "invalid-name",
+                    ) from exc
+                relative = name if not relative_parent else f"{relative_parent}/{name}"
+                entry, child = _acquire_current_child(
+                    directory,
+                    name,
+                    display_path=relative,
+                )
+                entries.append(entry)
+                try:
+                    # The held no-follow FD is the acquisition authority: a replacement that
+                    # wins before this open is simply the current child.  Recheck observable
+                    # parent metadata before invoking any visitor, while post-acquisition name
+                    # rebinding below rejects a replacement that races the actual visit.
+                    _verify_directory_metadata(
+                        directory,
+                        initial_metadata=initial_metadata,
+                        display_path=relative_parent or directory.display_path,
+                    )
+                    if entry.name in omit_names:
+                        continue
+                    # The hook deliberately runs only after the descriptor is held.  A test or
+                    # hostile source can therefore rename/unlink/recreate the name, but it cannot
+                    # make this visit read a replacement object; the post-hook binding check fails.
+                    if before_open is not None:
+                        before_open(relative)
+                    _verify_held_child_name(
+                        directory,
+                        entry,
+                        child,
+                        display_path=relative,
+                    )
+                    visit(entry, child, relative)
+                    _verify_held_child_name(
+                        directory,
+                        entry,
+                        child,
+                        display_path=relative,
+                    )
+                    _verify_directory_metadata(
+                        directory,
+                        initial_metadata=initial_metadata,
+                        display_path=relative_parent or directory.display_path,
+                    )
+                finally:
+                    child.close()
+    except OSError as exc:
+        if _is_tree_drift_oserror(exc):
+            raise LinuxTreeDriftError(
+                "FD-relative directory changed while being enumerated"
+            ) from exc
+        if _is_tree_policy_oserror(exc):
+            raise LinuxTreePolicyError("FD-relative directory is unreadable", "unreadable") from exc
+        raise LinuxCapabilityError("could not enumerate pinned directory capability") from exc
+    finally:
+        scan_capability.close()
+    _verify_directory_snapshot(
+        directory,
+        tuple(sorted(entries, key=lambda value: value.name.encode("utf-8"))),
+        initial_metadata=initial_metadata,
+        display_path=relative_parent or directory.display_path,
+    )
 
 
 def open_verified_children(
@@ -556,18 +1036,403 @@ def open_verified_children(
 
     acquired: list[tuple[str, LinuxPathCapability]] = []
     try:
-        for entry in _enumerate_directory(root):
-            if entry.name in omit_names:
-                continue
-            display = f"{root.display_path.rstrip('/')}/{entry.name}"
-            if before_open is not None:
-                before_open(entry.name)
-            acquired.append((entry.name, open_verified_child(root, entry, display_path=display)))
+
+        def retain(
+            entry: _EnumeratedEntry,
+            child: LinuxPathCapability,
+            _relative: str,
+        ) -> None:
+            acquired.append((entry.name, child.duplicate()))
+
+        _stream_verified_children(
+            root,
+            relative_parent="",
+            before_open=before_open,
+            visit=retain,
+            omit_names=omit_names,
+        )
         return tuple(acquired)
     except BaseException:
         for _name, capability in acquired:
             capability.close()
         raise
+
+
+def _display_child(parent: LinuxPathCapability, name: str) -> str:
+    return f"{parent.display_path.rstrip('/')}/{name}"
+
+
+def _entry_from_capability(name: str, capability: LinuxPathCapability) -> _EnumeratedEntry:
+    """Capture the current descriptor identity for a destination entry."""
+
+    try:
+        metadata = os.fstat(capability.fd)
+    except OSError as exc:
+        raise LinuxCapabilityError(f"could not inspect copied FD-relative entry {name!r}") from exc
+    return _entry_from_stat(name, metadata)
+
+
+def _create_destination_directory(
+    parent: LinuxPathCapability,
+    name: str,
+    *,
+    display_path: str,
+) -> LinuxPathCapability:
+    """Create and identity-bind a single child directory below an owned parent FD."""
+
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent.fd)
+    except FileExistsError as exc:
+        raise LinuxCapabilityError(f"copy destination already contains {display_path!r}") from exc
+    except OSError as exc:
+        raise LinuxCapabilityError(
+            f"could not create FD-relative directory {display_path!r}"
+        ) from exc
+    try:
+        metadata = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+    except OSError as exc:
+        raise LinuxCapabilityError(
+            f"could not inspect created FD-relative directory {display_path!r}"
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise LinuxCapabilityError(
+            f"created FD-relative directory changed before open: {display_path!r}"
+        )
+    created = _entry_from_stat(name, metadata)
+    directory = _open_verified_destination_child(parent, created, display_path=display_path)
+    try:
+        # The source directory may be read-only.  Keep the destination traversable while its
+        # descendants are copied, then restore only its ordinary permission bits at completion.
+        os.chmod(directory.fd, 0o700)
+    except OSError as exc:
+        directory.close()
+        raise LinuxCapabilityError(
+            f"could not prepare FD-relative directory {display_path!r}"
+        ) from exc
+    return directory
+
+
+def _create_destination_regular(
+    parent: LinuxPathCapability,
+    name: str,
+    *,
+    display_path: str,
+) -> LinuxPathCapability:
+    """Create a private regular destination file below an owned parent FD."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_CLOEXEC | _O_NOFOLLOW
+    try:
+        fd = os.open(name, flags, 0o600, dir_fd=parent.fd)
+    except FileExistsError as exc:
+        raise LinuxCapabilityError(f"copy destination already contains {display_path!r}") from exc
+    except OSError as exc:
+        raise LinuxCapabilityError(f"could not create FD-relative file {display_path!r}") from exc
+    return LinuxPathCapability._from_open_fd(
+        fd,
+        display_path=display_path,
+        expected="regular",
+        exclusive_copy_destination=parent._exclusive_copy_destination,
+    )
+
+
+def _write_all(fd: int, value: bytes) -> None:
+    """Write one buffered block completely, retaining the caller's descriptor ownership."""
+
+    remaining = memoryview(value)
+    while remaining:
+        try:
+            written = os.write(fd, remaining)
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise LinuxCapabilityError("could not write copied regular file") from exc
+        if written <= 0:
+            raise LinuxCapabilityError("could not write copied regular file")
+        remaining = remaining[written:]
+
+
+def _copy_regular_contents(
+    source: LinuxPathCapability,
+    destination: LinuxPathCapability,
+    *,
+    source_entry: _EnumeratedEntry,
+    display_path: str,
+) -> None:
+    """Copy and re-read one stable source file, rejecting same-size content mutation."""
+
+    size_bytes = source_entry.st_size
+    try:
+        os.lseek(source.fd, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise LinuxCapabilityError(
+            f"could not seek FD-relative source file {display_path!r}"
+        ) from exc
+    copied_digest = hashlib.blake2b(digest_size=32)
+    remaining = size_bytes
+    while remaining:
+        try:
+            block = os.read(source.fd, min(_COPY_CHUNK_BYTES, remaining))
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise LinuxCapabilityError(
+                f"could not read FD-relative source file {display_path!r}"
+            ) from exc
+        if not block:
+            raise LinuxTreeDriftError(
+                f"FD-relative source file changed while being copied: {display_path!r}"
+            )
+        _write_all(destination.fd, block)
+        copied_digest.update(block)
+        remaining -= len(block)
+    try:
+        first_final_source = os.fstat(source.fd)
+        final_destination = os.fstat(destination.fd)
+    except OSError as exc:
+        raise LinuxCapabilityError(
+            f"could not verify copied FD-relative file {display_path!r}"
+        ) from exc
+    if not _entry_matches_stat(source_entry, first_final_source):
+        raise LinuxTreeDriftError(
+            f"FD-relative source file changed while being copied: {display_path!r}"
+        )
+    if not stat.S_ISREG(final_destination.st_mode) or final_destination.st_size != size_bytes:
+        raise LinuxCapabilityError(f"copied FD-relative file changed: {display_path!r}")
+    try:
+        os.lseek(source.fd, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise LinuxCapabilityError(
+            f"could not seek FD-relative source file {display_path!r}"
+        ) from exc
+    verified_digest = hashlib.blake2b(digest_size=32)
+    remaining = size_bytes
+    while remaining:
+        try:
+            block = os.read(source.fd, min(_COPY_CHUNK_BYTES, remaining))
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise LinuxCapabilityError(
+                f"could not verify FD-relative source file {display_path!r}"
+            ) from exc
+        if not block:
+            raise LinuxTreeDriftError(
+                f"FD-relative source file changed while being copied: {display_path!r}"
+            )
+        verified_digest.update(block)
+        remaining -= len(block)
+    try:
+        second_final_source = os.fstat(source.fd)
+    except OSError as exc:
+        raise LinuxCapabilityError(
+            f"could not verify FD-relative source file {display_path!r}"
+        ) from exc
+    if (
+        not _entry_matches_stat(source_entry, second_final_source)
+        or copied_digest.digest() != verified_digest.digest()
+    ):
+        raise LinuxTreeDriftError(
+            f"FD-relative source file changed while being copied: {display_path!r}"
+        )
+
+
+def _set_copied_mode(capability: LinuxPathCapability, mode: int, *, display_path: str) -> None:
+    """Restore only ordinary rwx bits; ownership, timestamps, and special bits never transfer."""
+
+    try:
+        os.chmod(capability.fd, stat.S_IMODE(mode) & 0o777)
+    except OSError as exc:
+        raise LinuxCapabilityError(
+            f"could not set copied FD-relative mode for {display_path!r}"
+        ) from exc
+
+
+def _verify_copied_entries(
+    directory: LinuxPathCapability,
+    expected: tuple[_CopiedEntry, ...],
+    *,
+    relative_parent: str,
+    depth: int,
+) -> None:
+    """Ensure the destination still consists of the exact identities created by this copy."""
+
+    if depth > _MAX_ANCESTRY_DEPTH:
+        raise LinuxTreePolicyError(
+            "tree copy exceeded the structural depth bound", "structural-shape"
+        )
+    observed = _enumerate_directory(directory)
+    expected_by_name = {value.entry.name: value for value in expected}
+    if len(observed) != len(expected) or any(
+        entry.name not in expected_by_name for entry in observed
+    ):
+        raise LinuxCapabilityError("copy destination changed while the tree was being copied")
+    for observed_entry in observed:
+        copied = expected_by_name[observed_entry.name]
+        expected_entry = copied.entry
+        if observed_entry != expected_entry:
+            raise LinuxCapabilityError("copy destination changed while the tree was being copied")
+        relative = (
+            observed_entry.name
+            if not relative_parent
+            else f"{relative_parent}/{observed_entry.name}"
+        )
+        child = _open_verified_destination_child(directory, expected_entry, display_path=relative)
+        try:
+            if copied.is_directory:
+                _verify_copied_entries(
+                    child,
+                    copied.children,
+                    relative_parent=relative,
+                    depth=depth + 1,
+                )
+        finally:
+            child.close()
+
+
+def copy_tree(
+    source: LinuxPathCapability,
+    destination: LinuxPathCapability,
+    *,
+    file_limit: int | None = None,
+    byte_limit: int | None = None,
+    before_open: Callable[[str], None] | None = None,
+) -> TreeWalkUsage:
+    """Copy a held source directory's regular-file tree into an empty held destination directory.
+
+    Both root capabilities remain owned by the caller.  Every source entry is enumerated and
+    opened through descriptor-relative no-follow operations, while every destination name is a
+    validated single component created under its held directory descriptor.  The result counts
+    logical regular-file bytes and nested directories, matching :func:`walk_tree` semantics.
+    """
+
+    if not stat.S_ISDIR(source.st_mode):
+        raise LinuxCapabilityError("tree copy source must be a directory capability")
+    if not stat.S_ISDIR(destination.st_mode):
+        raise LinuxCapabilityError("tree copy destination must be a directory capability")
+    if not destination._exclusive_copy_destination:
+        raise LinuxCapabilityError(
+            "tree copy destination must be a validated exclusive private capability"
+        )
+    if capabilities_overlap(source, destination):
+        raise LinuxCapabilityError("tree copy source and destination capabilities may not overlap")
+    if _enumerate_directory(destination):
+        raise LinuxCapabilityError("tree copy destination must be empty")
+
+    file_count = 0
+    size_bytes = 0
+    directory_count = 0
+
+    def copy_directory(
+        relative_parent: str,
+        source_directory: LinuxPathCapability,
+        destination_directory: LinuxPathCapability,
+        depth: int,
+    ) -> tuple[_CopiedEntry, ...]:
+        nonlocal directory_count, file_count, size_bytes
+        if depth > _MAX_ANCESTRY_DEPTH:
+            raise LinuxTreePolicyError(
+                "tree copy exceeded the structural depth bound", "structural-shape"
+            )
+        copied_entries: list[_CopiedEntry] = []
+
+        def copy_child(
+            source_entry: _EnumeratedEntry,
+            source_child: LinuxPathCapability,
+            relative: str,
+        ) -> None:
+            nonlocal directory_count, file_count, size_bytes
+            destination_display = _display_child(destination_directory, source_entry.name)
+            if stat.S_ISDIR(source_child.st_mode):
+                directory_count += 1
+                if directory_count > _MAX_TREE_DIRECTORIES:
+                    raise LinuxTreePolicyError(
+                        "tree copy exceeded the structural directory bound",
+                        "structural-shape",
+                    )
+                destination_child = _create_destination_directory(
+                    destination_directory,
+                    source_entry.name,
+                    display_path=destination_display,
+                )
+                try:
+                    children = copy_directory(
+                        relative,
+                        source_child,
+                        destination_child,
+                        depth + 1,
+                    )
+                    _set_copied_mode(
+                        destination_child,
+                        source_child.st_mode,
+                        display_path=destination_display,
+                    )
+                    copied_entries.append(
+                        _CopiedEntry(
+                            entry=_entry_from_capability(source_entry.name, destination_child),
+                            is_directory=True,
+                            children=children,
+                        )
+                    )
+                finally:
+                    destination_child.close()
+                return
+
+            file_count += 1
+            if file_limit is not None and file_count > file_limit:
+                raise LinuxTreeLimitError("file-count", file_count, size_bytes)
+            size_bytes += source_entry.st_size
+            if byte_limit is not None and size_bytes > byte_limit:
+                raise LinuxTreeLimitError("file-bytes", file_count, size_bytes)
+            destination_child = _create_destination_regular(
+                destination_directory,
+                source_entry.name,
+                display_path=destination_display,
+            )
+            try:
+                _copy_regular_contents(
+                    source_child,
+                    destination_child,
+                    source_entry=source_entry,
+                    display_path=relative,
+                )
+                _set_copied_mode(
+                    destination_child,
+                    source_child.st_mode,
+                    display_path=destination_display,
+                )
+                copied_entries.append(
+                    _CopiedEntry(
+                        entry=_entry_from_capability(source_entry.name, destination_child),
+                        is_directory=False,
+                    )
+                )
+            finally:
+                destination_child.close()
+
+        _stream_verified_children(
+            source_directory,
+            relative_parent=relative_parent,
+            before_open=before_open,
+            visit=copy_child,
+        )
+        return tuple(copied_entries)
+
+    try:
+        with (
+            source.reopen_directory() as source_root,
+            destination.reopen_directory() as destination_root,
+        ):
+            copied = copy_directory("", source_root, destination_root, 0)
+            _verify_copied_entries(destination_root, copied, relative_parent="", depth=0)
+    except RecursionError as exc:
+        raise LinuxTreePolicyError(
+            "tree copy exceeded the structural depth bound", "structural-shape"
+        ) from exc
+    return TreeWalkUsage(
+        file_count=file_count,
+        size_bytes=size_bytes,
+        directory_count=directory_count,
+    )
 
 
 def walk_tree(
@@ -588,35 +1453,46 @@ def walk_tree(
     def visit(relative_parent: str, directory: LinuxPathCapability, depth: int) -> None:
         nonlocal directory_count, file_count, size_bytes
         if depth > _MAX_ANCESTRY_DEPTH:
-            raise LinuxCapabilityError("tree walk exceeded the structural depth bound")
-        for entry in _enumerate_directory(directory):
-            relative = entry.name if not relative_parent else f"{relative_parent}/{entry.name}"
-            if before_open is not None:
-                before_open(relative)
-            child = open_verified_child(directory, entry, display_path=relative)
-            try:
-                if stat.S_ISDIR(child.st_mode):
-                    directory_count += 1
-                    if directory_count > _MAX_TREE_DIRECTORIES:
-                        raise LinuxCapabilityError(
-                            "tree walk exceeded the structural directory bound"
-                        )
-                    visit(relative, child, depth + 1)
-                else:
-                    file_count += 1
-                    if file_limit is not None and file_count > file_limit:
-                        raise LinuxTreeLimitError("file-count", file_count, size_bytes)
-                    size_bytes += os.fstat(child.fd).st_size
-                    if byte_limit is not None and size_bytes > byte_limit:
-                        raise LinuxTreeLimitError("file-bytes", file_count, size_bytes)
-            finally:
-                child.close()
+            raise LinuxTreePolicyError(
+                "tree walk exceeded the structural depth bound", "structural-shape"
+            )
+
+        def visit_child(
+            entry: _EnumeratedEntry,
+            child: LinuxPathCapability,
+            relative: str,
+        ) -> None:
+            nonlocal directory_count, file_count, size_bytes
+            if stat.S_ISDIR(child.st_mode):
+                directory_count += 1
+                if directory_count > _MAX_TREE_DIRECTORIES:
+                    raise LinuxTreePolicyError(
+                        "tree walk exceeded the structural directory bound",
+                        "structural-shape",
+                    )
+                visit(relative, child, depth + 1)
+                return
+            file_count += 1
+            if file_limit is not None and file_count > file_limit:
+                raise LinuxTreeLimitError("file-count", file_count, size_bytes)
+            size_bytes += entry.st_size
+            if byte_limit is not None and size_bytes > byte_limit:
+                raise LinuxTreeLimitError("file-bytes", file_count, size_bytes)
+
+        _stream_verified_children(
+            directory,
+            relative_parent=relative_parent,
+            before_open=before_open,
+            visit=visit_child,
+        )
 
     with root.reopen_directory() as scan_root:
         try:
             visit("", scan_root, 0)
         except RecursionError as exc:
-            raise LinuxCapabilityError("tree walk exceeded the structural depth bound") from exc
+            raise LinuxTreePolicyError(
+                "tree walk exceeded the structural depth bound", "structural-shape"
+            ) from exc
     return TreeWalkUsage(
         file_count=file_count,
         size_bytes=size_bytes,
@@ -628,12 +1504,14 @@ __all__ = [
     "LinuxCapabilityError",
     "LinuxCapabilityUnavailableError",
     "LinuxPathCapability",
+    "LinuxTreeDriftError",
     "LinuxTreeLimitError",
+    "LinuxTreePolicyError",
     "TreeLimitName",
     "TreeWalkUsage",
     "capabilities_overlap",
+    "copy_tree",
     "is_ancestor",
-    "open_verified_child",
     "open_verified_children",
     "walk_tree",
 ]

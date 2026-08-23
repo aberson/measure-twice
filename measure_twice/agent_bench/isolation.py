@@ -31,9 +31,16 @@ from measure_twice.agent_bench._linux_capabilities import (
     walk_tree,
 )
 from measure_twice.agent_bench.models import Ceilings
-from measure_twice.agent_bench.process import ProcessRequest, ProcessResourceLimits
+from measure_twice.agent_bench.process import (
+    EVALUATOR_WORKSPACE_FD_TOKEN,
+    EvaluatorScratch,
+    LinuxResourceGuard,
+    ProcessExecutionError,
+    ProcessRequest,
+    ProcessResourceLimits,
+)
 
-SANDBOX_CONTRACT_VERSION: Final[str] = "linux-bwrap-v1"
+SANDBOX_CONTRACT_VERSION: Final[str] = "linux-bwrap-v2"
 _BWRAP_UNAVAILABLE: Final[str] = (
     "compatible Bubblewrap with behavioral --bind-fd/--ro-bind-fd support is unavailable"
 )
@@ -77,6 +84,7 @@ _BASE_ENVIRONMENT: Final[Mapping[str, str]] = MappingProxyType(
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PATH": "/usr/bin:/bin",
+        "PWD": "/workspace",
         "TMPDIR": _SANDBOX_TMP,
     }
 )
@@ -367,9 +375,11 @@ class SandboxLaunch:
     _mounts: tuple[_FdMount, ...] = field(repr=False)
     _overlap_roots: tuple[LinuxPathCapability, ...] = field(default=(), repr=False)
     resource_limits: ProcessResourceLimits | None = None
+    resource_guard: LinuxResourceGuard | None = field(default=None, repr=False)
     evaluator_file_limit: int | None = None
     evaluator_bytes_limit: int | None = None
     _terminal_tree: LinuxPathCapability | None = field(default=None, repr=False)
+    _evaluator_scratch: EvaluatorScratch | None = field(default=None, repr=False)
     _tree_before_open: RaceHook | None = field(default=None, repr=False)
     _ownership: _LaunchOwnership = field(default_factory=_LaunchOwnership, repr=False)
 
@@ -380,9 +390,10 @@ class SandboxLaunch:
             raise IsolationContractError(f"{self.profile} profile must isolate the network")
         if self.profile == "evaluator" and (
             self.resource_limits is None
+            or self.resource_guard is None
             or self.evaluator_file_limit is None
             or self.evaluator_bytes_limit is None
-            or self._terminal_tree is None
+            or self._evaluator_scratch is None
         ):
             raise IsolationContractError("evaluator launch requires every resource/tree ceiling")
 
@@ -447,6 +458,8 @@ class SandboxLaunch:
                     mount.destination,
                 )
             )
+        if self._evaluator_scratch is not None:
+            argv.extend(("--bind-fd", EVALUATOR_WORKSPACE_FD_TOKEN, "/workspace"))
         argv.extend(
             (
                 "--symlink",
@@ -526,6 +539,8 @@ class SandboxLaunch:
                     stream_limit_bytes=stream_limit_bytes,
                     secret_values=tuple(secret_values),
                     resource_limits=self.resource_limits,
+                    resource_guard=self.resource_guard,
+                    evaluator_scratch=self._evaluator_scratch,
                     cwd_capability=cwd,
                     executable_capability=bwrap,
                     inherited_capabilities=tuple(mount.capability for mount in mounts),
@@ -537,6 +552,8 @@ class SandboxLaunch:
                 _close_capabilities(self._launch_capabilities())
                 if self._terminal_tree is not None:
                     self._terminal_tree.close()
+                if self._evaluator_scratch is not None:
+                    self._evaluator_scratch.close()
                 self._ownership.closed = True
                 raise
             _close_capabilities(self._launch_capabilities())
@@ -546,10 +563,21 @@ class SandboxLaunch:
         """Borrow the retained evaluator root for immediate terminal validation."""
 
         with self._ownership.lock:
-            if self._ownership.closed or self._terminal_tree is None:
+            if self._ownership.closed:
                 raise IsolationContractError("evaluator terminal tree capability is unavailable")
-        _ = self._terminal_tree.fd
-        return self._terminal_tree
+            scratch = self._evaluator_scratch
+            terminal = self._terminal_tree
+        if scratch is not None:
+            try:
+                return scratch.terminal_tree_capability()
+            except ProcessExecutionError as exc:
+                raise IsolationContractError(
+                    "evaluator terminal tree capability is unavailable"
+                ) from exc
+        if terminal is None:
+            raise IsolationContractError("evaluator terminal tree capability is unavailable")
+        _ = terminal.fd
+        return terminal
 
     def close(self) -> None:
         with self._ownership.lock:
@@ -559,6 +587,8 @@ class SandboxLaunch:
         _close_capabilities(self._launch_capabilities())
         if self._terminal_tree is not None:
             self._terminal_tree.close()
+        if self._evaluator_scratch is not None:
+            self._evaluator_scratch.close()
 
     def __enter__(self) -> Self:
         with self._ownership.lock:
@@ -568,10 +598,6 @@ class SandboxLaunch:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
-
-
-# Backward-compatible name for the Step-26 utility boundary.
-SandboxSpec = SandboxLaunch
 
 
 def _read_text(path: Path, *, label: str) -> str:
@@ -1003,8 +1029,11 @@ def _new_launch(
     cwd_source: LinuxPathCapability,
     terminal_tree: LinuxPathCapability | None = None,
     resource_limits: ProcessResourceLimits | None = None,
+    resource_guard: LinuxResourceGuard | None = None,
     evaluator_file_limit: int | None = None,
     evaluator_bytes_limit: int | None = None,
+    evaluator_scratch: EvaluatorScratch | None = None,
+    writable_mounts: Sequence[str] | None = None,
     tree_before_open: RaceHook | None = None,
     overlap_sources: Sequence[LinuxPathCapability] = (),
 ) -> SandboxLaunch:
@@ -1019,11 +1048,16 @@ def _new_launch(
         return SandboxLaunch(
             profile=profile,
             network_isolated=network_isolated,
-            writable_mounts=tuple(mount.destination for mount in mounts if not mount.read_only),
+            writable_mounts=(
+                tuple(mount.destination for mount in mounts if not mount.read_only)
+                if writable_mounts is None
+                else tuple(writable_mounts)
+            ),
             read_only_mounts=tuple(mount.destination for mount in mounts if mount.read_only),
             command=command,
             environment=environment,
             resource_limits=resource_limits,
+            resource_guard=resource_guard,
             evaluator_file_limit=evaluator_file_limit,
             evaluator_bytes_limit=evaluator_bytes_limit,
             _bwrap=bwrap,
@@ -1031,6 +1065,7 @@ def _new_launch(
             _mounts=tuple(mounts),
             _overlap_roots=tuple(overlap_roots),
             _terminal_tree=terminal_tree,
+            _evaluator_scratch=evaluator_scratch,
             _tree_before_open=tree_before_open,
         )
     except BaseException:
@@ -1042,6 +1077,8 @@ def _new_launch(
         _close_capabilities(tuple(mount.capability for mount in mounts))
         if terminal_tree is not None:
             terminal_tree.close()
+        if evaluator_scratch is not None:
+            evaluator_scratch.close()
         raise
 
 
@@ -1142,7 +1179,6 @@ def build_capture_sandbox(
             overlap_sources=(submitted, repository),
         )
     except BaseException:
-        submitted.close()
         if repository is not None:
             repository.close()
         _close_capabilities(tuple(capability for _name, capability in children))
@@ -1168,7 +1204,7 @@ def build_evaluator_sandbox(
         raise IsolationContractError("evaluator ceilings must be a Ceilings instance")
     sandbox_command = _sandbox_command(command)
     acquired: list[LinuxPathCapability] = []
-    terminal_tree: LinuxPathCapability | None = None
+    evaluator_scratch: EvaluatorScratch | None = None
     try:
         workspace_capability = preflight.acquire(workspace, label="evaluator workspace")
         acquired.append(workspace_capability)
@@ -1185,7 +1221,13 @@ def build_evaluator_sandbox(
                     raise IsolationContractError(
                         "evaluator workspace, oracle, and runtime may not overlap"
                     )
-        terminal_tree = workspace_capability.reopen_directory()
+        evaluator_scratch = EvaluatorScratch(
+            source=workspace_capability.reopen_directory(),
+            file_limit=ceilings.evaluator_files,
+            byte_limit=ceilings.evaluator_file_bytes,
+            tmpfs_bytes=ceilings.evaluator_tmpfs_bytes,
+            tmpfs_inodes=ceilings.evaluator_tmpfs_inodes,
+        )
         limits = ProcessResourceLimits(
             cpu_seconds=ceilings.evaluator_cpu_s,
             memory_bytes=ceilings.evaluator_memory_bytes,
@@ -1195,14 +1237,14 @@ def build_evaluator_sandbox(
             tree_files=ceilings.evaluator_files,
             tree_bytes=ceilings.evaluator_file_bytes,
         )
+        guard = LinuxResourceGuard(
+            memory_bytes=ceilings.evaluator_memory_bytes,
+            processes=ceilings.evaluator_processes,
+            cpu_bandwidth_percent=ceilings.evaluator_cpu_bandwidth_percent,
+        )
         mounts = _base_mounts(preflight, include_network=False)
         mounts.extend(
             (
-                _FdMount(
-                    read_only=False,
-                    destination="/workspace",
-                    capability=workspace_capability,
-                ),
                 _FdMount(
                     read_only=True,
                     destination="/opt/measure-twice/oracle",
@@ -1215,7 +1257,7 @@ def build_evaluator_sandbox(
                 ),
             )
         )
-        return _new_launch(
+        launch = _new_launch(
             profile="evaluator",
             preflight=preflight,
             network_isolated=True,
@@ -1223,17 +1265,23 @@ def build_evaluator_sandbox(
             environment=allowlisted_environment({}, fixed=EVALUATOR_ENVIRONMENT),
             mounts=mounts,
             cwd_source=workspace_capability,
-            terminal_tree=terminal_tree,
             resource_limits=limits,
+            resource_guard=guard,
             evaluator_file_limit=ceilings.evaluator_files,
             evaluator_bytes_limit=ceilings.evaluator_file_bytes,
+            evaluator_scratch=evaluator_scratch,
+            writable_mounts=("/workspace",),
             tree_before_open=_tree_before_open,
             overlap_sources=(workspace_capability, oracle_capability, runtime_capability),
         )
+        # The launch owns reopened cwd/overlap roots and EvaluatorScratch owns its reopened seed;
+        # unlike oracle/runtime, the original workspace capability is not itself a mount.
+        workspace_capability.close()
+        return launch
     except BaseException:
         _close_capabilities(acquired)
-        if terminal_tree is not None:
-            terminal_tree.close()
+        if evaluator_scratch is not None:
+            evaluator_scratch.close()
         raise
 
 
@@ -1335,7 +1383,6 @@ __all__ = [
     "LinuxIsolationPreflight",
     "ResourceCeilingError",
     "SandboxLaunch",
-    "SandboxSpec",
     "TreeUsage",
     "allowlisted_environment",
     "build_agent_sandbox",

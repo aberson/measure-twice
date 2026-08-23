@@ -18,6 +18,9 @@ from measure_twice.agent_bench._wire import AgentInputError, WireCodec
 PROVIDERS = frozenset({"codex-cli", "claude-cli"})
 RUN_CLASSES = ("smoke", "pilot", "observation")
 RETRY_CLASSES = ("rate-limit", "provider-5xx", "preterminal-transport")
+_EXECUTION_PROFILE_SCHEMA_VERSION = 2
+_SANDBOX_CONTRACT_VERSION = "linux-bwrap-v2"
+_EVALUATOR_DIRECTORY_ALLOWANCE = 10_001
 
 
 class ModelSpecError(AgentInputError):
@@ -25,6 +28,22 @@ class ModelSpecError(AgentInputError):
 
 
 _WIRE = WireCodec(ModelSpecError)
+
+
+def _validate_execution_profile_schema_version(value: object) -> int:
+    """Validate the independently-versioned execution-profile wire contract."""
+
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ModelSpecError(
+            "execution profile.schema_version must be integer "
+            f"{_EXECUTION_PROFILE_SCHEMA_VERSION}, got {value!r}"
+        )
+    if value != _EXECUTION_PROFILE_SCHEMA_VERSION:
+        raise ModelSpecError(
+            f"unsupported execution profile.schema_version {value!r}; supported version is "
+            f"{_EXECUTION_PROFILE_SCHEMA_VERSION}"
+        )
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,10 +296,23 @@ class Ceilings:
     evaluator_processes: int
     evaluator_files: int
     evaluator_file_bytes: int
+    evaluator_cpu_bandwidth_percent: int
+    evaluator_tmpfs_bytes: int
+    evaluator_tmpfs_inodes: int
 
     def __post_init__(self) -> None:
         for name in self.__slots__:
             _WIRE.require_positive_int(getattr(self, name), label=f"ceilings.{name}")
+        if self.evaluator_cpu_bandwidth_percent > 100:
+            raise ModelSpecError("ceilings.evaluator_cpu_bandwidth_percent may not exceed 100")
+        if self.evaluator_tmpfs_bytes < self.evaluator_file_bytes:
+            raise ModelSpecError("ceilings.evaluator_tmpfs_bytes must cover evaluator_file_bytes")
+        minimum_inodes = self.evaluator_files + _EVALUATOR_DIRECTORY_ALLOWANCE
+        if self.evaluator_tmpfs_inodes < minimum_inodes:
+            raise ModelSpecError(
+                "ceilings.evaluator_tmpfs_inodes must cover evaluator files and directory "
+                f"structure ({minimum_inodes})"
+            )
 
     @classmethod
     def from_mapping(cls, value: object) -> Ceilings:
@@ -371,7 +403,7 @@ class ExecutionProfile:
     analysis_algorithm: str
 
     def __post_init__(self) -> None:
-        _WIRE.validate_schema_version(self.schema_version, label="execution profile")
+        _validate_execution_profile_schema_version(self.schema_version)
         _WIRE.validate_safe_id(self.id, label="execution profile.id")
         if not isinstance(self.qualification_limits, Limits):
             raise ModelSpecError("execution profile.qualification_limits must be Limits")
@@ -400,9 +432,10 @@ class ExecutionProfile:
             raise ModelSpecError("execution profile.ceilings must be Ceilings")
         if not isinstance(self.retry, RetryPolicy):
             raise ModelSpecError("execution profile.retry must be RetryPolicy")
-        if self.sandbox_contract_version != "linux-bwrap-v1":
+        if self.sandbox_contract_version != _SANDBOX_CONTRACT_VERSION:
             raise ModelSpecError(
-                "execution profile.sandbox_contract_version must equal 'linux-bwrap-v1'"
+                "execution profile.sandbox_contract_version must equal "
+                f"{_SANDBOX_CONTRACT_VERSION!r}"
             )
         if self.schedule_algorithm != "schedule-v1":
             raise ModelSpecError("execution profile.schedule_algorithm must equal 'schedule-v1'")
@@ -436,9 +469,7 @@ class ExecutionProfile:
             }
         )
         clean = _WIRE.require_exact_keys(value, expected, label="execution profile")
-        schema_version = _WIRE.validate_schema_version(
-            clean["schema_version"], label="execution profile"
-        )
+        schema_version = _validate_execution_profile_schema_version(clean["schema_version"])
         raw_policy = _WIRE.require_exact_keys(
             clean["run_policy"], frozenset(RUN_CLASSES), label="execution profile.run_policy"
         )

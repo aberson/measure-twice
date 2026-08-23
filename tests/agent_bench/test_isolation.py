@@ -20,9 +20,12 @@ from typing import Any, ClassVar, cast
 import pytest
 
 import measure_twice.agent_bench.isolation as isolation_module
+import measure_twice.agent_bench.process as process_module
 from measure_twice.agent_bench._linux_capabilities import (
     LinuxCapabilityError,
     LinuxPathCapability,
+    LinuxTreeDriftError,
+    walk_tree,
 )
 from measure_twice.agent_bench.isolation import (
     CAPTURE_GIT_ENVIRONMENT,
@@ -45,7 +48,13 @@ from measure_twice.agent_bench.isolation import (
     secret_environment_values,
 )
 from measure_twice.agent_bench.models import Ceilings, load_execution_profile
-from measure_twice.agent_bench.process import ProcessRequest, ProcessResourceLimits, run_process
+from measure_twice.agent_bench.process import (
+    EVALUATOR_WORKSPACE_FD_TOKEN,
+    ProcessExecutionError,
+    ProcessRequest,
+    ProcessResourceLimits,
+    run_process,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 EXECUTION_PROFILE = ROOT / "profiles" / "agent-execution-v1.json"
@@ -61,7 +70,11 @@ def _ceilings(
     processes: int = 16,
     files: int = 100,
     file_bytes: int = 1024 * 1024,
+    cpu_bandwidth_percent: int = 100,
+    tmpfs_bytes: int | None = None,
+    tmpfs_inodes: int | None = None,
 ) -> Ceilings:
+    bounded_tmpfs_bytes = max(file_bytes + files * 4096, 2 * 1024 * 1024)
     return Ceilings(
         changed_paths=100,
         patch_bytes=5 * 1024 * 1024,
@@ -72,6 +85,9 @@ def _ceilings(
         evaluator_processes=processes,
         evaluator_files=files,
         evaluator_file_bytes=file_bytes,
+        evaluator_cpu_bandwidth_percent=cpu_bandwidth_percent,
+        evaluator_tmpfs_bytes=(bounded_tmpfs_bytes if tmpfs_bytes is None else tmpfs_bytes),
+        evaluator_tmpfs_inodes=(files + 10_001 if tmpfs_inodes is None else tmpfs_inodes),
     )
 
 
@@ -557,6 +573,24 @@ def _run_launch(
     return run_process(request)
 
 
+def _host_private_mountpoint_identity() -> tuple[int, int]:
+    if sys.platform != "linux":
+        pytest.skip("host private-mountpoint canary requires Linux")
+    metadata = os.stat("/var/tmp")  # noqa: S108 - inspected as a host-mount isolation canary.
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _host_private_mountpoint_capability() -> LinuxPathCapability:
+    return _linux_capability("/var/tmp")  # noqa: S108 - isolation canary.
+
+
+def _assert_path_stays_absent(path: Path, *, duration_s: float = 1.5) -> None:
+    deadline = time.monotonic() + duration_s
+    while time.monotonic() < deadline:
+        assert not path.exists()
+        time.sleep(0.02)
+
+
 class _RaceBarrier:
     def __init__(self) -> None:
         self.entered = threading.Event()
@@ -759,11 +793,20 @@ def test_linux_every_builder_root_transfers_original_inode_after_symlink_swap(
         request = _request_from_launch(launch)
         try:
             by_fd = {capability.fd: capability for capability in request._inherited_capabilities}
-            mounts = {
-                request.argv[index + 2]: by_fd[int(request.argv[index + 1])]
-                for index, argument in enumerate(request.argv)
-                if argument in {"--bind-fd", "--ro-bind-fd"}
-            }
+            mounts = {}
+            for index, argument in enumerate(request.argv):
+                if argument not in {"--bind-fd", "--ro-bind-fd"}:
+                    continue
+                source_fd = request.argv[index + 1]
+                mount_destination = request.argv[index + 2]
+                if source_fd == EVALUATOR_WORKSPACE_FD_TOKEN:
+                    assert profile == "evaluator"
+                    assert mount_destination == "/workspace"
+                    scratch = request._evaluator_scratch
+                    assert scratch is not None
+                    mounts[mount_destination] = scratch.source_capability()
+                else:
+                    mounts[mount_destination] = by_fd[int(source_fd)]
             mounted = mounts[destination]
             if stat.S_ISDIR(mounted.st_mode):
                 sentinel_fd = os.open("sentinel.txt", os.O_RDONLY, dir_fd=mounted.fd)
@@ -809,13 +852,20 @@ def test_linux_capture_direct_child_identity_change_fails_closed(tmp_path: Path)
 
         value, error = race.run(operation, mutate)
         assert value is None
-        assert isinstance(error, LinuxCapabilityError)
-        assert "changed or became unreadable" in str(error)
+        # Post-acquisition rebinding is classified drift, not a generic capability error: the
+        # capture path must still fail closed, and the specific class is what distinguishes
+        # model-caused churn from harness failure downstream.
+        assert isinstance(error, LinuxTreeDriftError)
+        assert "changed after acquisition" in str(error)
         assert outside.read_text(encoding="utf-8") == "outside-canary"
 
 
 @pytest.mark.linux_isolation
-def test_linux_live_scanner_child_identity_change_fails_closed(tmp_path: Path) -> None:
+def test_linux_live_scanner_child_drift_records_inconclusive_sample_and_retries(
+    tmp_path: Path,
+) -> None:
+    """Live churn is an inconclusive sample, never a harness failure the model can trigger."""
+
     if sys.platform != "linux":
         pytest.skip("live evaluator-tree scanner requires Linux")
     workspace = tmp_path / "live-workspace"
@@ -832,59 +882,63 @@ def test_linux_live_scanner_child_identity_change_fails_closed(tmp_path: Path) -
         stdin="",
         cwd=tmp_path.resolve(),
         environment={},
-        timeout_s=5,
+        timeout_s=2,
         stream_limit_bytes=1024,
         resource_limits=ProcessResourceLimits(tree_files=100, tree_bytes=1024 * 1024),
         tree_root=workspace,
         _tree_before_open=race.hook("child.txt"),
     )
 
+    # Rename only.  The entry identity changes underneath the held descriptor, so the live
+    # walk observes real drift, but the tree it settles into is stable and policy-valid --
+    # which is what lets the later authoritative scan succeed and keeps this test about the
+    # live sample alone.
     def mutate() -> None:
         child.rename(moved)
-        child.symlink_to(outside)
 
     value, error = race.run(lambda: run_process(request), mutate)
     assert error is None
-    result = cast("Any", value)
-    assert result.termination == "resource-limit"
-    assert result.resource_limit == "tree-inspection"
+    assert value is not None
+    assert value.termination == "timeout"
+    # The drifted sample is retained as audit evidence and contributes no usage claim.
+    assert value.tree_sample_inconclusive_count >= 1
+    assert value.resource_limit is None
     assert outside.read_text(encoding="utf-8") == "outside-canary"
 
 
 @pytest.mark.linux_isolation
-def test_linux_terminal_scanner_child_identity_change_fails_closed(tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    oracle = tmp_path / "oracle"
-    runtime = tmp_path / "runtime"
-    outside = tmp_path / "outside.txt"
-    for directory in (workspace, oracle, runtime):
-        directory.mkdir()
-    child = workspace / "child.txt"
-    child.write_text("original", encoding="utf-8")
-    outside.write_text("outside-canary", encoding="utf-8")
-    moved = workspace / "moved.txt"
-    race = _RaceBarrier()
-    with _manual_preflight(tmp_path) as preflight:
-        launch = build_evaluator_sandbox(
-            preflight,
-            workspace=workspace,
-            oracle=oracle,
-            runtime=runtime,
-            command=("/usr/bin/true",),
-            ceilings=_ceilings(),
-            _tree_before_open=race.hook("child.txt"),
-        )
+def test_linux_terminal_scanner_drift_after_quiescence_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drift observed by the authoritative post-quiescence scan is never swallowed."""
 
-        def mutate() -> None:
-            child.rename(moved)
-            child.symlink_to(outside)
+    if sys.platform != "linux":
+        pytest.skip("terminal evaluator-tree scanner requires Linux")
+    workspace = tmp_path / "terminal-workspace"
+    workspace.mkdir()
+    (workspace / "child.txt").write_text("original", encoding="utf-8")
+    executable = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
 
-        value, error = race.run(lambda: enforce_evaluator_tree_ceiling(launch), mutate)
-        assert value is None
-        assert isinstance(error, ResourceCeilingError)
-        assert "inspection failed closed" in str(error)
-        assert outside.read_text(encoding="utf-8") == "outside-canary"
-        launch.close()
+    # Every walk drifts, so the live samples exercise the inconclusive path and the scan that
+    # runs once the target is reaped is the one that must fail closed.  Injecting at the
+    # shared seam is what makes "which scan raised" the only variable under test.
+    def always_drifts(*_args: object, **_kwargs: object) -> None:
+        raise LinuxTreeDriftError("injected tree drift")
+
+    monkeypatch.setattr(process_module, "walk_tree", always_drifts)
+    request = ProcessRequest.create(
+        argv=(executable, "-I", "-c", "raise SystemExit(0)"),
+        stdin="",
+        cwd=tmp_path.resolve(),
+        environment={},
+        timeout_s=5,
+        stream_limit_bytes=1024,
+        resource_limits=ProcessResourceLimits(tree_files=100, tree_bytes=1024 * 1024),
+        tree_root=workspace,
+    )
+    with pytest.raises(ProcessExecutionError, match="changed during post-cleanup validation"):
+        run_process(request)
 
 
 @pytest.mark.linux_isolation
@@ -977,6 +1031,7 @@ def test_linux_agent_namespace_persists_only_workspace_writes(tmp_path: Path) ->
         "print(json.dumps({"
         "'escaped':escaped,'home':os.environ.get('HOME'),"
         "'oracle':pathlib.Path('/opt/measure-twice/oracle').exists(),"
+        "'procfs_matches_pid':pathlib.Path('/proc/self').samefile(f'/proc/{os.getpid()}'),"
         "'suite':pathlib.Path('/suite').exists(),"
         "'run':pathlib.Path('/run-store').exists()}))"
     )
@@ -992,6 +1047,7 @@ def test_linux_agent_namespace_persists_only_workspace_writes(tmp_path: Path) ->
         "escaped": False,
         "home": SANDBOX_HOME,
         "oracle": False,
+        "procfs_matches_pid": True,
         "suite": False,
         "run": False,
     }
@@ -1011,6 +1067,7 @@ def test_linux_evaluator_hostile_canaries_all_fail_closed(
     oracle.mkdir()
     _copy_fixture(runtime, "hostile_probe.py")
     (oracle / "oracle-sentinel.txt").write_text("oracle-original", encoding="utf-8")
+    (runtime / "runtime-sentinel.txt").write_text("runtime-original", encoding="utf-8")
     host_sentinel = tmp_path / "host-sentinel.txt"
     credential_sentinel = tmp_path / "credential-sentinel.txt"
     outside = tmp_path / "outside-write.txt"
@@ -1023,6 +1080,25 @@ def test_linux_evaluator_hostile_canaries_all_fail_closed(
     tcp.bind(("127.0.0.1", 0))
     tcp.listen()
     udp.bind(("127.0.0.1", 0))
+    udp_echo_stop = threading.Event()
+
+    def echo_udp_canary() -> None:
+        udp.settimeout(0.05)
+        while not udp_echo_stop.is_set():
+            try:
+                message, peer = udp.recvfrom(64)
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            if message == b"udp-canary":
+                try:
+                    udp.sendto(b"udp-canary", peer)
+                except OSError:
+                    return
+                return
+
+    udp_echo = threading.Thread(target=echo_udp_canary, daemon=True)
     payload = {
         "credential_path": str(credential_sentinel),
         "credential_value": credential_value,
@@ -1045,9 +1121,14 @@ def test_linux_evaluator_hostile_canaries_all_fail_closed(
                 ),
                 ceilings=load_execution_profile(EXECUTION_PROFILE).ceilings,
             ) as launch:
+                udp_echo.start()
                 result = _run_launch(launch, stdin=json.dumps(payload))
     finally:
+        udp_echo_stop.set()
         tcp.close()
+        if udp_echo.ident is not None:
+            udp_echo.join(timeout=1)
+            assert not udp_echo.is_alive()
         udp.close()
     assert result.exit_code == 0, result.stderr
     assert json.loads(result.stdout) == {
@@ -1060,12 +1141,15 @@ def test_linux_evaluator_hostile_canaries_all_fail_closed(
         "parent_credential_environment": False,
         "process_environment_credential": False,
         "run_store_visible": False,
+        "runtime_before": "runtime-original",
+        "runtime_mutated": False,
         "suite_visible": False,
         "tcp_reached": False,
         "udp_reached": False,
         "workspace_write": True,
     }
     assert (oracle / "oracle-sentinel.txt").read_text(encoding="utf-8") == "oracle-original"
+    assert (runtime / "runtime-sentinel.txt").read_text(encoding="utf-8") == "runtime-original"
     assert not outside.exists()
 
 
@@ -1077,8 +1161,6 @@ def test_linux_timeout_leaves_no_detached_child(tmp_path: Path) -> None:
     workspace.mkdir()
     oracle.mkdir()
     _copy_fixture(runtime, "detached_child.py")
-    marker = workspace / "escaped.txt"
-    ready = workspace / "ready.txt"
     with _real_preflight(tmp_path) as preflight:
         with build_evaluator_sandbox(
             preflight,
@@ -1091,14 +1173,146 @@ def test_linux_timeout_leaves_no_detached_child(tmp_path: Path) -> None:
                 "/opt/measure-twice/runtime/detached_child.py",
                 "/workspace/escaped.txt",
                 "/workspace/ready.txt",
+                "/workspace/release.txt",
             ),
             ceilings=load_execution_profile(EXECUTION_PROFILE).ceilings,
         ) as launch:
-            result = _run_launch(launch, timeout=0.35)
-    assert result.termination == "timeout"
-    assert ready.is_file()
-    time.sleep(1.1)
-    assert not marker.exists()
+            result = _run_launch(launch, timeout=5)
+            assert result.termination == "timeout"
+            # The evaluator workspace is a private tmpfs, so the sandbox's own markers are
+            # only reachable through the root descriptor the harness retains.  Asserting the
+            # host directory stays empty keeps that isolation explicit: without it, a marker
+            # that simply became invisible would read exactly like a contained child.
+            assert not (workspace / "ready.txt").exists()
+            assert not (workspace / "escaped.txt").exists()
+            retained = Path(f"/proc/self/fd/{launch.terminal_tree_capability().fd}")
+            assert (retained / "ready.txt").is_file()
+            # Release inside the same tmpfs a surviving detached child would still be polling.
+            (retained / "release.txt").write_text("release", encoding="utf-8")
+            _assert_path_stays_absent(retained / "escaped.txt")
+
+
+@pytest.mark.linux_isolation
+def test_linux_evaluator_inherits_rlimit_nofile_through_sandbox_launch(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace-nofile"
+    oracle = tmp_path / "oracle-nofile"
+    runtime = tmp_path / "runtime-nofile"
+    workspace.mkdir()
+    oracle.mkdir()
+    runtime.mkdir()
+    code = """
+import errno
+import json
+import os
+import resource
+
+limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+descriptors = []
+try:
+    while True:
+        descriptors.append(os.open('/dev/null', os.O_RDONLY))
+except OSError as exc:
+    print(
+        json.dumps(
+            {'errno': exc.errno, 'hard': limits[1], 'opened': len(descriptors), 'soft': limits[0]}
+        )
+    )
+finally:
+    for descriptor in descriptors:
+        os.close(descriptor)
+"""
+    with _real_preflight(tmp_path) as preflight:
+        with build_evaluator_sandbox(
+            preflight,
+            workspace=workspace,
+            oracle=oracle,
+            runtime=runtime,
+            command=("/usr/bin/python3", "-I", "-c", code),
+            ceilings=_ceilings(files=64),
+        ) as launch:
+            result = _run_launch(launch)
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["errno"] == errno.EMFILE
+    assert payload["soft"] == 64
+    assert payload["hard"] == 64
+    assert 0 < payload["opened"] < 64
+
+
+@pytest.mark.linux_isolation
+def test_linux_evaluator_bubblewrap_uses_private_tmpfs_fd_and_retains_terminal_fd(
+    tmp_path: Path,
+) -> None:
+    """The real Bubblewrap path writes through an outer-private tmpfs FD retained by the parent."""
+
+    workspace = tmp_path / "workspace-detached-tmpfs"
+    oracle = tmp_path / "oracle-detached-tmpfs"
+    runtime = tmp_path / "runtime-detached-tmpfs"
+    workspace.mkdir()
+    oracle.mkdir()
+    runtime.mkdir()
+    host_tmp_identity = _host_private_mountpoint_identity()
+    with _real_preflight(tmp_path) as preflight:
+        with build_evaluator_sandbox(
+            preflight,
+            workspace=workspace,
+            oracle=oracle,
+            runtime=runtime,
+            command=(
+                "/usr/bin/python3",
+                "-I",
+                "-c",
+                "from pathlib import Path; "
+                "Path('/workspace/terminal.txt').write_bytes(b'terminal')",
+            ),
+            ceilings=_ceilings(files=8),
+        ) as launch:
+            result = _run_launch(launch)
+            assert result.exit_code == 0, result.stderr
+            terminal_root = launch.terminal_tree_capability()
+            with _host_private_mountpoint_capability() as host_tmp_fd:
+                assert terminal_root.filesystem_magic != host_tmp_fd.filesystem_magic
+            with terminal_root.open_beneath(
+                "terminal.txt",
+                expected="regular",
+                display_path="/workspace/terminal.txt",
+            ) as terminal_file:
+                assert os.read(terminal_file.fd, 8) == b"terminal"
+            assert walk_tree(terminal_root).file_count == 1
+    assert _host_private_mountpoint_identity() == host_tmp_identity
+
+
+@pytest.mark.linux_isolation
+def test_linux_evaluator_failed_materialization_leaves_host_private_mountpoint_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-release failure tears down the private mount namespace without host mutation."""
+
+    workspace = tmp_path / "workspace-failed-detach"
+    oracle = tmp_path / "oracle-failed-detach"
+    runtime = tmp_path / "runtime-failed-detach"
+    workspace.mkdir()
+    oracle.mkdir()
+    runtime.mkdir()
+    host_tmp_identity = _host_private_mountpoint_identity()
+
+    def fail_materialization(*_args: object, **_kwargs: object) -> None:
+        raise LinuxCapabilityError("injected private tmpfs materialization failure")
+
+    monkeypatch.setattr(process_module, "copy_tree", fail_materialization)
+    with _real_preflight(tmp_path) as preflight:
+        with build_evaluator_sandbox(
+            preflight,
+            workspace=workspace,
+            oracle=oracle,
+            runtime=runtime,
+            command=("/usr/bin/python3", "-I", "-c", "raise SystemExit(0)"),
+            ceilings=_ceilings(files=8),
+        ) as launch:
+            with pytest.raises(ProcessExecutionError, match="materialize evaluator applied tree"):
+                _run_launch(launch)
+    assert _host_private_mountpoint_identity() == host_tmp_identity
 
 
 @pytest.mark.linux_isolation
@@ -1125,7 +1339,11 @@ def test_linux_evaluator_aggregate_cpu_memory_and_process_limits(
                 "/opt/measure-twice/runtime/resource_probe.py",
                 operation,
             ),
-            ceilings=_ceilings(cpu=1, memory=128 * 1024 * 1024, processes=8),
+            ceilings=_ceilings(
+                cpu=1 if operation == "cpu" else 10,
+                memory=128 * 1024 * 1024,
+                processes=8,
+            ),
         ) as launch:
             result = _run_launch(launch, timeout=5)
     assert result.termination == "resource-limit"
