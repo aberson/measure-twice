@@ -1,6 +1,6 @@
 # Provider-Neutral Coding Agent Benchmark
 
-**Status:** WRAPPED - ready for repo sync (2026-08-21)
+**Status:** WRAPPED - Step 26 capability revision ready for repo sync (2026-08-22)
 
 **Roadmap allocation:** Steps 25-55. Canonical `plan.md` owns Steps 1-17 and the approved
 operations plan owns Steps 18-24.
@@ -114,6 +114,7 @@ It does not isolate a base model from the CLI's system prompt, tools, or agent l
 |---|---|---|---|
 | `measure_twice/cli.py` | extend | Register the `mt agent` validate, doctor, run, report, and evidence commands and carry one optional agent-process DI seam. | Read `CliDeps` at lines 109-127 and `_build_parser`/`main` at lines 545-813. Grep found production consumers at lines 172, 248, 288, 472, 546, and 792-800; test constructors are `tests/test_report.py:319,332,344,359,375`, `tests/test_runner.py:522,559,601,794,801`, `tests/test_scoring.py:532,558,607`, and `tests/test_judge.py:526`. The new field must have a default so none of those callers becomes positional or required. |
 | `tests/conftest.py` | extend | Add workspace-aware fake agent processes and artifact fixtures for production-path CLI tests. | Read current `StubAdapters` at lines 52-97; grep found its Claude factory import/use at lines 14 and 84-93 and direct `StubAdapters` consumers in `tests/test_runner.py` and `tests/test_report.py`. Scoring/judge tests construct their own `CliDeps` seams. Existing fixture behavior remains unchanged. |
+| `measure_twice/agent_bench/_linux_capabilities.py` | create | Own exact Linux file/directory descriptors across validation, Bubblewrap mounting, subprocess cwd selection, and resource-tree traversal so no security decision authorizes a later pathname lookup. | The blocked Step-26 implementation returns strings from `isolation.py:_preflighted_path`, later reopens them for mounts, and queues `DirEntry.path` in both tree scanners. `suite.py` already demonstrates the contrasting open-relative, no-follow, identity-check pattern for contained inputs. |
 | `.gitignore` | extend | Keep default-path agent runs, workspaces, confirmations, traces, exports, and reports local while preserving tracked suite/evidence bundles. | Read the complete file: it currently ignores only `data/runs/`, `data/reports/`, caches, and local session state. Add `data/agent-runs/`, `data/agent-workspaces/`, `data/agent-confirmations/`, `data/agent-reports/`, and `data/exports/`; the operator protocol instead uses the automatically untracked Git-common state home. Do not ignore `suites/agents/`, `profiles/`, `analysis-plans/`, or `docs/agent-benchmark/evidence/`. |
 | `pyproject.toml` | extend | Register the `linux_isolation` pytest marker used by the real WSL gate; package/runtime dependencies remain unchanged. | Read the complete pytest configuration: it currently declares only `testpaths` and `addopts`, so the new marker must be explicit rather than warning-only. |
 | `README.md` | modify | Add the agent benchmark boundary, WSL2 live prerequisite, and verified commands after the real v1 run. | Read current setup/command/structure sections; they list only prompt-suite `validate`, `run`, `report`, and `smoke` paths and still carry stale Phase-A status text. |
@@ -147,6 +148,7 @@ measure_twice/agent_bench/
   models.py                 # ModelSpec registry, selected-profile hash, provider dispatch
   analysis.py               # strict machine-readable analysis policy and scope validation
   suite.py                  # AgentSuite/AgentTask loaders, containment checks, instrument hash
+  _linux_capabilities.py    # owned FD capabilities, identity checks, and FD-relative traversal
   process.py                # cwd/env-aware subprocess contract and process-tree termination
   isolation.py              # Linux agent/evaluator isolation profiles and canary contracts
   evaluator.py              # materialize, patch capture/apply, oracle injection, repeated tests
@@ -162,8 +164,12 @@ measure_twice/agent_bench/
 ```
 
 The existing response-only adapters remain unchanged. The new process contract takes an immutable
-request containing `argv`, UTF-8 stdin, `cwd`, sanitized environment, and timeout, then returns
-stdout/stderr/exit/elapsed data. Both real providers and offline fakes implement the same
+request containing `argv`, UTF-8 stdin, an owned cwd capability on Linux, sanitized environment,
+and timeout, then returns stdout/stderr/exit/elapsed data. Display paths remain available for
+diagnostics and non-authorizing policy comparisons, but mounts, cwd entry, and recursive traversal
+consume the same opened descriptors that passed validation. The launch object is one-shot and owns
+every descriptor until the child has inherited its copies; all success and error paths close the
+parent copies deterministically. Both real providers and offline fakes implement the same
 `AgentAdapter.preflight()` and `AgentAdapter.invoke()` interface.
 
 `AgentCliDeps` is defined inside `measure_twice.agent_bench` and supplied to a registration
@@ -850,6 +856,31 @@ with `failIfUnavailable: true`, no excluded commands, no unsandboxed escape, exp
 read-denies, and an empty child-network allowlist. The installed versions and exact supported flags
 remain preflight evidence, not assumptions frozen from this prose.
 
+A filesystem security decision produces an owned descriptor capability, never durable authority in
+a canonical path string. Caller-controlled roots are opened beneath a pinned directory FD with Linux
+`openat2` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`; unsupported kernel
+semantics fail preflight. Filesystem type, object type, and device/inode identity are validated from
+the opened object with `fstat`/`fstatfs`, never a second pathname lookup. Harness runtime mounts,
+network files, and the Bubblewrap executable are pinned before use too; only sandbox destination paths
+remain strings. Capability overlap checks compare the held objects and FD-relative ancestry, not
+canonical path strings.
+
+Capture children are enumerated with `os.scandir(directory_fd)`, reopened one component at a time
+relative to the pinned parent with no-follow flags, and rejected if their enumerated object type,
+device, or inode differs from the opened child. Both resource scanners use that same FD-relative
+walker and queue opened child-directory descriptors rather than `DirEntry.path`. Linux subprocess cwd
+uses a passed directory descriptor through `/proc/self/fd/<n>` with `pass_fds` so a post-validation
+rename cannot redirect `chdir`.
+
+Bubblewrap must consume those same capabilities through `--bind-fd` and `--ro-bind-fd`, including
+fail-closed mounted-object identity verification. Preflight records the pinned executable/version and
+proves both FD-bind operations with live behavioral canaries; recognizing a flag or version string
+alone is insufficient. Upstream Bubblewrap 0.11.2 is the pinned known-good implementation, while
+Ubuntu 24.04's stock Bubblewrap 0.9.0 package lacks the required FD-bind contract. Before the real
+Step-26 WSL gate, the operator must install a compatible Bubblewrap build in the fixed trusted
+executable search path; tests never download, compile, or silently fall back to path binds. Missing
+capability yields one actionable unavailable-substrate error and no untrusted command executes.
+
 The effective model-tool surface is also equalized at the capability boundary. Codex receives only
 its workspace file/edit and sandboxed shell tools, with built-in web search disabled under the
 [Codex configuration contract](https://learn.chatgpt.com/docs/config-file/config-reference), no MCP
@@ -1097,13 +1128,15 @@ post-Step-55 work; this plan does not alter the prompt-run scope reserved for St
 | Typecheck | `uv run mypy --strict measure_twice` |
 | Linux isolation integration from Windows | `pwsh -File scripts/test-agent-bench-wsl.ps1` |
 | Linux isolation integration inside WSL | `uv run pytest -q -m linux_isolation` |
+| Bubblewrap capability prerequisite | A trusted installed `bwrap` must pass Step 26's live `--bind-fd` and `--ro-bind-fd` probes. Upstream 0.11.2 is pinned known-good; Ubuntu 24.04's stock 0.9.0 package is rejected. |
 
 Live work requires `measure-twice` and `switchboard` as sibling sources because the existing
 `pyproject.toml` resolves `../switchboard`. A WSL-local clone is preferred; when orchestration began
 from this Windows checkout, the runbook uses that same Git repository through WSL but stages the
 package, dependency, temporary homes, agent workspaces, and evaluators onto ext4. The Step-29
 runbook pins the exact commands, but the fresh-context path is: install Git, Python 3.12, `uv`,
-Bubblewrap, `socat`, and the supported Linux Codex/Claude CLIs in WSL2 Ubuntu 24.04; ensure the two
+a Bubblewrap build that passes the FD-bind behavior probe, `socat`, and the supported Linux
+Codex/Claude CLIs in WSL2 Ubuntu 24.04; ensure the two
 sibling sources are present; reject `/mnt/*` for every untrusted workspace/scratch path; run
 `uv sync --extra dev`; authenticate the benchmark-scoped account
 inside WSL using current provider instructions; run the full test/build gates; then use `doctor
@@ -1116,6 +1149,9 @@ non-ignored worktree files plus the sibling `switchboard` source, streams that e
 a fresh WSL-ext4 temporary directory, installs there, runs the marked tests, reports the staged-tree
 hash, and removes the temporary directory; it never copies `.git`, `.venv`, data homes, credentials,
 or untracked ignored files.
+
+The Linux marker is non-skipping for the isolation substrate: absent or incompatible Bubblewrap is
+a failed prerequisite with a stable diagnostic, not a pytest skip or reduced-coverage pass.
 
 ## 7. Build Steps
 
@@ -1162,24 +1198,73 @@ report paths do not require inference.
 
 <!-- autofix-applied: 2026-08-21 -->
 ### Step 26: Linux process and isolation substrate
-- **Problem:** Implement the immutable cwd/stdin/environment subprocess contract, bounded stream
-  capture, process-tree termination, WSL2/ext4 preflight, Bubblewrap namespace builders, secret
-  scrubbing, and separate fail-closed agent/capture/evaluator isolation profiles. This step supplies
-  mechanics and canaries only; it does not know provider event formats or make inference calls.
+- **Problem:** Complete the fail-closed Linux execution substrate under one kernel-object-identity
+  invariant: every host filesystem source is opened once as an owned Linux file-descriptor (FD)
+  capability, so later rename, unlink, or symlink replacement cannot redirect sandbox mounts,
+  subprocess cwd, capture enumeration, live resource monitoring, or terminal tree validation.
+  Preserve the immutable stdin/environment contract, bounded streams, secret scrubbing, aggregate
+  evaluator ceilings, and whole-process-tree termination. This step supplies mechanics and canaries
+  only; it neither understands provider event formats nor makes inference calls.
 - **Type:** code
 - **Issue:** #28
 - **Flags:** --reviewers deep --isolation worktree
-- **Files:** `measure_twice/agent_bench/{process,isolation}.py`,
+- **Environment prerequisite:** The non-skipping Linux gate runs on WSL2 Ubuntu 24.04 with every
+  untrusted workspace and scratch path on ext4. Bubblewrap must pass live behavioral probes for
+  `--bind-fd` and `--ro-bind-fd`; version text is evidence only. Upstream Bubblewrap 0.11.2 is the
+  pinned known-good implementation, while Ubuntu 24.04's stock 0.9.0 package is unsupported.
+  Missing or incompatible Bubblewrap raises a stable `IsolationUnavailableError` and fails the WSL
+  gate rather than skipping it. No provider authentication or live model call is required.
+- **Capability contract:** Pathnames are accepted only at capability acquisition. Caller-controlled
+  roots are opened with Linux `openat2` beneath a pinned directory FD using
+  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`; unsupported kernel semantics fail
+  preflight. Filesystem/type/identity checks use the opened descriptor (`fstat`/`fstatfs`), never a
+  second pathname lookup. Harness runtime files, network files, and the Bubblewrap executable are
+  likewise pinned before use; only sandbox destination paths remain pathname strings. Capability
+  overlap checks compare the held objects and FD-relative ancestry, not canonical strings.
+
+  | Internal type | Required fields and lifetime |
+  |---|---|
+  | `LinuxPathCapability` | owned `fd`; diagnostic-only `display_path`; `st_dev`, `st_ino`, `st_mode`, and filesystem evidence captured from that FD; explicit open/closed state; non-copyable, non-serializable, context-managed, and idempotently closed |
+  | `SandboxLaunch` | profile, command/environment, FD-backed source mounts `(writable/read-only, destination, capability)`, limits, and one-shot consumed state; it renders `--bind-fd`/`--ro-bind-fd` only while creating the process request and retains an evaluator-workspace FD through terminal validation |
+  | `ProcessRequest` | immutable argv/stdin/environment/limits plus an owned cwd capability, inherited mount FDs, optional duplicated tree-monitor capability, and one-shot consumed state |
+
+  On Linux, `run_process` supplies every inherited descriptor through `Popen(pass_fds=...,
+  close_fds=True)`, enters cwd through `/proc/self/fd/<cwd-fd>`, and executes the pinned Bubblewrap
+  descriptor through `/proc/self/fd/<bwrap-fd>`. Launch-only parent descriptors close after
+  successful `Popen`; monitoring descriptors remain open through collection; every success, startup
+  failure, timeout, interrupt, ceiling failure, and caller exception closes all remaining
+  descriptors. Reusing a consumed request or launch fails.
+- **Traversal contract:** Capture and evaluator walkers call `os.scandir(directory_fd)`, reopen each
+  single-component child relative to that FD with no-follow flags, compare the enumerated
+  `(st_dev, st_ino, file type)` with `fstat` of the opened child, and queue child directory FDs rather
+  than `entry.path`. A changed entry, symlink, special file, unreadable object, or identity mismatch
+  fails closed. One shared FD-relative walker supplies both the live evaluator ceiling monitor and
+  terminal `measure_tree_usage`, preventing the two scanners from drifting.
+- **Files:** `measure_twice/agent_bench/{_linux_capabilities,process,isolation}.py`,
   `scripts/test-agent-bench-wsl.ps1`, `pyproject.toml`,
   `tests/agent_bench/test_process.py`, `tests/agent_bench/test_isolation.py`,
   `tests/agent_bench/fixtures/isolation/`
-- **Done when:** tests prove exact UTF-8 stdin/cwd/allowlisted environment, byte ceilings,
-  timeout/interrupt whole-tree kill, `/mnt/*` rejection, unavailable-Bubblewrap failure,
-  workspace-only writes, absent suite/oracle/run/home mounts, child-network denial, trusted
-  capture-Git config with the submitted `.git` absent, and evaluator
-  CPU/memory/process/file ceilings; hostile fixtures cannot read host or credential sentinels,
-  mutate an oracle, write outside the sandbox, reach TCP/UDP/DNS, inspect parent credential state,
-  or leave a detached child; no provider credentials or live calls are used.
+- **Done when:** `uv build`, full pytest, Ruff lint/format, strict mypy, and the non-skipping
+  `pwsh -File scripts/test-agent-bench-wsl.ps1` gate pass with all of this evidence:
+  - Exact UTF-8 stdin, FD-pinned cwd, allowlisted environment, bounded raw streams, and secret
+    detection remain frozen; success and every error/interrupt path leave no FD leak.
+  - Timeout and interrupt kill and reap the complete Linux-owned descendant tree, including detach
+    and double-fork fixtures identified by `(pid, starttime)`.
+  - Evaluator CPU, resident-memory, process-count, file-count, and tree-byte ceilings aggregate
+    across owned descendants; per-process `RLIMIT_FSIZE` and `RLIMIT_NOFILE` remain backstops rather
+    than being reported as aggregate enforcement.
+  - Real Bubblewrap canaries prove workspace-only writes, absent suite/oracle/run/operator-home
+    mounts, read-only oracle/runtime mounts, capture with submitted `.git` absent, empty child
+    network for capture/evaluator, and no host/credential/parent-`/proc` disclosure.
+  - Barrier-controlled, sleep-free rename-to-symlink regressions mutate each caller-supplied source
+    after acquisition but before consumption: agent workspace; capture submitted root and direct
+    child; capture repository; evaluator workspace, oracle, and runtime; process cwd; live tree
+    scanner child; terminal tree scanner child. Root/cwd cases must consume the originally opened
+    inode; child-entry identity changes must produce the documented fail-closed error; no case may
+    read, mount, execute from, or count the replacement target.
+  - Existing hostile fixtures still cannot mutate an oracle, write outside the sandbox, reach
+    TCP/UDP/DNS, inspect parent credential state, or leave a detached child. No provider credentials
+    or live calls are used.
 - **Depends on:** 25
 
 <!-- autofix-applied: 2026-08-21 -->
@@ -1781,6 +1866,7 @@ are gates to prove rather than assumptions to waive.
 | Item | Risk | Mitigation |
 |---|---|---|
 | WSL2 CLI availability/auth | Windows-authenticated CLIs may not already be installed or authenticated inside WSL2. | Steps 28-29 provide fail-loud preflight code and the runbook; Step 30 is the operator qualification gate. Do not fall back to asymmetric native Windows execution. |
+| Bubblewrap FD-bind availability | Ubuntu 24.04 may provide a path-bind-only Bubblewrap that cannot preserve an opened filesystem identity through namespace setup. | Step 26 live-probes FD-bound writable/read-only mounts, records executable/version evidence, and fails before executing untrusted code. Upstream 0.11.2 is pinned known-good; the operator installs a compatible trusted build, and the harness never downloads one or falls back to pathname binds. |
 | Provider flag or stream drift | CLI updates can remove isolation flags or change JSONL events. | Pin exact argv/event contracts in offline tests, record executable/version hashes, and fail preflight on missing required capability. |
 | Model alias drift | `sonnet` or a future `haiku` alias can silently move. | Record requested and stream-reported identity per cell, abort within-run drift, and pin the qualified full identity before v1 where the provider exposes it. Never invent a resolved Codex field that JSONL does not supply; retain request plus catalog/executable evidence. |
 | Unequal native internals | Tool loops and system prompts differ across products. | Define the claim as end-to-end agent-product performance; equalize inputs, environment, permissions, and outcome scorer, and record the remaining provider differences. |
@@ -1807,8 +1893,11 @@ are gates to prove rather than assumptions to waive.
 - Evaluator: seed materialization; create/edit/delete/binary/mode/commit patch capture; clean apply
   and tree-hash round-trip; allowed/protected globs; oracle separation; baseline/no-op/reference
   anchors; timeout; nondeterministic repeat; evaluator versus model failure taxonomy.
-- Process/adapters: exact argv, prompt bytes on UTF-8 stdin, cwd, scrubbed environment without secret
-  logging, timeout/process-tree kill, every Codex JSONL and Claude stream terminal/error shape, model
+- Process/adapters: exact argv, prompt bytes on UTF-8 stdin, descriptor-bound cwd, scrubbed
+  environment without secret logging, timeout/process-tree kill, FD-bound Bubblewrap mount sources,
+  shared FD-relative tree traversal, one-shot ownership and leak checks, deterministic
+  post-acquisition rename-to-symlink races, every Codex JSONL and Claude stream terminal/error shape,
+  model
   mismatch, missing capability, empty output, exact effective-tool drift, first-class web denial,
   MCP/plugin/browser absence, one-shot confirmation receipts, and executable fingerprints.
 - Runner/store: seeded pair order, unique workspaces, budget abort, atomic cell finalization,
