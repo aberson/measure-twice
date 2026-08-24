@@ -81,7 +81,13 @@ _FAKE_ROOT = PurePosixPath("/var/lib/measure-twice-test")
 
 def _ceilings(
     *,
-    cpu: int = 2,
+    # Generous by default.  cgroup CPU accounting covers the WHOLE scope -- the namespace
+    # supervisor and Bubblewrap as well as the target -- so three interpreter startups on a
+    # contended host can cross a tight ceiling and stop a test that was measuring something else
+    # entirely (observed: the RLIMIT_NOFILE probe killed at cpu=2 with observed=2,
+    # provenance="sampled-threshold").  A test that MEANS to hit a ceiling sets it explicitly;
+    # every other test must be unable to trip one by accident.
+    cpu: int = 30,
     memory: int = 256 * 1024 * 1024,
     processes: int = 16,
     files: int = 100,
