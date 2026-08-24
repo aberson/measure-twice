@@ -6,6 +6,7 @@ import itertools
 import json
 import os
 import pickle
+import select
 import shutil
 import socket
 import stat
@@ -25,6 +26,8 @@ from measure_twice.agent_bench._linux_capabilities import (
     LinuxCapabilityError,
     LinuxPathCapability,
     LinuxTreeDriftError,
+    LinuxTreeLimitError,
+    LinuxTreePolicyError,
     walk_tree,
 )
 from measure_twice.agent_bench.isolation import (
@@ -61,6 +64,9 @@ ROOT = Path(__file__).resolve().parents[2]
 EXECUTION_PROFILE = ROOT / "profiles" / "agent-execution-v1.json"
 FIXTURES = Path(__file__).parent / "fixtures" / "isolation"
 SANDBOX_HOME = "/tmp/home"  # noqa: S108 - private sandbox path asserted by the canary.
+# Long enough that a release-then-verify inversion is caught with a wide margin: a released
+# target reaches os.write in tens of milliseconds against a 1000 ms dwell polled every 20 ms.
+_BARRIER_DWELL_S = 1.0
 _FAKE_ROOT = PurePosixPath("/var/lib/measure-twice-test")
 
 
@@ -1012,6 +1018,113 @@ def test_linux_terminal_scanner_stable_policy_violation_stays_a_model_tree_outco
 
 
 @pytest.mark.linux_isolation
+def test_linux_live_scanner_capability_fault_is_evaluator_infrastructure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw capability/I/O fault at the live seam is infrastructure, never a model outcome."""
+
+    if sys.platform != "linux":
+        pytest.skip("live evaluator-tree scanner requires Linux")
+    workspace = tmp_path / "capability-workspace"
+    workspace.mkdir()
+    # Exactly one live walk: `next_tree_scan` starts at 0.0 so the monitor's first sample always
+    # runs, and a long interval suppresses cleanup's pre-kill pass.  The surfaced cause chain
+    # therefore belongs to one identified scan rather than whichever poll happened to arrive.
+    monkeypatch.setattr(process_module, "_TREE_POLL_INTERVAL_S", 3600.0)
+    executable = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
+    request = ProcessRequest.create(
+        argv=(executable, "-I", "-c", "import time; time.sleep(30)"),
+        stdin="",
+        cwd=tmp_path.resolve(),
+        environment={},
+        timeout_s=5,
+        stream_limit_bytes=1024,
+        resource_limits=ProcessResourceLimits(tree_files=100, tree_bytes=1024 * 1024),
+        tree_root=workspace,
+    )
+    # Kill the pinned capability itself.  Destroying the directory underneath the held FD does
+    # NOT work here: this kernel lets openat2(dirfd, ".", RESOLVE_BENEATH) succeed on an unlinked
+    # directory, so walk_tree just reports an empty tree (measured -- see
+    # .review-deep/step26-coverage/B5-spec.md).  Closing is the one mechanism that produces a
+    # *plain* LinuxCapabilityError from production code rather than a fabricated one: no
+    # model-authored tree content can ever reach this branch, because every content-shaped
+    # mutation is typed drift/policy/limit first.  `run_process` owns and re-closes this
+    # capability on cleanup, and close() is idempotent.
+    assert request._tree_capability is not None
+    request._tree_capability.close()
+
+    with pytest.raises(ProcessExecutionError) as raised:
+        run_process(request)
+
+    assert "evaluator tree inspection failed closed" in str(raised.value)
+    assert not isinstance(raised.value, ModelTreeViolationError)
+    inner = raised.value.__cause__
+    assert isinstance(inner, ProcessExecutionError)
+    assert str(inner) == "evaluator tree inspection failed closed"
+    cause = inner.__cause__
+    # The clause itself: a *plain* capability fault, not one of the three typed tree outcomes.
+    assert isinstance(cause, LinuxCapabilityError)
+    assert not isinstance(cause, (LinuxTreeDriftError, LinuxTreePolicyError, LinuxTreeLimitError))
+
+
+@pytest.mark.linux_isolation
+def test_linux_terminal_scanner_capability_fault_is_evaluator_infrastructure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The authoritative scan reports a raw capability fault as infrastructure, not a model zero."""
+
+    if sys.platform != "linux":
+        pytest.skip("terminal evaluator-tree scanner requires Linux")
+    workspace = tmp_path / "terminal-capability-workspace"
+    workspace.mkdir()
+    child = workspace / "child.txt"
+    child.write_text("original", encoding="utf-8")
+    # Arrival 1 is the monitor's first and -- with this interval -- only live sample.  Blocking
+    # there lets the capability be closed while that walk is already streaming its children off
+    # descriptors it opened before the seam, so the live scan still completes normally and only
+    # the post-quiescence authoritative scan meets the dead capability.  That ordering is what
+    # makes this a test of seam 1461 specifically rather than of seam 1417.
+    monkeypatch.setattr(process_module, "_TREE_POLL_INTERVAL_S", 3600.0)
+    race = _RaceBarrier()
+    executable = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
+    request = ProcessRequest.create(
+        argv=(executable, "-I", "-c", "import time; time.sleep(30)"),
+        stdin="",
+        cwd=tmp_path.resolve(),
+        environment={},
+        timeout_s=1,
+        stream_limit_bytes=1024,
+        resource_limits=ProcessResourceLimits(tree_files=100, tree_bytes=1024 * 1024),
+        tree_root=workspace,
+        _tree_before_open=race.hook("child.txt"),
+    )
+
+    # The in-flight live walk keeps working off already-open descriptors; the next walk_tree
+    # call -- validate_terminal_tree's -- is the one that asks the capability to reopen.
+    def mutate() -> None:
+        assert request._tree_capability is not None
+        request._tree_capability.close()
+
+    value, error = race.run(
+        lambda: run_process(request),
+        mutate,
+        enter_timeout_s=20.0,
+        join_timeout_s=20.0,
+    )
+    assert value is None
+    assert isinstance(error, ProcessExecutionError)
+    assert "evaluator terminal tree inspection failed closed" in str(error)
+    # Distinct from its neighbour branch: a vanished capability is never a Step-27 model zero.
+    assert not isinstance(error, ModelTreeViolationError)
+    assert "violates submitted-output policy" not in str(error)
+    cause = error.__cause__
+    assert isinstance(cause, LinuxCapabilityError)
+    assert not isinstance(cause, (LinuxTreeDriftError, LinuxTreePolicyError, LinuxTreeLimitError))
+
+
+@pytest.mark.linux_isolation
 @pytest.mark.parametrize("failure_stage", ["setup", "execute", "verify"])
 def test_linux_bubblewrap_probe_partial_setup_failure_leaks_no_fd_or_directory(
     tmp_path: Path,
@@ -1353,6 +1466,143 @@ def test_linux_evaluator_bubblewrap_uses_private_tmpfs_fd_and_retains_terminal_f
 
 
 @pytest.mark.linux_isolation
+def test_linux_evaluator_release_barrier_holds_target_until_real_control_readback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No evaluator target byte crosses the barrier before the real cgroup readback completes."""
+
+    workspace = tmp_path / "workspace-barrier"
+    oracle = tmp_path / "oracle-barrier"
+    runtime_directory = tmp_path / "runtime-barrier"
+    for directory in (workspace, oracle, runtime_directory):
+        directory.mkdir()
+    ceilings = _ceilings(memory=256 * 1024 * 1024, processes=16, files=8)
+    real_read = process_module._read_directory_text
+    reads: list[str] = []
+
+    def recording_read(capability: LinuxPathCapability, name: str) -> str:
+        value = real_read(capability, name)
+        reads.append(name)
+        return value
+
+    real_handshake = process_module._receive_evaluator_handshake
+    observed: dict[str, Any] = {}
+
+    def observing_handshake(
+        control: socket.socket,
+        request: ProcessRequest,
+        runtime: Any,
+        scope_relative_path: str,
+    ) -> LinuxPathCapability:
+        # The real handshake: real adopt, real validate_before_release, real _verify_readback.
+        scratch_capability = real_handshake(control, request, runtime, scope_relative_path)
+        state = runtime.resource_guard
+        observed["reads"] = tuple(reads)
+        observed["validated"] = state.validated_for_release
+        observed["owner"] = state.outer_owner_identity
+        observed["magic"] = state.capability.filesystem_magic
+        observed["controls"] = {
+            name: real_read(state.capability, name).strip()
+            for name in ("memory.max", "memory.swap.max", "pids.max", "cpu.max")
+        }
+        # Still behind the barrier: _start_process has not sent b"R", so the supervisor is parked
+        # in control.recv(1), has forked nothing, and no target byte can reach the stdout pipe.
+        owner_pid = state.outer_owner_identity[0]
+        deadline = time.monotonic() + _BARRIER_DWELL_S
+        while time.monotonic() < deadline:
+            assert not select.select([runtime.proc.stdout], [], [], 0)[0], (
+                "evaluator target wrote a byte before the release barrier"
+            )
+            assert not process_module._posix_direct_children(owner_pid), (
+                "evaluator supervisor forked the target before the release barrier"
+            )
+            time.sleep(0.02)
+        observed["dwelled"] = True
+        return scratch_capability
+
+    monkeypatch.setattr(process_module, "_read_directory_text", recording_read)
+    monkeypatch.setattr(process_module, "_receive_evaluator_handshake", observing_handshake)
+    with _real_preflight(tmp_path) as preflight:
+        with build_evaluator_sandbox(
+            preflight,
+            workspace=workspace,
+            oracle=oracle,
+            runtime=runtime_directory,
+            command=("/usr/bin/python3", "-I", "-c", "import os; os.write(1, b'FIRST')"),
+            ceilings=ceilings,
+        ) as launch:
+            result = _run_launch(launch, timeout=20)
+    assert observed["dwelled"] is True
+    assert observed["validated"] is True
+    assert observed["owner"] is not None
+    assert observed["magic"] == process_module._CGROUP2_SUPER_MAGIC
+    controls = observed["controls"]
+    assert controls["memory.max"] == str(ceilings.evaluator_memory_bytes)
+    assert controls["memory.swap.max"] == "0"
+    assert controls["pids.max"] == str(ceilings.evaluator_processes)
+    quota, period = (int(piece) for piece in controls["cpu.max"].split())
+    assert quota > 0 and period > 0
+    assert quota * 100 == ceilings.evaluator_cpu_bandwidth_percent * period
+    assert {
+        "memory.max",
+        "memory.swap.max",
+        "pids.max",
+        "cpu.max",
+        "cgroup.procs",
+    }.issubset(set(observed["reads"]))
+    # Not vacuous: the target really did execute, after the barrier.
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == b"FIRST"
+
+
+@pytest.mark.linux_isolation
+@pytest.mark.parametrize(
+    ("control", "replacement", "message"),
+    [
+        ("memory.max", "1\n", "memory.max readback mismatch"),
+        ("memory.swap.max", "max\n", "memory.swap.max readback mismatch"),
+        ("pids.max", "9999\n", "pids.max readback mismatch"),
+        ("cpu.max", "50000 200000\n", "cpu.max readback mismatch"),
+    ],
+)
+def test_linux_evaluator_control_readback_mismatch_fails_closed_before_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+    replacement: str,
+    message: str,
+) -> None:
+    """A single mismatched effective control fails closed as evaluator infrastructure."""
+
+    workspace = tmp_path / "workspace-mismatch"
+    oracle = tmp_path / "oracle-mismatch"
+    runtime_directory = tmp_path / "runtime-mismatch"
+    for directory in (workspace, oracle, runtime_directory):
+        directory.mkdir()
+    host_tmp_identity = _host_private_mountpoint_identity()
+    real_read = process_module._read_directory_text
+
+    def corrupt_one_control(capability: LinuxPathCapability, name: str) -> str:
+        value = real_read(capability, name)
+        return replacement if name == control else value
+
+    monkeypatch.setattr(process_module, "_read_directory_text", corrupt_one_control)
+    with _real_preflight(tmp_path) as preflight:
+        with build_evaluator_sandbox(
+            preflight,
+            workspace=workspace,
+            oracle=oracle,
+            runtime=runtime_directory,
+            command=("/usr/bin/python3", "-I", "-c", "import os; os.write(1, b'FIRST')"),
+            ceilings=_ceilings(memory=256 * 1024 * 1024, processes=16, files=8),
+        ) as launch:
+            with pytest.raises(ProcessExecutionError, match=message):
+                _run_launch(launch, timeout=20)
+    assert _host_private_mountpoint_identity() == host_tmp_identity
+
+
+@pytest.mark.linux_isolation
 def test_linux_evaluator_failed_materialization_leaves_host_private_mountpoint_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1386,10 +1636,22 @@ def test_linux_evaluator_failed_materialization_leaves_host_private_mountpoint_u
 
 
 @pytest.mark.linux_isolation
-@pytest.mark.parametrize("operation", ["cpu", "memory", "processes"])
+@pytest.mark.parametrize(
+    ("operation", "provenance"),
+    [
+        # CPU is cumulative cgroup accounting read at monitor ticks: a sampled scoring
+        # threshold that may overshoot.  Memory and task ceilings are kernel-enforced cgroup
+        # guards.  The two-layer contract is observable ONLY through provenance -- a silent
+        # fall back to /proc polling reports the identical resource name.
+        ("cpu", "sampled-threshold"),
+        ("memory", "hard-guard"),
+        ("processes", "hard-guard"),
+    ],
+)
 def test_linux_evaluator_aggregate_cpu_memory_and_process_limits(
     tmp_path: Path,
     operation: str,
+    provenance: str,
 ) -> None:
     workspace = tmp_path / f"workspace-{operation}"
     oracle = tmp_path / f"oracle-{operation}"
@@ -1397,6 +1659,9 @@ def test_linux_evaluator_aggregate_cpu_memory_and_process_limits(
     workspace.mkdir()
     oracle.mkdir()
     _copy_fixture(runtime, "resource_probe.py")
+    cpu_seconds = 1 if operation == "cpu" else 10
+    memory_bytes = 128 * 1024 * 1024
+    processes = 8
     with _real_preflight(tmp_path) as preflight:
         with build_evaluator_sandbox(
             preflight,
@@ -1410,22 +1675,108 @@ def test_linux_evaluator_aggregate_cpu_memory_and_process_limits(
                 operation,
             ),
             ceilings=_ceilings(
-                cpu=1 if operation == "cpu" else 10,
-                memory=128 * 1024 * 1024,
-                processes=8,
+                cpu=cpu_seconds,
+                memory=memory_bytes,
+                processes=processes,
             ),
         ) as launch:
             result = _run_launch(launch, timeout=5)
     assert result.termination == "resource-limit"
     assert result.resource_limit == operation
+    assert result.resource_limit_provenance == provenance
+    configured = {"cpu": cpu_seconds, "memory": memory_bytes, "processes": processes}[operation]
+    # The recorded limit is the control the kernel actually read back before release:
+    # _verify_readback refuses to release the target unless memory.max/pids.max equal these.
+    assert result.resource_limit_value == configured
+    observed = result.resource_limit_observed
+    assert observed is not None
+    if operation == "cpu":
+        # Sampled: cumulative usec//1e6 crossed the configured second and may overshoot.
+        assert observed >= configured
+    elif operation == "processes":
+        # pids.peak cannot exceed the enforced pids.max, and a denied fork proves it reached it.
+        assert observed == configured
+    else:
+        # memory.peak is bounded by the enforced memory.max and sits near it after the OOM kill.
+        assert configured // 2 <= observed <= configured
 
 
 @pytest.mark.linux_isolation
 @pytest.mark.parametrize(
-    ("count", "size", "files", "file_bytes", "live_limit", "message"),
+    ("children", "expected_limit"),
+    [(16, "memory"), (4, None)],
+    ids=["aggregate-crosses", "aggregate-stays-under"],
+)
+def test_linux_evaluator_multi_descendant_allocation_hits_the_hard_memory_guard(
+    tmp_path: Path,
+    children: int,
+    expected_limit: str | None,
+) -> None:
+    """Descendants that each stay far under the bound must still be charged together.
+
+    Only aggregate cgroup accounting can see this: every descendant holds one eighth of
+    ``memory.max``, so the per-process ``RLIMIT``/``/proc``-RSS approach this step replaces stays
+    silent.  The under-budget parametrization is the calibration anchor -- same fixture, same
+    ceilings, fewer descendants -- and the guard must NOT fire.
+    """
+
+    chunk = 24 * 1024 * 1024
+    memory_bytes = 192 * 1024 * 1024
+    workspace = tmp_path / f"workspace-fan-out-{children}"
+    oracle = tmp_path / f"oracle-fan-out-{children}"
+    runtime = tmp_path / f"runtime-fan-out-{children}"
+    workspace.mkdir()
+    oracle.mkdir()
+    _copy_fixture(runtime, "resource_probe.py")
+    with _real_preflight(tmp_path) as preflight:
+        with build_evaluator_sandbox(
+            preflight,
+            workspace=workspace,
+            oracle=oracle,
+            runtime=runtime,
+            command=(
+                "/usr/bin/python3",
+                "-I",
+                "/opt/measure-twice/runtime/resource_probe.py",
+                "memory-fan-out",
+                str(children),
+                str(chunk),
+            ),
+            ceilings=_ceilings(cpu=10, memory=memory_bytes, processes=48),
+        ) as launch:
+            result = _run_launch(launch, timeout=20)
+    if expected_limit is None:
+        # Calibration anchor: the same fan-out below the aggregate bound must score clean.
+        assert result.termination == "exited", result.stderr
+        assert result.exit_code == 0, result.stderr
+        assert result.resource_limit is None
+        assert result.resource_limit_observed is None
+        assert result.resource_limit_provenance is None
+        assert result.stdout.decode("utf-8").strip().endswith(f"fan-out-complete:{children}")
+        return
+    assert result.termination == "resource-limit", result.stderr
+    assert result.exit_code is None
+    assert result.resource_limit == expected_limit
+    # The recorded limit is the cgroup's configured aggregate bound, never an RLIMIT backstop.
+    assert result.resource_limit_value == memory_bytes
+    assert result.resource_limit_provenance == "hard-guard"
+    observed = result.resource_limit_observed
+    assert observed is not None
+    # `observed` is cgroup `memory.peak`.  No descendant ever held more than `chunk`, so a value
+    # clearing four whole descendants proves the charge was summed across the tree rather than
+    # read off any single process.
+    assert observed >= 4 * chunk
+
+
+@pytest.mark.linux_isolation
+@pytest.mark.parametrize(
+    ("count", "size", "files", "file_bytes", "live_limit", "expected_observed", "message"),
     [
-        (3, 10, 2, 100, "file-count", "file ceiling"),
-        (2, 80, 10, 128, "file-bytes", "byte ceiling"),
+        # walk_tree raises on the FIRST crossing, so both observations are exact, not racy:
+        # file-count crosses at files + 1; file-bytes crosses at the first cumulative sum
+        # strictly greater than file_bytes (80 -> 160 for two 80-byte files).
+        (3, 10, 2, 100, "file-count", 3, "file ceiling"),
+        (2, 80, 10, 128, "file-bytes", 160, "byte ceiling"),
     ],
 )
 def test_linux_evaluator_terminal_file_ceilings(
@@ -1435,6 +1786,7 @@ def test_linux_evaluator_terminal_file_ceilings(
     files: int,
     file_bytes: int,
     live_limit: str,
+    expected_observed: int,
     message: str,
 ) -> None:
     workspace = tmp_path / "workspace-files"
@@ -1463,5 +1815,13 @@ def test_linux_evaluator_terminal_file_ceilings(
             assert result.termination == "resource-limit"
             assert result.exit_code is None
             assert result.resource_limit == live_limit
+            # A logical walker threshold is a sampled scoring rule.  It must never be
+            # promoted to hard-guard: the tmpfs here is generously bounded and
+            # _tmpfs_hard_exhaustion returns None, so physical exhaustion did NOT occur.
+            assert result.resource_limit_provenance == "sampled-threshold"
+            assert result.resource_limit_value == (
+                files if live_limit == "file-count" else file_bytes
+            )
+            assert result.resource_limit_observed == expected_observed
             with pytest.raises(ResourceCeilingError, match=message):
                 enforce_evaluator_tree_ceiling(launch)

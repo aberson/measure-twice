@@ -59,7 +59,11 @@ _SUPERVISOR_MAGIC: Final[bytes] = b"MT26"
 EVALUATOR_WORKSPACE_FD_TOKEN: Final[str] = "__measure_twice_evaluator_workspace_fd__"  # noqa: S105 - argv placeholder, not a secret.
 _TMPFS_SUPER_MAGIC: Final[int] = 0x01021994
 _CGROUP2_SUPER_MAGIC: Final[int] = 0x63677270
-_STARTUP_TIMEOUT_S: Final[float] = 10.0
+# Bounds the pre-release bring-up ONLY: systemd-run scope creation, cgroup delegation and
+# readback, the bounded private tmpfs, supervisor binding, and the SCM_RIGHTS handshake.
+# It is deliberately independent of ProcessRequest.timeout_s -- no submitted byte executes
+# before the release barrier, so the target's wall clock cannot be the right budget here.
+SANDBOX_SETUP_TIMEOUT_S: Final[float] = 10.0
 _SUPERVISOR_CODE: Final[str] = """
 import errno
 import ctypes
@@ -1726,9 +1730,13 @@ class _LinuxTargetStatus:
 @dataclass(slots=True)
 class _RunningProcess:
     proc: subprocess.Popen[bytes]
+    # When the TARGET began executing, not when the harness began standing the sandbox up:
+    # assigned after the release barrier on the evaluator seam and after the Win32 resume.
     started: float
     process_group_id: int | None
     status_read_fd: int | None
+    # When the target stopped, captured before teardown so elapsed_ms excludes the reap chain.
+    finished: float | None = None
     job: _WindowsJob | None = None
     tracker: _LinuxDescendantTracker | None = None
     tracker_thread: threading.Thread | None = None
@@ -2519,7 +2527,7 @@ def _receive_evaluator_handshake(
     scratch = request._evaluator_scratch
     if guard is None or scratch is None:
         raise ProcessContractError("evaluator handshake requires resource guard and scratch")
-    control.settimeout(min(_STARTUP_TIMEOUT_S, float(request.timeout_s)))
+    control.settimeout(SANDBOX_SETUP_TIMEOUT_S)
     try:
         socket_api = cast("Any", socket)
         payload, ancillary, message_flags, _address = cast("Any", control).recvmsg(
@@ -2621,7 +2629,6 @@ def _receive_evaluator_handshake(
 def _start_process(request: ProcessRequest) -> _RunningProcess:
     """Spawn the outer owner and return immediately into cleanup-covered state."""
 
-    started = time.monotonic()
     capabilities = _launch_capabilities(request)
     status_read_fd: int | None = None
     status_write_fd: int | None = None
@@ -2691,7 +2698,9 @@ def _start_process(request: ProcessRequest) -> _RunningProcess:
             control_child_fd = None
             runtime = _RunningProcess(
                 proc=proc,
-                started=started,
+                # Provisional: correct for a guard-free Linux run, where the child is already
+                # executing.  The evaluator seam re-anchors this at the release barrier below.
+                started=time.monotonic(),
                 process_group_id=proc.pid,
                 status_read_fd=status_read_fd,
             )
@@ -2711,6 +2720,11 @@ def _start_process(request: ProcessRequest) -> _RunningProcess:
                     raise
                 try:
                     control_parent.sendall(b"R")
+                    # The barrier is open: this is the first instant any submitted byte can
+                    # execute, so it -- not the start of bring-up -- is the target's clock
+                    # origin.  Anchoring earlier charges systemd-run, cgroup delegation, the
+                    # tmpfs mount and the handshake to the model's wall-clock budget.
+                    runtime.started = time.monotonic()
                 except BaseException:
                     # A failed release send is ambiguous: the supervisor could already have
                     # received it and forked the Bubblewrap target.  Do not take the graceful
@@ -2750,7 +2764,9 @@ def _start_process(request: ProcessRequest) -> _RunningProcess:
             )
         return _RunningProcess(
             proc=proc,
-            started=started,
+            # POSIX children run from Popen; the Windows child is created suspended and has its
+            # origin corrected in _initialize_process once the Win32 job resumes it.
+            started=time.monotonic(),
             process_group_id=proc.pid if os.name == "posix" else None,
             status_read_fd=status_read_fd,
         )
@@ -2800,6 +2816,10 @@ def _initialize_process(request: ProcessRequest, runtime: _RunningProcess) -> No
         raise ProcessExecutionError(
             "could not assign suspended process to a Win32 kill-on-close job"
         )
+    if sys.platform == "win32":
+        # The child was created suspended and NtResumeProcess ran inside assign(); until now no
+        # target instruction had executed, so this is the Windows clock origin.
+        runtime.started = time.monotonic()
     if sys.platform == "linux":
         root_starttime = _pid_starttime(proc.pid)
         if root_starttime is None:
@@ -3239,7 +3259,10 @@ def _render_result(
         stderr=stderr,
         exit_code=exit_code,
         signal=signal_number,
-        elapsed_ms=max(0, int((time.monotonic() - runtime.started) * 1000)),
+        elapsed_ms=max(
+            0,
+            int(((runtime.finished or time.monotonic()) - runtime.started) * 1000),
+        ),
         termination=termination,
         stdout_limit_exceeded=stdout_capture.exceeded,
         stderr_limit_exceeded=stderr_capture.exceeded,
@@ -3266,6 +3289,9 @@ def _run_process_owned(request: ProcessRequest) -> ProcessResult:
     try:
         _initialize_process(request, runtime)
         termination, abnormal = _wait_for_process(request, runtime)
+        # Stop the target's clock here: _cleanup_process below runs a bounded reap chain that
+        # can legitimately spend tens of seconds, and none of it is the target's runtime.
+        runtime.finished = time.monotonic()
     finally:
         _cleanup_process(runtime, abnormal=abnormal)
     if termination is None:

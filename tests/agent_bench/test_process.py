@@ -181,6 +181,58 @@ def test_linux_evaluator_handshake_requires_three_cloexec_capabilities(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux SCM_RIGHTS handshake invariant")
+def test_linux_evaluator_handshake_budget_is_independent_of_the_caller_wall_clock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-release bring-up is bounded by its own budget, never by the target's clock.
+
+    ``timeout_s`` is the SUBMITTED CODE's wall-clock budget, consumed only after the release
+    barrier.  The five-stage bring-up this socket covers -- systemd-run scope creation, cgroup
+    delegation and readback, the bounded private tmpfs, supervisor binding, the FD handshake --
+    runs before any submitted byte executes, so clamping it by ``timeout_s`` made a slow-but-
+    healthy host report evaluator infrastructure as unavailable.
+
+    Calibration (measurement-validity.md): ``timeout_s`` is deliberately far SMALLER than the
+    setup budget.  Against the previous ``min(SANDBOX_SETUP_TIMEOUT_S, timeout_s)`` this test is
+    red -- the error would arrive in ~0.05 s and the elapsed lower bound would fail -- so it
+    discriminates the fix rather than restating it.  It is also the first coverage this error
+    path has ever had.
+    """
+
+    baseline = _linux_fd_snapshot()
+    monkeypatch.setattr(process_module, "SANDBOX_SETUP_TIMEOUT_S", 0.5)
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    scratch = _handshake_scratch(tmp_path)
+    request = SimpleNamespace(
+        resource_guard=LinuxResourceGuard(1, 1, 100),
+        _evaluator_scratch=scratch,
+        timeout_s=0.05,
+    )
+    runtime = SimpleNamespace(resource_guard=None)
+    try:
+        # Nothing is ever sent on `child`: the supervisor is modelled as wedged before its
+        # pre-release handshake, which is exactly the liveness failure the budget exists for.
+        begin = time.monotonic()
+        with pytest.raises(ProcessExecutionError, match="did not reach its release barrier"):
+            process_module._receive_evaluator_handshake(
+                parent,
+                request,
+                runtime,
+                "/user.slice/test.scope",
+            )
+        elapsed = time.monotonic() - begin
+        assert elapsed >= 0.4, (
+            f"handshake honoured the caller clock, not the setup budget: {elapsed}"
+        )
+    finally:
+        scratch.close()
+        parent.close()
+        child.close()
+    _assert_linux_fd_baseline(baseline)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SCM_RIGHTS handshake invariant")
 @pytest.mark.parametrize(("payload", "fd_count"), [(b"wrong", 3), (b"MT26R", 2)])
 def test_linux_evaluator_handshake_rejects_malformed_message_before_release(
     tmp_path: Path,
@@ -1385,14 +1437,30 @@ def test_linux_resource_monitor_enforces_aggregate_descendant_ceiling(
 
     assert result.termination == "resource-limit"
     assert result.resource_limit == resource_name
+    # The unguarded process seam has no cgroup: every one of its ceilings is /proc sampling
+    # and may never claim hard-guard.  This is what makes the evaluator seam's hard-guard
+    # assertions non-tautological -- collapsing provenance to one constant reddens one side.
+    assert result.resource_limit_provenance == "sampled-threshold"
+    configured = {
+        "cpu": limits.cpu_seconds,
+        "memory": limits.memory_bytes,
+        "processes": limits.processes,
+    }[resource_name]
+    observed = result.resource_limit_observed
+    assert configured is not None and observed is not None
+    assert result.resource_limit_value == configured
+    # cpu crosses at >=; the sampled memory/process ceilings cross strictly above.
+    assert observed >= configured if resource_name == "cpu" else observed > configured
     assert result.elapsed_ms < 4_000
     _assert_linux_fd_baseline(fd_baseline)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux live evaluator-tree monitor")
 @pytest.mark.parametrize(
-    ("count", "size", "files", "tree_bytes", "resource_name"),
-    [(6, 10, 5, 1_000, "file-count"), (3, 50, 10, 100, "file-bytes")],
+    ("count", "size", "files", "tree_bytes", "resource_name", "expected_observed"),
+    # walk_tree raises on the first crossing: file-count at files + 1, file-bytes at the
+    # first cumulative sum strictly greater than tree_bytes (50 + 50 + 50 = 150 > 100).
+    [(6, 10, 5, 1_000, "file-count", 6), (3, 50, 10, 100, "file-bytes", 150)],
 )
 def test_linux_resource_monitor_terminates_live_tree_ceiling_crossing(
     tmp_path: Path,
@@ -1401,6 +1469,7 @@ def test_linux_resource_monitor_terminates_live_tree_ceiling_crossing(
     files: int,
     tree_bytes: int,
     resource_name: str,
+    expected_observed: int,
 ) -> None:
     fd_baseline = _linux_fd_snapshot()
     code = (
@@ -1424,6 +1493,9 @@ def test_linux_resource_monitor_terminates_live_tree_ceiling_crossing(
 
     assert result.termination == "resource-limit"
     assert result.resource_limit == resource_name
+    assert result.resource_limit_provenance == "sampled-threshold"
+    assert result.resource_limit_value == (files if resource_name == "file-count" else tree_bytes)
+    assert result.resource_limit_observed == expected_observed
     _assert_linux_fd_baseline(fd_baseline)
 
 

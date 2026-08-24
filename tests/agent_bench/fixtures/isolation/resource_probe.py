@@ -20,6 +20,39 @@ def _memory() -> None:
         blocks.append(bytearray(8 * 1024 * 1024))
 
 
+def _memory_fan_out(children: int, chunk: int) -> None:
+    """Hold ``chunk`` bytes in each of ``children`` descendants, none near the cgroup bound.
+
+    Only aggregate cgroup accounting can see this crossing: every descendant's own footprint is a
+    small fraction of ``memory.max``, so a per-process ceiling stays silent.  Allocation is
+    serialized through ``ready`` so the charge grows monotonically, and children park on ``hold``
+    so earlier allocations stay resident while later siblings are still starting.
+    """
+
+    ready_read, ready_write = os.pipe()
+    hold_read, hold_write = os.pipe()
+    print(f"fan-out:{children}x{chunk}", flush=True)
+    for index in range(children):
+        pid = os.fork()
+        if pid == 0:
+            os.close(ready_read)
+            os.close(hold_write)
+            held = bytearray(chunk)
+            for offset in range(0, chunk, 4096):
+                held[offset] = 1
+            os.write(ready_write, b"x")
+            os.close(ready_write)
+            os.read(hold_read, 1)
+            os._exit(0)
+        if os.read(ready_read, 1) != b"x":
+            os._exit(3)
+        print(f"allocated:{index + 1}", flush=True)
+    os.close(hold_write)
+    for _ in range(children):
+        os.wait()
+    print(f"fan-out-complete:{children}", flush=True)
+
+
 def _processes() -> None:
     children: list[int] = []
     try:
@@ -44,6 +77,8 @@ def main() -> None:
         _cpu()
     elif operation == "memory":
         _memory()
+    elif operation == "memory-fan-out":
+        _memory_fan_out(int(sys.argv[2]), int(sys.argv[3]))
     elif operation == "processes":
         _processes()
     elif operation == "files":

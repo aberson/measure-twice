@@ -33,6 +33,7 @@ from measure_twice.agent_bench._linux_capabilities import (
 from measure_twice.agent_bench.models import SANDBOX_CONTRACT_VERSION, Ceilings
 from measure_twice.agent_bench.process import (
     EVALUATOR_WORKSPACE_FD_TOKEN,
+    SANDBOX_SETUP_TIMEOUT_S,
     EvaluatorScratch,
     LinuxResourceGuard,
     ProcessExecutionError,
@@ -640,7 +641,7 @@ def _pinned_subprocess(
     *,
     pass_capabilities: Sequence[LinuxPathCapability] = (),
     cwd: LinuxPathCapability | None = None,
-    timeout_s: float = 10,
+    timeout_s: float = SANDBOX_SETUP_TIMEOUT_S,
 ) -> subprocess.CompletedProcess[bytes]:
     descriptors = tuple(
         dict.fromkeys(
