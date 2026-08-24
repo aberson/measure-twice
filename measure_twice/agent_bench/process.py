@@ -399,10 +399,10 @@ if guard_enabled:
             hard_limit, hard_observed = 2, _nonnegative_value(cgroup_fd, "pids.peak")
         elif scratch_fd >= 0:
             scratch_usage = os.fstatvfs(scratch_fd)
-            if scratch_usage.f_bavail == 0:
+            if scratch_usage.f_bavail <= 0:
                 hard_limit = 3
                 hard_observed = scratch_usage.f_blocks * scratch_usage.f_frsize
-            elif scratch_usage.f_ffree == 0:
+            elif scratch_usage.f_ffree <= 0:
                 hard_limit = 4
                 hard_observed = scratch_usage.f_files
         cpu_usage_after = _required_counter(
@@ -2344,9 +2344,13 @@ def _tmpfs_hard_exhaustion(
         values = cast("Any", os).fstatvfs(capability.fd)
     except OSError as exc:
         raise ProcessExecutionError("could not inspect evaluator tmpfs exhaustion") from exc
-    if int(values.f_bavail) == 0:
+    # `<= 0`, not `== 0`: tmpfs block accounting overshoots on a full filesystem and statvfs
+    # reports the remainder as a NEGATIVE count (measured: f_bfree = f_bavail = -1 on a genuinely
+    # exhausted private tmpfs).  An equality test silently misses that, so a hard guard that had
+    # actually fired would record no exhaustion and no `hard-guard` provenance at all.
+    if int(values.f_bavail) <= 0:
         return ("file-bytes", int(values.f_blocks) * int(values.f_frsize))
-    if int(values.f_ffree) == 0:
+    if int(values.f_ffree) <= 0:
         return ("file-count", int(values.f_files))
     return None
 
@@ -3193,6 +3197,15 @@ def _cleanup_process(runtime: _RunningProcess, *, abnormal: bool) -> None:
             tracker.validate_terminal_tree()
         except BaseException as exc:
             errors.append(exc)
+    if tracker is not None and runtime.tracker_thread is not None:
+        if runtime.tracker_thread.is_alive() and tracker.tree_capability is not None:
+            # The tracker's tree capability is `runtime.scratch_tree or request._tree_capability`
+            # (see _initialize_process).  The request-owned half is closed later by
+            # ProcessRequest._release(), which is outside this function's reach, so abandoning it
+            # here is what makes the surviving-monitor hazard covered on BOTH descriptors rather
+            # than only on the evaluator one.  A non-evaluator Linux run with tree_root set takes
+            # exactly that path.
+            tracker.tree_capability.abandon()
     if runtime.scratch_tree is not None:
         if runtime.tracker_thread is not None and runtime.tracker_thread.is_alive():
             # Deliberately leak this descriptor rather than close it.  `detach_resource_guard`

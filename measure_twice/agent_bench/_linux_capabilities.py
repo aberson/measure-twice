@@ -492,6 +492,22 @@ class LinuxPathCapability:
             self._fd = -1
         os.close(fd)
 
+    def abandon(self) -> None:
+        """Give up ownership WITHOUT closing: mark closed and leak the descriptor.
+
+        For the one case where closing is more dangerous than leaking.  ``fd`` hands out the raw
+        integer and releases this lock before the caller issues its syscall, so a thread that
+        outlived its bounded join can still be mid-``fstatvfs``/``scandir`` on that number; closing
+        underneath it lets descriptor-number reuse land that syscall on an unrelated object.  A run
+        that reaches this has already failed, so one leaked descriptor for the life of the process
+        is the smaller harm.  A later ``close()`` is a no-op, which is what lets ordinary
+        ownership teardown run unchanged after this.
+        """
+
+        with self._lock:
+            self._closed = True
+            self._fd = -1
+
     def __enter__(self) -> Self:
         _ = self.fd
         return self

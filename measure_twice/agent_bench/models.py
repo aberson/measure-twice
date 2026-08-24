@@ -8,11 +8,10 @@ sorted-key UTF-8 JSON and never include an unselected registry entry.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Final, cast
 
 from measure_twice.agent_bench._wire import AgentInputError, WireCodec
 
@@ -27,27 +26,28 @@ SANDBOX_CONTRACT_VERSION: Final[str] = "linux-bwrap-v2"
 EVALUATOR_DIRECTORY_ALLOWANCE: Final[int] = 10_001
 
 
+# The per-file page granularity CONFIG validation assumes.  Deliberately a fixed constant, not
+# the running host's page size: profiles are loaded on the operator's host (Windows, where
+# os.sysconf does not exist) while the evaluator runs inside WSL2 Linux, so resolving it at
+# runtime made the floor differ between the two sides that must agree -- and would have made the
+# shipped profile fail to LOAD on a 16 KiB-page host, a strictly new rejection. Physical capacity
+# is still checked for real against the mounted tmpfs by the readback in process.py, and genuine
+# exhaustion is caught by the hard-guard path; this constant only has to make config validation
+# deterministic and identical everywhere.
+EVALUATOR_PAGE_GRANULARITY: Final[int] = 4096
+
+
 def evaluator_tmpfs_minimum_bytes(*, file_bytes: int, files: int) -> int:
     """The tmpfs byte floor: logical bytes plus one page of slack per file.
 
-    ONE owner for this formula.  Config-load validation (``Ceilings``) and launch validation
-    (``EvaluatorScratch`` / ``_validate_evaluator_tmpfs``) must compute the identical floor, or a
-    profile that loads cleanly dies with ``ProcessContractError`` inside the evaluator launch --
-    the late rejection the shared ``EVALUATOR_DIRECTORY_ALLOWANCE`` already closed for inodes.
-    tmpfs charges a whole page per file, so a bound that covers only the logical bytes is not a
-    bound the kernel will honour.
+    ONE owner for this formula.  Config-load validation (``Ceilings``) and launch-time contract
+    validation (``EvaluatorScratch``) must compute the identical floor, or a profile that loads
+    cleanly dies with ``ProcessContractError`` inside the evaluator launch -- the late rejection
+    the shared ``EVALUATOR_DIRECTORY_ALLOWANCE`` already closed for inodes.  tmpfs charges a whole
+    page per file, so a bound covering only the logical bytes is not a bound the kernel honours.
     """
 
-    return file_bytes + files * evaluator_page_size()
-
-
-def evaluator_page_size() -> int:
-    """Host page size, with the same documented 4096 fallback on every caller."""
-
-    try:
-        return int(cast("Any", os).sysconf("SC_PAGE_SIZE"))
-    except (AttributeError, OSError, ValueError):
-        return 4096
+    return file_bytes + files * EVALUATOR_PAGE_GRANULARITY
 
 
 class ModelSpecError(AgentInputError):

@@ -1892,7 +1892,7 @@ def test_linux_evaluator_parallel_large_writers_hit_the_physical_tmpfs_byte_enve
     """Concurrent writers exhaust the private tmpfs itself, not the backing ext4 volume.
 
     The physical envelope is the only thing that can stop four unbounded writers, so a full
-    ``f_bavail == 0`` readback through the retained parent FD is what authorizes ``hard-guard``
+    ``f_bavail <= 0`` readback through the retained parent FD is what authorizes ``hard-guard``
     provenance carrying the tmpfs capacity instead of the configured logical byte ceiling.
     """
 
@@ -1935,7 +1935,11 @@ def test_linux_evaluator_parallel_large_writers_hit_the_physical_tmpfs_byte_enve
             values = os.fstatvfs(terminal_root.fd)
             capacity = int(values.f_blocks) * int(values.f_frsize)
             # The retained FD -- not a supervisor claim -- is what proves exhaustion.
-            assert values.f_bavail == 0
+            # `<= 0`: tmpfs reports a NEGATIVE remainder when block accounting overshoots
+            # on a full filesystem (measured: -1).  Equality here would make this canary
+            # flake red on a genuinely exhausted tmpfs -- and it is how the same equality
+            # bug in the production predicate stayed hidden.
+            assert values.f_bavail <= 0
             assert capacity == ceilings.evaluator_tmpfs_bytes
             assert result.termination == "resource-limit"
             assert result.exit_code is None
@@ -1991,7 +1995,7 @@ def test_linux_evaluator_many_small_files_hit_the_physical_tmpfs_inode_envelope(
             result = _run_launch(launch, timeout=60)
             terminal_root = launch.terminal_tree_capability()
             values = os.fstatvfs(terminal_root.fd)
-            assert values.f_ffree == 0
+            assert values.f_ffree <= 0
             assert int(values.f_files) == ceilings.evaluator_tmpfs_inodes
             assert result.termination == "resource-limit"
             assert result.resource_limit == "file-count"
@@ -2058,7 +2062,7 @@ def test_linux_terminal_validation_upgrades_a_sampled_threshold_with_the_physica
             _run_launch(launch, timeout=20)
             terminal_root = launch.terminal_tree_capability()
             values = os.fstatvfs(terminal_root.fd)
-            assert values.f_bavail == 0, "canary did not physically exhaust the private tmpfs"
+            assert values.f_bavail <= 0, "canary did not physically exhaust the private tmpfs"
             capacity = int(values.f_blocks) * int(values.f_frsize)
             scratch = EvaluatorScratch(
                 source=LinuxPathCapability.acquire_absolute(seed, expected="directory"),

@@ -318,8 +318,10 @@ def test_ceilings_accepts_exactly_what_the_evaluator_scratch_requires() -> None:
 
     files = 7
     file_bytes = 64 * 1024
-    page_size = models_module.evaluator_page_size()
-    expected_floor = file_bytes + files * page_size
+    # Independently written: the floor is a fixed granularity, not the running host's page
+    # size, so this expectation is identical on the Windows config host and inside WSL2.
+    expected_floor = file_bytes + files * 4096
+    assert models_module.EVALUATOR_PAGE_GRANULARITY == 4096
     assert (
         models_module.evaluator_tmpfs_minimum_bytes(file_bytes=file_bytes, files=files)
         == expected_floor
