@@ -1738,7 +1738,12 @@ def test_linux_evaluator_aggregate_cpu_memory_and_process_limits(
                 processes=processes,
             ),
         ) as launch:
-            result = _run_launch(launch, timeout=5)
+            # Generous wall clock on purpose.  This canary asserts that a RESOURCE ceiling
+            # is what stops the run, so the wall clock must never be the thing that fires
+            # first -- the ceiling depends on a kernel event (OOM kill, pids denial, walker
+            # crossing) whose latency the test does not control.  A broken guard still
+            # fails here, it just fails as 'timeout' after longer.
+            result = _run_launch(launch, timeout=30)
     assert result.termination == "resource-limit"
     assert result.resource_limit == operation
     assert result.resource_limit_provenance == provenance
@@ -1869,7 +1874,12 @@ def test_linux_evaluator_terminal_file_ceilings(
             ),
             ceilings=_ceilings(files=files, file_bytes=file_bytes),
         ) as launch:
-            result = _run_launch(launch)
+            # Generous wall clock on purpose.  This canary asserts that a RESOURCE ceiling
+            # is what stops the run, so the wall clock must never be the thing that fires
+            # first -- the ceiling depends on a kernel event (OOM kill, pids denial, walker
+            # crossing) whose latency the test does not control.  A broken guard still
+            # fails here, it just fails as 'timeout' after longer.
+            result = _run_launch(launch, timeout=30)
             assert result.termination == "resource-limit"
             assert result.exit_code is None
             assert result.resource_limit == live_limit

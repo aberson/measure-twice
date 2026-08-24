@@ -1,6 +1,6 @@
 # Provider-Neutral Coding Agent Benchmark
 
-**Status:** WRAPPED - Step 26 resource-guard revision ready for recovery build (2026-08-23)
+**Status:** Step 26 DONE - Linux process and isolation substrate shipped and merged (2026-08-24)
 
 **Roadmap allocation:** Steps 25-55. Canonical `plan.md` owns Steps 1-17 and the approved
 operations plan owns Steps 18-24.
@@ -1446,7 +1446,7 @@ report paths do not require inference.
   Step 26's retained tmpfs-root capability and carries its hard-guard versus sampled-threshold resource
   provenance into evaluator evidence; it cannot substitute a pathname reconstruction or
   monitor-only launch.
-- **Depends on:** 26, including its non-optional cgroup, bounded-tmpfs, and retained terminal-FD
+- **Depends on:** 26 (shipped), including its non-optional cgroup, bounded-tmpfs, and retained terminal-FD
   contract
 
 <!-- autofix-applied: 2026-08-21 -->
@@ -1467,7 +1467,7 @@ report paths do not require inference.
   attempted first-class web use, timeout, and stream overflow fail closed; `doctor --dry-run`
   emits the canonical one-shot receipt/digest and writes only its pending confirmation file—no
   evidence or run; automated tests make zero inference calls.
-- **Depends on:** 26
+- **Depends on:** 26 (shipped)
 
 <!-- autofix-applied: 2026-08-21 -->
 ### Step 29: Claude parity and live-operation runbook
