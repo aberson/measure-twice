@@ -16,3 +16,8 @@ __pycache__/
 # Local session/handoff scratch — carries absolute operator paths; must never be
 # published from this public repo.
 .claude/
+# Build/review scratch written by /build-step and /review-deep. Carries absolute
+# operator paths and worktree-local findings; must never be published from this
+# public repo. The durable record is the plan doc, the commits, and the issues.
+.build-step/
+.review-deep/

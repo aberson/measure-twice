@@ -1,6 +1,6 @@
 # Provider-Neutral Coding Agent Benchmark
 
-**Status:** Step 26 DONE - Linux process and isolation substrate shipped and merged (2026-08-24)
+**Status:** Steps 25-26 DONE - strict agent inputs (2026-08-22) and the Linux process and isolation substrate (2026-08-24) are shipped and merged. Step 27 is next.
 
 **Roadmap allocation:** Steps 25-55. Canonical `plan.md` owns Steps 1-17 and the approved
 operations plan owns Steps 18-24.
@@ -1416,7 +1416,7 @@ report paths do not require inference.
   - Existing hostile fixtures still cannot mutate an oracle, write outside the sandbox, reach
     TCP/UDP/DNS, inspect parent credential state, or leave a detached child. No provider credentials
     or live calls are used.
-- **Depends on:** 25
+- **Depends on:** 25 (shipped)
 
 <!-- autofix-applied: 2026-08-21 -->
 ### Step 27: Sandboxed evaluator and complete validation
@@ -2104,3 +2104,98 @@ Applicable Step-26+ code steps also pass the WSL marker command defined in §6.1
 The feature is one-shot and operator-invoked; no background/always-on soak is required. The long
 wait steps exist because model sweeps consume real wall-clock time, not because the system runs
 autonomously after the command returns.
+
+---
+
+## Shipped: Steps 25-26 - strict agent inputs and the Linux isolation substrate
+
+**Both steps merged to `master`. Issues #27-#28 closed.** The instrument can now be *defined* and a
+process can be *contained*; nothing yet makes an inference call. Steps 27-29 build the sandboxed
+evaluator and the provider adapters on top of this substrate.
+
+### What was built
+
+**Step 25 - strict agent inputs and structural validation** (`3be9f3f`, issue #27)
+
+- Fail-loud loaders for `ModelSpec`/`ModelRegistry`, `AnalysisPlan`, `ExecutionProfile`,
+  `AgentSuite`, and `AgentTask`. Unknown keys, missing keys, wrong types, duplicate or unsafe
+  identifiers, paths escaping the bundle, symlinks and NTFS junctions, missing assets, arbitrary
+  task commands, and unsupported `schema_version` values are all rejected **at load**, never at use.
+- Recursive instrument hashing over task-asset bytes, with the selected model profile hashed
+  separately. **Model profiles stay outside suite identity**, so admitting a new provider cannot
+  silently redefine what the instrument measures. Canonical instrument, selected-profile, and
+  execution-profile hash goldens are frozen, as are run-class, evaluator-layout, allowed/protected
+  glob, and `policy: "none"` analysis-plan goldens.
+- `mt agent validate <suite-dir> [--structure-only]` - the structure-only path is cross-platform and
+  never executes suite code.
+- The candidate registry (`codex-luna`, `claude-sonnet`), execution profile `agent-execution-v1`,
+  analysis plan `agent-smoke-v1`, and the one-task `suites/agents/smoke` bundle declaring
+  `run_class: "smoke"` with a no-ranking preregistration that cites the analysis-plan hash.
+- A three-profile offline fixture proving two Claude profiles dispatch by provider without
+  consulting `CLAUDE_ALIASES`.
+
+**Step 26 - Linux process and isolation substrate** (`cf8ac78` and follow-ups, issue #28)
+
+- **One kernel-object-identity invariant.** Every caller-supplied filesystem source is opened once
+  through `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)` and thereafter
+  referred to only by that owned descriptor (`LinuxPathCapability`). A later rename, unlink, or
+  symlink replacement therefore cannot redirect a sandbox mount, a subprocess cwd, a capture
+  enumeration, a live resource scan, or terminal tree validation. Type and identity come from
+  `fstat`/`fstatfs` of the held FD, never from a reconstructed pathname; `readdir` output is treated
+  as an untrusted component name whose no-follow `openat2` is its acquisition boundary.
+- **Contained execution.** `run_process` passes every inherited descriptor via
+  `Popen(pass_fds=..., close_fds=True)`, enters cwd through `/proc/self/fd/<cwd-fd>`, and executes
+  pinned executables through `/proc/self/fd/<exe-fd>`. Targets launch under
+  `systemd-run --user --scope --collect --slice=app.slice` into a freshly named transient scope; the
+  controller environment needed to reach `/run/user/<uid>/bus` never enters the target's separately
+  allowlisted environment. Bubblewrap mounts sources by `--bind-fd`/`--ro-bind-fd`.
+- **A two-layer, self-labelling resource contract**, replacing polling-as-containment. Memory, pids,
+  and tmpfs byte/inode ceilings are *hard host guards*, active and read back before the target is
+  released, and record `hard-guard` provenance. Cumulative CPU and logical-tree thresholds remain
+  *sampled scoring rules* that may overshoot between observations, and record `sampled-threshold`
+  provenance. `RLIMIT_FSIZE`/`RLIMIT_NOFILE` stay per-process backstops and are never reported as
+  aggregate enforcement. Guard-health failure is an execution error, never a resource result.
+- **Per-repetition private tmpfs** (`EvaluatorScratch`) with `size` and `nr_inodes` limits active
+  before the applied tree is copied. The same retained root FD survives outer-namespace teardown and
+  is what Step 27 will snapshot.
+- **No fallback.** There is no polling-only and no path-bind degradation path. Missing or
+  incompatible cgroup delegation, bounded-tmpfs behavior, or Bubblewrap raises
+  `IsolationUnavailableError` and *fails* the WSL gate rather than skipping it. Bubblewrap 0.11.2
+  from upstream is the pinned known-good build; Ubuntu 24.04's stock 0.9.0 is unsupported, and
+  version text is evidence only - the harness runs live `--bind-fd`/`--ro-bind-fd` behavioral probes.
+- **Canaries, not assertions about intent.** Real Bubblewrap probes prove workspace-only writes,
+  absent suite/oracle/run/operator-home mounts, read-only oracle and runtime mounts, an empty child
+  network, and no host, credential, or parent-`/proc` disclosure. Barrier-controlled, sleep-free
+  rename-to-symlink regressions mutate each caller-supplied source after acquisition but before
+  consumption and assert that the originally opened inode is still the one consumed.
+- `scripts/test-agent-bench-wsl.ps1` stages the tree onto WSL ext4 and runs the `linux_isolation`
+  marker for real. Its JUnit gate forbids a *selected* case from skipping, so the containment
+  evidence cannot quietly evaporate.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `measure_twice/agent_bench/models.py`, `analysis.py`, `suite.py` | Strict loaders, safe identifiers, recursive instrument/profile hashing |
+| `measure_twice/agent_bench/_wire.py` | Shared wire codec with duplicate-JSON-key detection |
+| `measure_twice/agent_bench/cli.py`, `measure_twice/cli.py` | `mt agent validate` wired into the production CLI |
+| `measure_twice/agent_bench/_linux_capabilities.py` | `openat2` FD-capability acquisition, FD-relative traversal, exclusive copy |
+| `measure_twice/agent_bench/isolation.py` | Bubblewrap launch, preflight behavioral probes, evaluator tmpfs scratch |
+| `measure_twice/agent_bench/process.py` | Contained `run_process`, transient cgroup scope, two-layer resource contract, tree-scan monitoring |
+| `measure_twice/agent_bench/_win32_contained.py` | Windows-side contained handles for the cross-platform structural path |
+| `profiles/`, `analysis-plans/`, `suites/agents/smoke/`, `docs/agent-benchmark/` | Candidate registry, execution profile, analysis plan, smoke bundle, preregistration |
+| `scripts/test-agent-bench-wsl.ps1` | The real Linux containment gate, invoked from Windows |
+| `.gitattributes` | `suites/agents/** -text` so task-asset bytes stay exact |
+| `.gitignore` | Generated agent data roots ignored; suites, profiles, and tracked evidence stay visible |
+| `tests/agent_bench/` | Units, offline fixtures, hostile probes, and the Linux containment canaries |
+
+### Fresh context notes for Step 27
+
+| Issue | Detail |
+|---|---|
+| A green Windows run is **not** containment evidence | `uv run pytest` on Windows reports the containment cases as explicit skips. Only `scripts/test-agent-bench-wsl.ps1` (or `-m linux_isolation` from a WSL-ext4 checkout) actually exercises them. Both roots must be green before a step is DONE. |
+| Task-asset bytes are load-bearing | `suites/agents/** -text` in `.gitattributes` keeps git from normalizing line endings. A CRLF conversion there silently moves the instrument hash. |
+| cgroup CPU accounting covers the whole scope | The namespace supervisor and Bubblewrap are billed to the same scope as the target, so three interpreter startups share one CPU budget. A ceiling meant for the target alone will fire on a contended host. |
+| One test-flake shape produced five separate flakes here | Every one was a test asserting on a quantity it does not control. Two invariants now hold the line: a canary asserting that a *resource ceiling* stopped a run must never let its wall clock fire first (the ceiling depends on a kernel event the test cannot schedule); and `_ceilings()` defaults are deliberately unhittable by accident, so only a test that *means* to trip a ceiling passes an explicit low value. Preserve both when adding canaries. |
+| Step 27 must consume the retained FD | `EvaluatorScratch` keeps the tmpfs root FD alive specifically so the authoritative result-tree snapshot uses the same kernel object. Re-deriving it from a pathname reintroduces the class this step exists to remove. |
+| Four non-blocking follow-ups are filed | Issue #58 records them: the pre-release handshake sentinel `MT26R` still hand-maintained in two places (the supervisor source template writes it literally and the parent compares it literally, though the substitution mechanism that dedupes the status wire format already exists), a teardown half of the clock test that is not separately anchored, one reappearance test with a low-probability red-when-healthy race, and a plan edit made outside Step 26's `Files:` list. None blocks Step 27. |
