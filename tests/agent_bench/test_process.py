@@ -759,6 +759,24 @@ def test_supervisor_status_wire_shape_has_one_owner_and_survives_large_ceilings(
     assert unpacked[5] == oversized
 
 
+def test_collected_cgroup_error_recognises_both_retired_scope_shapes() -> None:
+    """A retired cgroup v2 scope fails in two shapes, and only those two may be accepted.
+
+    ``open()`` raises ENOENT when the control file is already unlinked; when the open wins the
+    race the following ``read()`` raises ENODEV on the now-removed cgroup.  Accepting only the
+    first turned a healthy-but-slow systemd teardown into an evaluator-infrastructure failure.
+    Accepting any ``OSError`` would be worse -- it would launder a permission or I/O fault into
+    "the cgroup is gone", so the negative cases below are the load-bearing half of this test.
+    """
+
+    assert process_module._is_collected_cgroup_error(FileNotFoundError(errno.ENOENT, "gone"))
+    assert process_module._is_collected_cgroup_error(OSError(errno.ENODEV, "no such device"))
+    assert not process_module._is_collected_cgroup_error(OSError(errno.EACCES, "denied"))
+    assert not process_module._is_collected_cgroup_error(OSError(errno.EIO, "io error"))
+    assert not process_module._is_collected_cgroup_error(ValueError("malformed"))
+    assert not process_module._is_collected_cgroup_error(None)
+
+
 def _request(
     tmp_path: Path,
     code: str,

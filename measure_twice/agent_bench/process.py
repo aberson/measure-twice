@@ -2190,6 +2190,8 @@ class _LinuxResourceGuardState:
     def control_missing_after_collection(
         self,
         error: ProcessExecutionError,
+        *,
+        wait_for_owner: bool = False,
     ) -> bool:
         """Accept control ENOENT only after proving this exact owner and scope are gone.
 
@@ -2203,15 +2205,25 @@ class _LinuxResourceGuardState:
         if not _is_collected_cgroup_error(cause):
             return False
         # systemd retires the controls and reaps the transient scope's owner independently, and
-        # either order is legal.  Waiting the same bounded interval the collection proof already
-        # uses keeps the plan's "the exact namespace-supervisor (pid, starttime) is gone"
-        # requirement intact while removing a false infrastructure failure on a healthy but slow
-        # teardown; a genuinely surviving owner still fails closed when the interval expires.
-        owner_deadline = time.monotonic() + _REAP_TIMEOUT_S
-        while not self.outer_owner_exited():
-            if time.monotonic() >= owner_deadline:
-                return False
-            time.sleep(_POLL_INTERVAL_S)
+        # either order is legal, so a cleanup caller waits the same bounded interval the collection
+        # proof already uses.  That keeps the plan's "the exact namespace-supervisor (pid,
+        # starttime) is gone" requirement intact while removing a false infrastructure failure on a
+        # healthy but slow teardown; a genuinely surviving owner still fails closed at expiry.
+        #
+        # `wait_for_owner` defaults to FALSE because two of this method's callers are on the
+        # MONITOR thread (_guard_observations) and hold `guard_lock`.  Blocking there would make
+        # cleanup's detach_resource_guard() wait on that lock for longer than the tracker join
+        # budget, turning a slow teardown into "Linux descendant monitor did not stop" -- the same
+        # class of false failure this wait exists to remove.  Only the cleanup-thread callers,
+        # which hold no lock, opt in.
+        if wait_for_owner:
+            owner_deadline = time.monotonic() + _REAP_TIMEOUT_S
+            while not self.outer_owner_exited():
+                if time.monotonic() >= owner_deadline:
+                    return False
+                time.sleep(_POLL_INTERVAL_S)
+        elif not self.outer_owner_exited():
+            return False
         # systemd can tear down control files just before it unlinks the cgroup directory.  The
         # fresh identity remains authoritative while we boundedly wait for that same object to
         # disappear; replacement or a surviving path is still a fail-closed infrastructure error.
@@ -2494,7 +2506,7 @@ def _cleanup_failed_linux_start(
                 isinstance(exc, ProcessExecutionError)
                 and (
                     guard.control_missing_during_unreleased_startup(exc)
-                    or guard.control_missing_after_collection(exc)
+                    or guard.control_missing_after_collection(exc, wait_for_owner=True)
                 )
             ):
                 errors.append(exc)
@@ -2515,7 +2527,7 @@ def _cleanup_failed_linux_start(
                 isinstance(exc, ProcessExecutionError)
                 and (
                     guard.control_missing_during_unreleased_startup(exc)
-                    or guard.control_missing_after_collection(exc)
+                    or guard.control_missing_after_collection(exc, wait_for_owner=True)
                 )
             ):
                 errors.append(exc)
@@ -3089,7 +3101,9 @@ def _cleanup_process(runtime: _RunningProcess, *, abnormal: bool) -> None:
             except BaseException as exc:
                 if not (
                     isinstance(exc, ProcessExecutionError)
-                    and runtime.resource_guard.control_missing_after_collection(exc)
+                    and runtime.resource_guard.control_missing_after_collection(
+                        exc, wait_for_owner=True
+                    )
                 ):
                     errors.append(exc)
         try:
@@ -3154,7 +3168,7 @@ def _cleanup_process(runtime: _RunningProcess, *, abnormal: bool) -> None:
         except BaseException as exc:
             collected = isinstance(
                 exc, ProcessExecutionError
-            ) and guard.control_missing_after_collection(exc)
+            ) and guard.control_missing_after_collection(exc, wait_for_owner=True)
             if collected:
                 # This exact branch proves the namespace-init owner and named scope disappeared.
                 # Collection implies cgroup emptiness, so terminal retained-FD validation is safe.
