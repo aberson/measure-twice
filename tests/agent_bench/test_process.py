@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import _thread
 import array
+import errno
 import json
 import os
 import signal
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
@@ -384,6 +386,334 @@ def test_linux_evaluator_post_handshake_failure_keeps_verified_guard_for_common_
         os.close(cgroup_fd)
         os.close(scratch_fd)
         os.close(kill_fd)
+    _assert_linux_fd_baseline(baseline)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux failed-start owner reap invariant")
+@pytest.mark.parametrize("reap_outcome", ["timeout", "oserror", "clean"])
+def test_linux_failed_start_direct_owner_reap_failure_surfaces_as_execution_error(
+    monkeypatch: pytest.MonkeyPatch,
+    reap_outcome: str,
+) -> None:
+    """A systemd-run owner that survives failed-start termination is an execution error."""
+
+    baseline = _linux_fd_snapshot()
+
+    class _SurvivingDirectOwner:
+        def __init__(self) -> None:
+            self.pid = 0x7FFFFFFE
+            self.stdin = os.fdopen(os.open(os.devnull, os.O_WRONLY | os.O_CLOEXEC), "wb")
+            self.stdout = os.fdopen(os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC), "rb")
+            self.stderr = os.fdopen(os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC), "rb")
+
+        def poll(self) -> int | None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            if reap_outcome == "timeout":
+                raise subprocess.TimeoutExpired("systemd-run", timeout)
+            if reap_outcome == "oserror":
+                raise OSError(errno.ECHILD, "no child processes")
+            return 0
+
+    owner = _SurvivingDirectOwner()
+    kill_calls: list[tuple[object, object, object]] = []
+    monkeypatch.setattr(
+        process_module,
+        "_kill_tree",
+        lambda *args: kill_calls.append(args[:3]),
+    )
+    try:
+        error = process_module._cleanup_failed_linux_start(
+            cast("subprocess.Popen[bytes]", owner),
+            None,
+            "",
+        )
+        # The direct owner is signalled before any bounded wait, on every arm.
+        assert kill_calls == [(owner, owner.pid, None)]
+        if reap_outcome == "timeout":
+            assert isinstance(error, ProcessExecutionError)
+            assert "direct child survived failed-start termination" in str(error)
+        elif reap_outcome == "oserror":
+            assert isinstance(error, OSError)
+            assert error.errno == errno.ECHILD
+        else:
+            assert error is None
+        # A failed reap must still release every inherited pipe.
+        assert owner.stdin.closed and owner.stdout.closed and owner.stderr.closed
+    finally:
+        for stream in (owner.stdin, owner.stdout, owner.stderr):
+            if not stream.closed:
+                stream.close()
+    _assert_linux_fd_baseline(baseline)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux no-handshake absence-interval invariant")
+def test_linux_failed_start_without_handshake_proves_a_full_absence_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No descriptor crossed the boundary, so absence must hold for a whole bounded interval."""
+
+    stable_interval = 2.0
+    monkeypatch.setattr(process_module, "_REAP_TIMEOUT_S", stable_interval)
+    monkeypatch.setattr(process_module, "_POLL_INTERVAL_S", 0.005)
+    scope_name = f"measure-twice-{uuid.uuid4().hex}"
+    relative = process_module._expected_scope_relative_path(scope_name)
+    scope_path = Path(process_module._scope_collection_path(relative))
+    assert not scope_path.exists()
+    baseline = _linux_fd_snapshot()
+    proc = subprocess.Popen(
+        ("/bin/sleep", "30"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    started = time.monotonic()
+    try:
+        error = process_module._cleanup_failed_linux_start(proc, None, relative)
+    finally:
+        if proc.poll() is None:  # pragma: no cover - only on a production regression.
+            proc.kill()
+            proc.wait(timeout=5)
+    elapsed = time.monotonic() - started
+
+    assert error is None
+    # The direct systemd-run owner is reaped before absence can be claimed at all.
+    assert proc.poll() is not None
+    # A first ENOENT is not proof: the whole bounded interval must elapse.
+    assert elapsed >= stable_interval
+    assert not scope_path.exists()
+    _assert_linux_fd_baseline(baseline)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux no-handshake absence-interval invariant")
+def test_linux_scope_absence_interval_restarts_when_the_path_reappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An asynchronously reappearing scope restarts the bounded absence interval."""
+
+    stable_interval = 1.0
+    monkeypatch.setattr(process_module, "_REAP_TIMEOUT_S", stable_interval)
+    monkeypatch.setattr(process_module, "_POLL_INTERVAL_S", 0.005)
+    scope = tmp_path / "phantom.scope"
+    scope.mkdir()
+    returned: list[float] = []
+    errors: list[BaseException] = []
+
+    def wait_for_collection() -> None:
+        try:
+            process_module._wait_for_scope_collection(str(scope), None)
+            returned.append(time.monotonic())
+        except BaseException as exc:  # preserve the production exception from the worker.
+            errors.append(exc)
+
+    worker = threading.Thread(target=wait_for_collection, daemon=True)
+    worker.start()
+    time.sleep(0.05)
+    removed_at = time.monotonic()
+    scope.rmdir()
+    worker.join(timeout=5 * stable_interval + 5)
+
+    assert not worker.is_alive()
+    assert not errors, errors
+    assert len(returned) == 1
+    # The interval restarts from the LAST absence, not from the call, and not from a first ENOENT.
+    assert returned[0] - removed_at >= stable_interval
+
+
+def _packed_supervisor_status(
+    *,
+    wait_status: int = 0,
+    exec_error: int = 0,
+    cpu_microseconds: int = 4_321_000,
+    hard_limit: int = 0,
+    hard_observed: int = 0,
+    setup_error: int = 0,
+) -> bytes:
+    return process_module._SUPERVISOR_STATUS.pack(
+        process_module._SUPERVISOR_MAGIC,
+        wait_status,
+        exec_error,
+        cpu_microseconds,
+        hard_limit,
+        hard_observed,
+        setup_error,
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux fast scope-collection invariant")
+@pytest.mark.parametrize(
+    "case",
+    ["collected", "owner-alive", "path-replaced", "malformed-control", "missing-supervisor-record"],
+)
+def test_linux_fast_scope_collection_is_terminal_only_with_proved_owner_exit_and_exact_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    """systemd's --collect branch is terminal only once every precondition is proved."""
+
+    monkeypatch.setattr(process_module, "_REAP_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(process_module, "_POLL_INTERVAL_S", 0.005)
+    baseline = _linux_fd_snapshot()
+    scope = tmp_path / "measure-twice-fake.scope"
+    scope.mkdir()
+    (scope / "cgroup.kill").write_bytes(b"")
+    kill_fd = os.open(scope / "cgroup.kill", os.O_WRONLY | os.O_CLOEXEC)
+    capability = LinuxPathCapability.acquire_absolute(scope, expected="directory")
+
+    live_owner: subprocess.Popen[bytes] | None = None
+    if case == "malformed-control":
+        (scope / "cgroup.events").write_text("populated\n", encoding="utf-8")
+    else:
+        (scope / "cgroup.kill").unlink()
+        scope.rmdir()
+        if case == "path-replaced":
+            scope.mkdir()
+
+    if case == "owner-alive":
+        live_owner = subprocess.Popen(
+            ("/bin/sleep", "30"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        owner_identity = (
+            live_owner.pid,
+            cast("int", process_module._pid_starttime(live_owner.pid)),
+        )
+    else:
+        reaped = subprocess.Popen(
+            ("/bin/true",),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        reaped.wait(timeout=5)
+        owner_identity = (reaped.pid, 1)
+
+    guard = process_module._LinuxResourceGuardState(
+        capability,
+        kill_fd,
+        LinuxResourceGuard(1, 1, 100),
+        str(scope),
+        capability.identity,
+        {},
+        {},
+    )
+    guard.outer_owner_identity = owner_identity
+    guard.trusted_for_cleanup = True
+    guard.validated_for_release = True
+
+    status_read_fd, status_write_fd = os.pipe()
+    if case != "missing-supervisor-record":
+        os.write(status_write_fd, _packed_supervisor_status(hard_limit=1, hard_observed=987_654))
+    os.close(status_write_fd)
+    proc = subprocess.Popen(
+        ("/bin/true",),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    proc.wait(timeout=5)
+    runtime = process_module._RunningProcess(
+        proc=proc,
+        started=time.monotonic(),
+        process_group_id=None,
+        status_read_fd=status_read_fd,
+    )
+    runtime.resource_guard = guard
+
+    expected_message = {
+        "owner-alive": "could not read Linux resource guard cgroup.events",
+        "path-replaced": "scope path was replaced before collection",
+        "malformed-control": "cgroup.events is malformed",
+        "missing-supervisor-record": "invalid status record",
+    }.get(case)
+    try:
+        if expected_message is None:
+            process_module._cleanup_process(runtime, abnormal=False)
+            assert guard.collected is True
+            status = runtime.target_status
+            assert status is not None
+            assert status.cpu_microseconds == 4_321_000
+            assert (status.hard_limit, status.hard_observed) == (1, 987_654)
+        else:
+            with pytest.raises(ProcessExecutionError, match=expected_message):
+                process_module._cleanup_process(runtime, abnormal=False)
+            if case == "missing-supervisor-record":
+                # Collection still completed; the record is a separate fail-closed gate.
+                assert guard.collected is True
+            elif case != "malformed-control":
+                assert guard.collected is False
+        assert runtime.resource_guard is None
+    finally:
+        if live_owner is not None:
+            live_owner.kill()
+            live_owner.wait(timeout=5)
+        guard.close()
+        process_module._close_fd(runtime.status_read_fd)
+    _assert_linux_fd_baseline(baseline)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux terminal cgroup-emptiness invariant")
+def test_linux_normal_exit_still_kills_a_populated_scope_and_proves_it_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A descendant outliving a cleanly-exited target is caught by the cgroup, not by /proc."""
+
+    monkeypatch.setattr(process_module, "_REAP_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(process_module, "_POLL_INTERVAL_S", 0.005)
+    baseline = _linux_fd_snapshot()
+    scope = tmp_path / "populated.scope"
+    scope.mkdir()
+    (scope / "cgroup.events").write_text("populated 1\n", encoding="utf-8")
+    (scope / "cgroup.kill").write_bytes(b"")
+    kill_fd = os.open(scope / "cgroup.kill", os.O_WRONLY | os.O_CLOEXEC)
+    capability = LinuxPathCapability.acquire_absolute(scope, expected="directory")
+    guard = process_module._LinuxResourceGuardState(
+        capability,
+        kill_fd,
+        LinuxResourceGuard(1, 1, 100),
+        str(scope),
+        capability.identity,
+        {},
+        {},
+    )
+    guard.outer_owner_identity = (os.getpid(), 1)
+    guard.trusted_for_cleanup = True
+    guard.validated_for_release = True
+
+    status_read_fd, status_write_fd = os.pipe()
+    os.write(status_write_fd, _packed_supervisor_status())
+    os.close(status_write_fd)
+    proc = subprocess.Popen(
+        ("/bin/true",),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    proc.wait(timeout=5)
+    runtime = process_module._RunningProcess(
+        proc=proc,
+        started=time.monotonic(),
+        process_group_id=None,
+        status_read_fd=status_read_fd,
+    )
+    runtime.resource_guard = guard
+    assert runtime.tracker is None  # so `tracked` stays empty and only the late block can kill.
+    try:
+        # abnormal=False and an empty /proc snapshot: the cgroup is still tested and killed.
+        with pytest.raises(ProcessExecutionError, match="scope remained populated"):
+            process_module._cleanup_process(runtime, abnormal=False)
+        assert (scope / "cgroup.kill").read_bytes() == b"1"
+        assert runtime.resource_guard is None
+    finally:
+        guard.close()
+        process_module._close_fd(runtime.status_read_fd)
     _assert_linux_fd_baseline(baseline)
 
 

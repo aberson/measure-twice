@@ -50,9 +50,14 @@ from measure_twice.agent_bench.isolation import (
     resolve_bubblewrap,
     secret_environment_values,
 )
-from measure_twice.agent_bench.models import Ceilings, load_execution_profile
+from measure_twice.agent_bench.models import (
+    EVALUATOR_DIRECTORY_ALLOWANCE,
+    Ceilings,
+    load_execution_profile,
+)
 from measure_twice.agent_bench.process import (
     EVALUATOR_WORKSPACE_FD_TOKEN,
+    EvaluatorScratch,
     ModelTreeViolationError,
     ProcessExecutionError,
     ProcessRequest,
@@ -94,7 +99,9 @@ def _ceilings(
         evaluator_file_bytes=file_bytes,
         evaluator_cpu_bandwidth_percent=cpu_bandwidth_percent,
         evaluator_tmpfs_bytes=(bounded_tmpfs_bytes if tmpfs_bytes is None else tmpfs_bytes),
-        evaluator_tmpfs_inodes=(files + 10_001 if tmpfs_inodes is None else tmpfs_inodes),
+        evaluator_tmpfs_inodes=(
+            files + EVALUATOR_DIRECTORY_ALLOWANCE if tmpfs_inodes is None else tmpfs_inodes
+        ),
     )
 
 
@@ -1376,6 +1383,46 @@ def test_linux_timeout_leaves_no_detached_child(tmp_path: Path) -> None:
 
 
 @pytest.mark.linux_isolation
+def test_linux_evaluator_kills_a_descendant_that_outlives_the_nominal_target(
+    tmp_path: Path,
+) -> None:
+    """A cleanly-exiting target may not leave a reparented descendant alive in its scope."""
+
+    workspace = tmp_path / "workspace-outliving"
+    oracle = tmp_path / "oracle-outliving"
+    runtime = tmp_path / "runtime-outliving"
+    workspace.mkdir()
+    oracle.mkdir()
+    _copy_fixture(runtime, "outliving_child.py")
+    with _real_preflight(tmp_path) as preflight:
+        with build_evaluator_sandbox(
+            preflight,
+            workspace=workspace,
+            oracle=oracle,
+            runtime=runtime,
+            command=(
+                "/usr/bin/python3",
+                "-I",
+                "/opt/measure-twice/runtime/outliving_child.py",
+                "/workspace/escaped.txt",
+                "/workspace/ready.txt",
+                "/workspace/release.txt",
+            ),
+            ceilings=_ceilings(files=16),
+        ) as launch:
+            result = _run_launch(launch, timeout=10)
+            # The nominal target exits cleanly; containment may not depend on a timeout kill.
+            assert result.termination == "exited", result.stderr
+            assert result.exit_code == 0
+            assert result.resource_limit is None
+            retained = Path(f"/proc/self/fd/{launch.terminal_tree_capability().fd}")
+            # The descendant was genuinely alive when its parent exited.
+            assert (retained / "ready.txt").is_file()
+            (retained / "release.txt").write_text("release", encoding="utf-8")
+            _assert_path_stays_absent(retained / "escaped.txt")
+
+
+@pytest.mark.linux_isolation
 def test_linux_evaluator_inherits_rlimit_nofile_through_sandbox_launch(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace-nofile"
     oracle = tmp_path / "oracle-nofile"
@@ -1825,3 +1872,217 @@ def test_linux_evaluator_terminal_file_ceilings(
             assert result.resource_limit_observed == expected_observed
             with pytest.raises(ResourceCeilingError, match=message):
                 enforce_evaluator_tree_ceiling(launch)
+
+
+@pytest.mark.linux_isolation
+def test_linux_evaluator_parallel_large_writers_hit_the_physical_tmpfs_byte_envelope(
+    tmp_path: Path,
+) -> None:
+    """Concurrent writers exhaust the private tmpfs itself, not the backing ext4 volume.
+
+    The physical envelope is the only thing that can stop four unbounded writers, so a full
+    ``f_bavail == 0`` readback through the retained parent FD is what authorizes ``hard-guard``
+    provenance carrying the tmpfs capacity instead of the configured logical byte ceiling.
+    """
+
+    if sys.platform != "linux":
+        pytest.skip("private tmpfs envelope canaries require Linux")
+    workspace = tmp_path / "workspace-parallel-writers"
+    oracle = tmp_path / "oracle-parallel-writers"
+    runtime = tmp_path / "runtime-parallel-writers"
+    workspace.mkdir()
+    oracle.mkdir()
+    _copy_fixture(runtime, "resource_probe.py")
+    writers = 4
+    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    byte_limit = 4 * 1024 * 1024
+    ceilings = _ceilings(
+        cpu=10,
+        files=writers,
+        file_bytes=byte_limit,
+        tmpfs_bytes=byte_limit + writers * page_size,
+    )
+    host_tmp_identity = _host_private_mountpoint_identity()
+    with _real_preflight(tmp_path) as preflight:
+        with build_evaluator_sandbox(
+            preflight,
+            workspace=workspace,
+            oracle=oracle,
+            runtime=runtime,
+            command=(
+                "/usr/bin/python3",
+                "-I",
+                "/opt/measure-twice/runtime/resource_probe.py",
+                "parallel-writers",
+                str(writers),
+                str(256 * 1024),
+            ),
+            ceilings=ceilings,
+        ) as launch:
+            result = _run_launch(launch, timeout=20)
+            terminal_root = launch.terminal_tree_capability()
+            values = os.fstatvfs(terminal_root.fd)
+            capacity = int(values.f_blocks) * int(values.f_frsize)
+            # The retained FD -- not a supervisor claim -- is what proves exhaustion.
+            assert values.f_bavail == 0
+            assert capacity == ceilings.evaluator_tmpfs_bytes
+            assert result.termination == "resource-limit"
+            assert result.exit_code is None
+            assert result.resource_limit == "file-bytes"
+            assert result.resource_limit_provenance == "hard-guard"
+            # The recorded ceiling is the PHYSICAL tmpfs bound, never the logical byte ceiling.
+            assert result.resource_limit_value == capacity
+            assert result.resource_limit_value > ceilings.evaluator_file_bytes
+            assert result.resource_limit_observed == capacity
+            with pytest.raises(ResourceCeilingError, match="byte ceiling"):
+                enforce_evaluator_tree_ceiling(launch)
+    assert _host_private_mountpoint_identity() == host_tmp_identity
+
+
+@pytest.mark.linux_isolation
+def test_linux_evaluator_many_small_files_hit_the_physical_tmpfs_inode_envelope(
+    tmp_path: Path,
+) -> None:
+    """A logically legal tree can still exhaust the tmpfs inode budget.
+
+    ``EVALUATOR_DIRECTORY_ALLOWANCE`` is exactly the whole-tree directory bound plus the tmpfs
+    root inode, so a maximally structured legal tree consumes the last inode without tripping any
+    logical threshold or structural policy.  Only the physical inode envelope can stop it.
+    """
+
+    workspace = tmp_path / "workspace-inodes"
+    oracle = tmp_path / "oracle-inodes"
+    runtime = tmp_path / "runtime-inodes"
+    workspace.mkdir()
+    oracle.mkdir()
+    _copy_fixture(runtime, "resource_probe.py")
+    files = 20
+    max_dirs = EVALUATOR_DIRECTORY_ALLOWANCE - 1
+    ceilings = _ceilings(cpu=10, files=files, file_bytes=64 * 1024)
+    host_tmp_identity = _host_private_mountpoint_identity()
+    with _real_preflight(tmp_path) as preflight:
+        with build_evaluator_sandbox(
+            preflight,
+            workspace=workspace,
+            oracle=oracle,
+            runtime=runtime,
+            command=(
+                "/usr/bin/python3",
+                "-I",
+                "/opt/measure-twice/runtime/resource_probe.py",
+                "inodes",
+                str(files),
+                "1",
+                str(max_dirs),
+            ),
+            ceilings=ceilings,
+        ) as launch:
+            result = _run_launch(launch, timeout=60)
+            terminal_root = launch.terminal_tree_capability()
+            values = os.fstatvfs(terminal_root.fd)
+            assert values.f_ffree == 0
+            assert int(values.f_files) == ceilings.evaluator_tmpfs_inodes
+            assert result.termination == "resource-limit"
+            assert result.resource_limit == "file-count"
+            assert result.resource_limit_provenance == "hard-guard"
+            assert result.resource_limit_value == int(values.f_files)
+            assert result.resource_limit_value > ceilings.evaluator_files
+            assert result.resource_limit_observed == int(values.f_files)
+            # The same retained identity Step 27 will snapshot, and a legal tree by every logical
+            # measure: this hard guard is not a relabelled logical crossing.
+            usage = walk_tree(terminal_root)
+            assert usage.file_count == files
+            assert usage.size_bytes < ceilings.evaluator_file_bytes
+            assert usage.directory_count <= max_dirs
+            assert int(values.f_bavail) > 0
+    assert _host_private_mountpoint_identity() == host_tmp_identity
+
+
+@pytest.mark.linux_isolation
+def test_linux_terminal_validation_upgrades_a_sampled_threshold_with_the_physical_tmpfs_limit(
+    tmp_path: Path,
+) -> None:
+    """Only a retained-FD exhaustion proof may overwrite a latched sampled threshold.
+
+    ``_check_resources`` stops probing the moment ``limit_reached`` latches, so terminal
+    validation is the sole parent-side path that can turn an already-recorded sampled crossing
+    into ``hard-guard`` provenance carrying the physical tmpfs bound.
+    """
+
+    if sys.platform != "linux":
+        pytest.skip("private tmpfs envelope canaries require Linux")
+    workspace = tmp_path / "workspace-terminal-upgrade"
+    oracle = tmp_path / "oracle-terminal-upgrade"
+    runtime = tmp_path / "runtime-terminal-upgrade"
+    seed = tmp_path / "seed-terminal-upgrade"
+    workspace.mkdir()
+    oracle.mkdir()
+    seed.mkdir()
+    _copy_fixture(runtime, "resource_probe.py")
+    writers = 2
+    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    byte_limit = 1024 * 1024
+    ceilings = _ceilings(
+        cpu=10,
+        files=writers,
+        file_bytes=byte_limit,
+        tmpfs_bytes=byte_limit + writers * page_size,
+    )
+    with _real_preflight(tmp_path) as preflight:
+        with build_evaluator_sandbox(
+            preflight,
+            workspace=workspace,
+            oracle=oracle,
+            runtime=runtime,
+            command=(
+                "/usr/bin/python3",
+                "-I",
+                "/opt/measure-twice/runtime/resource_probe.py",
+                "parallel-writers",
+                str(writers),
+                str(64 * 1024),
+            ),
+            ceilings=ceilings,
+        ) as launch:
+            _run_launch(launch, timeout=20)
+            terminal_root = launch.terminal_tree_capability()
+            values = os.fstatvfs(terminal_root.fd)
+            assert values.f_bavail == 0, "canary did not physically exhaust the private tmpfs"
+            capacity = int(values.f_blocks) * int(values.f_frsize)
+            scratch = EvaluatorScratch(
+                source=LinuxPathCapability.acquire_absolute(seed, expected="directory"),
+                file_limit=ceilings.evaluator_files,
+                byte_limit=ceilings.evaluator_file_bytes,
+                tmpfs_bytes=ceilings.evaluator_tmpfs_bytes,
+                tmpfs_inodes=ceilings.evaluator_tmpfs_inodes,
+            )
+            try:
+                scratch.record_backing_bounds(
+                    bytes_capacity=capacity,
+                    inode_capacity=int(values.f_files),
+                )
+                tracker = process_module._LinuxDescendantTracker(
+                    root_pid=os.getpid(),
+                    root_starttime=0,
+                    resource_limits=ProcessResourceLimits(
+                        tree_files=ceilings.evaluator_files,
+                        tree_bytes=ceilings.evaluator_file_bytes,
+                    ),
+                    tree_capability=terminal_root,
+                    evaluator_scratch=scratch,
+                )
+                # The garbage state this branch must overwrite: a latched sampled threshold that
+                # reports the CONFIGURED ceiling and would survive if the retained-FD exhaustion
+                # proof were dropped or downgraded to replace=False.
+                tracker._set_resource_limit("file-count", observed=7)
+                assert tracker.resource_limit_provenance == "sampled-threshold"
+                assert tracker.resource_limit_value == ceilings.evaluator_files
+
+                tracker.validate_terminal_tree()
+
+                assert tracker.resource_limit == "file-bytes"
+                assert tracker.resource_limit_provenance == "hard-guard"
+                assert tracker.resource_limit_value == capacity
+                assert tracker.resource_limit_observed == capacity
+            finally:
+                scratch.close()
