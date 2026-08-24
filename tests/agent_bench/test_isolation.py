@@ -50,6 +50,7 @@ from measure_twice.agent_bench.isolation import (
 from measure_twice.agent_bench.models import Ceilings, load_execution_profile
 from measure_twice.agent_bench.process import (
     EVALUATOR_WORKSPACE_FD_TOKEN,
+    ModelTreeViolationError,
     ProcessExecutionError,
     ProcessRequest,
     ProcessResourceLimits,
@@ -595,13 +596,26 @@ class _RaceBarrier:
     def __init__(self) -> None:
         self.entered = threading.Event()
         self.released = threading.Event()
+        self._arrivals: dict[str, int] = {}
+        self._arrival_lock = threading.Lock()
 
-    def hook(self, expected: str) -> Callable[[str], None]:
+    def hook(self, expected: str, *, ordinal: int = 1) -> Callable[[str], None]:
+        """Block at the production seam on the ``ordinal``-th arrival of ``expected``.
+
+        The same ``before_open`` seam is shared by the live monitor scan and the terminal
+        post-quiescence scan, and they run on different threads.  Counting arrivals is what
+        lets a test race one specific scan instead of whichever one happens to arrive first.
+        """
+
         def wait_at_seam(label: str) -> None:
             if label != expected:
                 return
+            with self._arrival_lock:
+                self._arrivals[label] = self._arrivals.get(label, 0) + 1
+                if self._arrivals[label] != ordinal:
+                    return
             self.entered.set()
-            assert self.released.wait(5), "test did not release production race hook"
+            assert self.released.wait(10), "test did not release production race hook"
 
         return wait_at_seam
 
@@ -609,6 +623,9 @@ class _RaceBarrier:
         self,
         operation: Callable[[], Any],
         mutate: Callable[[], None],
+        *,
+        enter_timeout_s: float = 5.0,
+        join_timeout_s: float = 5.0,
     ) -> tuple[Any | None, BaseException | None]:
         outcome: list[Any] = []
         errors: list[BaseException] = []
@@ -621,10 +638,10 @@ class _RaceBarrier:
 
         thread = threading.Thread(target=wrapped, daemon=True)
         thread.start()
-        assert self.entered.wait(5), "production race hook was not reached"
+        assert self.entered.wait(enter_timeout_s), "production race hook was not reached"
         mutate()
         self.released.set()
-        thread.join(5)
+        thread.join(join_timeout_s)
         assert not thread.is_alive(), "production operation did not leave the race barrier"
         return (outcome[0] if outcome else None, errors[0] if errors else None)
 
@@ -873,8 +890,6 @@ def test_linux_live_scanner_child_drift_records_inconclusive_sample_and_retries(
     child = workspace / "child.txt"
     child.write_text("original", encoding="utf-8")
     moved = workspace / "moved.txt"
-    outside = tmp_path / "outside.txt"
-    outside.write_text("outside-canary", encoding="utf-8")
     race = _RaceBarrier()
     executable = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
     request = ProcessRequest.create(
@@ -903,42 +918,97 @@ def test_linux_live_scanner_child_drift_records_inconclusive_sample_and_retries(
     # The drifted sample is retained as audit evidence and contributes no usage claim.
     assert value.tree_sample_inconclusive_count >= 1
     assert value.resource_limit is None
-    assert outside.read_text(encoding="utf-8") == "outside-canary"
+    # No outside-canary assertion here on purpose: this mutation creates no symlink, so
+    # nothing outside the tree is ever reachable and such an assertion could not fail.
+    # The symlink case is owned by the stable-policy-violation test below.
 
 
 @pytest.mark.linux_isolation
-def test_linux_terminal_scanner_drift_after_quiescence_fails_closed(
+def test_linux_terminal_scanner_child_identity_change_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Drift observed by the authoritative post-quiescence scan is never swallowed."""
+    """A real rename-to-symlink raced into the authoritative scan fails closed."""
 
     if sys.platform != "linux":
         pytest.skip("terminal evaluator-tree scanner requires Linux")
     workspace = tmp_path / "terminal-workspace"
     workspace.mkdir()
-    (workspace / "child.txt").write_text("original", encoding="utf-8")
+    child = workspace / "child.txt"
+    child.write_text("original", encoding="utf-8")
+    moved = workspace / "moved.txt"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside-canary", encoding="utf-8")
+
+    # `next_tree_scan` starts at 0.0, so the monitor's first sample always walks the tree; a
+    # very long interval then prevents any second live walk.  Arrival 1 is therefore the live
+    # scan and arrival 2 is the terminal scan, which is what makes racing the terminal scan
+    # deterministic rather than a coin flip between the two.
+    monkeypatch.setattr(process_module, "_TREE_POLL_INTERVAL_S", 3600.0)
+    race = _RaceBarrier()
     executable = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
+    request = ProcessRequest.create(
+        argv=(executable, "-I", "-c", "import time; time.sleep(30)"),
+        stdin="",
+        cwd=tmp_path.resolve(),
+        environment={},
+        timeout_s=1,
+        stream_limit_bytes=1024,
+        resource_limits=ProcessResourceLimits(tree_files=100, tree_bytes=1024 * 1024),
+        tree_root=workspace,
+        _tree_before_open=race.hook("child.txt", ordinal=2),
+    )
 
-    # Every walk drifts, so the live samples exercise the inconclusive path and the scan that
-    # runs once the target is reaped is the one that must fail closed.  Injecting at the
-    # shared seam is what makes "which scan raised" the only variable under test.
-    def always_drifts(*_args: object, **_kwargs: object) -> None:
-        raise LinuxTreeDriftError("injected tree drift")
+    def mutate() -> None:
+        child.rename(moved)
+        child.symlink_to(outside)
 
-    monkeypatch.setattr(process_module, "walk_tree", always_drifts)
+    value, error = race.run(
+        lambda: run_process(request),
+        mutate,
+        enter_timeout_s=20.0,
+        join_timeout_s=20.0,
+    )
+    assert value is None
+    assert isinstance(error, ProcessExecutionError)
+    assert "changed during post-cleanup validation" in str(error)
+    # A real symlink to `outside` exists by now, so this canary can actually fail if the
+    # authoritative scan ever followed the replacement instead of the held descriptor.
+    assert outside.read_text(encoding="utf-8") == "outside-canary"
+
+
+@pytest.mark.linux_isolation
+def test_linux_terminal_scanner_stable_policy_violation_stays_a_model_tree_outcome(
+    tmp_path: Path,
+) -> None:
+    """A stable model-created symlink is a typed model-tree outcome, not harness failure."""
+
+    if sys.platform != "linux":
+        pytest.skip("terminal evaluator-tree scanner requires Linux")
+    workspace = tmp_path / "policy-workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside-canary", encoding="utf-8")
+    # Stable for the whole run rather than raced: the live sample and the authoritative scan
+    # both observe the identical policy-violating tree, which is exactly the case Step 27 must
+    # be able to score as a model `forbidden-edit` instead of an evaluator-infrastructure fault.
+    (workspace / "escape.txt").symlink_to(outside)
+    executable = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
     request = ProcessRequest.create(
         argv=(executable, "-I", "-c", "raise SystemExit(0)"),
         stdin="",
         cwd=tmp_path.resolve(),
         environment={},
-        timeout_s=5,
+        timeout_s=10,
         stream_limit_bytes=1024,
         resource_limits=ProcessResourceLimits(tree_files=100, tree_bytes=1024 * 1024),
         tree_root=workspace,
     )
-    with pytest.raises(ProcessExecutionError, match="changed during post-cleanup validation"):
+    with pytest.raises(ModelTreeViolationError, match="violates submitted-output policy") as raised:
         run_process(request)
+    # The whole point of the typed distinction: this must NOT arrive as infrastructure failure.
+    assert not isinstance(raised.value, ProcessExecutionError)
+    assert outside.read_text(encoding="utf-8") == "outside-canary"
 
 
 @pytest.mark.linux_isolation

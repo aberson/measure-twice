@@ -30,7 +30,7 @@ from measure_twice.agent_bench._linux_capabilities import (
     open_verified_children,
     walk_tree,
 )
-from measure_twice.agent_bench.models import Ceilings
+from measure_twice.agent_bench.models import SANDBOX_CONTRACT_VERSION, Ceilings
 from measure_twice.agent_bench.process import (
     EVALUATOR_WORKSPACE_FD_TOKEN,
     EvaluatorScratch,
@@ -40,7 +40,6 @@ from measure_twice.agent_bench.process import (
     ProcessResourceLimits,
 )
 
-SANDBOX_CONTRACT_VERSION: Final[str] = "linux-bwrap-v2"
 _BWRAP_UNAVAILABLE: Final[str] = (
     "compatible Bubblewrap with behavioral --bind-fd/--ro-bind-fd support is unavailable"
 )

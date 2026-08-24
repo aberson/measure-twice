@@ -40,6 +40,7 @@ from measure_twice.agent_bench._linux_capabilities import (
     copy_tree,
     walk_tree,
 )
+from measure_twice.agent_bench.models import EVALUATOR_DIRECTORY_ALLOWANCE
 
 _READ_CHUNK_BYTES: Final[int] = 64 * 1024
 _POLL_INTERVAL_S: Final[float] = 0.01
@@ -59,7 +60,6 @@ EVALUATOR_WORKSPACE_FD_TOKEN: Final[str] = "__measure_twice_evaluator_workspace_
 _TMPFS_SUPER_MAGIC: Final[int] = 0x01021994
 _CGROUP2_SUPER_MAGIC: Final[int] = 0x63677270
 _STARTUP_TIMEOUT_S: Final[float] = 10.0
-_TMPFS_DIRECTORY_ALLOWANCE: Final[int] = 10_001
 _SUPERVISOR_CODE: Final[str] = """
 import errno
 import ctypes
@@ -504,7 +504,7 @@ class EvaluatorScratch:
             raise ProcessContractError(
                 "evaluator scratch tmpfs_bytes must cover logical bytes and per-file pages"
             )
-        required_inodes = self.file_limit + _TMPFS_DIRECTORY_ALLOWANCE
+        required_inodes = self.file_limit + EVALUATOR_DIRECTORY_ALLOWANCE
         if self.tmpfs_inodes < required_inodes:
             raise ProcessContractError(
                 "evaluator scratch tmpfs_inodes must cover files and directory structure"
@@ -1950,30 +1950,6 @@ class _LinuxResourceGuardState:
             {},
         )
 
-    @classmethod
-    def from_capability(
-        cls,
-        capability: LinuxPathCapability,
-        kill_fd: int,
-        configuration: LinuxResourceGuard,
-        *,
-        scope_relative_path: str,
-    ) -> Self:
-        """Compatibility constructor for isolated callers that do not need staged ownership."""
-
-        state = cls.adopt(
-            capability,
-            kill_fd,
-            configuration,
-            scope_relative_path=scope_relative_path,
-        )
-        try:
-            state.validate_before_release()
-        except BaseException:
-            state.close()
-            raise
-        return state
-
     def validate_before_release(self) -> None:
         """Verify this is the named cgroup, then read every required control before release."""
 
@@ -2285,7 +2261,7 @@ def _validate_evaluator_tmpfs(
     required_bytes = scratch.byte_limit + scratch.file_limit * page_size
     if capacity_bytes < required_bytes or capacity_bytes > configured_bytes:
         raise ProcessExecutionError("evaluator tmpfs byte bound readback mismatch")
-    required_inodes = scratch.file_limit + _TMPFS_DIRECTORY_ALLOWANCE
+    required_inodes = scratch.file_limit + EVALUATOR_DIRECTORY_ALLOWANCE
     if int(values.f_files) < required_inodes or int(values.f_files) > scratch.tmpfs_inodes:
         raise ProcessExecutionError("evaluator tmpfs inode bound readback mismatch")
     scratch.record_backing_bounds(

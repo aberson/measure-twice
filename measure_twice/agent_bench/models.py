@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 
 from measure_twice.agent_bench._wire import AgentInputError, WireCodec
 
@@ -19,8 +19,11 @@ PROVIDERS = frozenset({"codex-cli", "claude-cli"})
 RUN_CLASSES = ("smoke", "pilot", "observation")
 RETRY_CLASSES = ("rate-limit", "provider-5xx", "preterminal-transport")
 _EXECUTION_PROFILE_SCHEMA_VERSION = 2
-_SANDBOX_CONTRACT_VERSION = "linux-bwrap-v2"
-_EVALUATOR_DIRECTORY_ALLOWANCE = 10_001
+# One source of truth for both shape constants: models.py is the leaf both process.py and
+# isolation.py can import without a cycle. Duplicating either here and there is the exact
+# drift shape code-quality.md forbids -- test_models.py asserts identity, not equality.
+SANDBOX_CONTRACT_VERSION: Final[str] = "linux-bwrap-v2"
+EVALUATOR_DIRECTORY_ALLOWANCE: Final[int] = 10_001
 
 
 class ModelSpecError(AgentInputError):
@@ -307,7 +310,7 @@ class Ceilings:
             raise ModelSpecError("ceilings.evaluator_cpu_bandwidth_percent may not exceed 100")
         if self.evaluator_tmpfs_bytes < self.evaluator_file_bytes:
             raise ModelSpecError("ceilings.evaluator_tmpfs_bytes must cover evaluator_file_bytes")
-        minimum_inodes = self.evaluator_files + _EVALUATOR_DIRECTORY_ALLOWANCE
+        minimum_inodes = self.evaluator_files + EVALUATOR_DIRECTORY_ALLOWANCE
         if self.evaluator_tmpfs_inodes < minimum_inodes:
             raise ModelSpecError(
                 "ceilings.evaluator_tmpfs_inodes must cover evaluator files and directory "
@@ -432,10 +435,10 @@ class ExecutionProfile:
             raise ModelSpecError("execution profile.ceilings must be Ceilings")
         if not isinstance(self.retry, RetryPolicy):
             raise ModelSpecError("execution profile.retry must be RetryPolicy")
-        if self.sandbox_contract_version != _SANDBOX_CONTRACT_VERSION:
+        if self.sandbox_contract_version != SANDBOX_CONTRACT_VERSION:
             raise ModelSpecError(
                 "execution profile.sandbox_contract_version must equal "
-                f"{_SANDBOX_CONTRACT_VERSION!r}"
+                f"{SANDBOX_CONTRACT_VERSION!r}"
             )
         if self.schedule_algorithm != "schedule-v1":
             raise ModelSpecError("execution profile.schedule_algorithm must equal 'schedule-v1'")

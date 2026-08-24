@@ -5,6 +5,9 @@ from pathlib import Path
 
 import pytest
 
+import measure_twice.agent_bench.isolation as isolation_module
+import measure_twice.agent_bench.models as models_module
+import measure_twice.agent_bench.process as process_module
 from measure_twice.agent_bench.models import (
     ExecutionProfile,
     ModelSpec,
@@ -258,3 +261,19 @@ def test_execution_profile_rejects_unknown_nested_and_missing_keys(tmp_path: Pat
     retry.pop("default_delay_s")
     with pytest.raises(ModelSpecError, match="missing"):
         load_execution_profile(_write(tmp_path, payload, "missing.json"))
+
+
+def test_shape_constants_resolve_to_one_shared_object() -> None:
+    """Identity, not equality: a re-duplicated copy fails here even while the values agree.
+
+    Both constants gate the same invariant from two modules -- ``SANDBOX_CONTRACT_VERSION``
+    is the persisted contract marker validated in models.py and exported by isolation.py,
+    and ``EVALUATOR_DIRECTORY_ALLOWANCE`` sizes the evaluator tmpfs inode budget that
+    models.py validates and process.py mounts against. An ``==`` assertion would keep
+    passing through the drift window this guards.
+    """
+
+    assert isolation_module.SANDBOX_CONTRACT_VERSION is models_module.SANDBOX_CONTRACT_VERSION
+    assert (
+        process_module.EVALUATOR_DIRECTORY_ALLOWANCE is models_module.EVALUATOR_DIRECTORY_ALLOWANCE
+    )
