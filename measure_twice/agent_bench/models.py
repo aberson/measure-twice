@@ -11,13 +11,43 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 
 from measure_twice.agent_bench._wire import AgentInputError, WireCodec
 
 PROVIDERS = frozenset({"codex-cli", "claude-cli"})
 RUN_CLASSES = ("smoke", "pilot", "observation")
 RETRY_CLASSES = ("rate-limit", "provider-5xx", "preterminal-transport")
+_EXECUTION_PROFILE_SCHEMA_VERSION = 2
+# One source of truth for both shape constants: models.py is the leaf both process.py and
+# isolation.py can import without a cycle. Duplicating either here and there is the exact
+# drift shape code-quality.md forbids -- test_models.py asserts identity, not equality.
+SANDBOX_CONTRACT_VERSION: Final[str] = "linux-bwrap-v2"
+EVALUATOR_DIRECTORY_ALLOWANCE: Final[int] = 10_001
+
+
+# The per-file page granularity CONFIG validation assumes.  Deliberately a fixed constant, not
+# the running host's page size: profiles are loaded on the operator's host (Windows, where
+# os.sysconf does not exist) while the evaluator runs inside WSL2 Linux, so resolving it at
+# runtime made the floor differ between the two sides that must agree -- and would have made the
+# shipped profile fail to LOAD on a 16 KiB-page host, a strictly new rejection. Physical capacity
+# is still checked for real against the mounted tmpfs by the readback in process.py, and genuine
+# exhaustion is caught by the hard-guard path; this constant only has to make config validation
+# deterministic and identical everywhere.
+EVALUATOR_PAGE_GRANULARITY: Final[int] = 4096
+
+
+def evaluator_tmpfs_minimum_bytes(*, file_bytes: int, files: int) -> int:
+    """The tmpfs byte floor: logical bytes plus one page of slack per file.
+
+    ONE owner for this formula.  Config-load validation (``Ceilings``) and launch-time contract
+    validation (``EvaluatorScratch``) must compute the identical floor, or a profile that loads
+    cleanly dies with ``ProcessContractError`` inside the evaluator launch -- the late rejection
+    the shared ``EVALUATOR_DIRECTORY_ALLOWANCE`` already closed for inodes.  tmpfs charges a whole
+    page per file, so a bound covering only the logical bytes is not a bound the kernel honours.
+    """
+
+    return file_bytes + files * EVALUATOR_PAGE_GRANULARITY
 
 
 class ModelSpecError(AgentInputError):
@@ -25,6 +55,22 @@ class ModelSpecError(AgentInputError):
 
 
 _WIRE = WireCodec(ModelSpecError)
+
+
+def _validate_execution_profile_schema_version(value: object) -> int:
+    """Validate the independently-versioned execution-profile wire contract."""
+
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ModelSpecError(
+            "execution profile.schema_version must be integer "
+            f"{_EXECUTION_PROFILE_SCHEMA_VERSION}, got {value!r}"
+        )
+    if value != _EXECUTION_PROFILE_SCHEMA_VERSION:
+        raise ModelSpecError(
+            f"unsupported execution profile.schema_version {value!r}; supported version is "
+            f"{_EXECUTION_PROFILE_SCHEMA_VERSION}"
+        )
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,10 +323,30 @@ class Ceilings:
     evaluator_processes: int
     evaluator_files: int
     evaluator_file_bytes: int
+    evaluator_cpu_bandwidth_percent: int
+    evaluator_tmpfs_bytes: int
+    evaluator_tmpfs_inodes: int
 
     def __post_init__(self) -> None:
         for name in self.__slots__:
             _WIRE.require_positive_int(getattr(self, name), label=f"ceilings.{name}")
+        if self.evaluator_cpu_bandwidth_percent > 100:
+            raise ModelSpecError("ceilings.evaluator_cpu_bandwidth_percent may not exceed 100")
+        minimum_bytes = evaluator_tmpfs_minimum_bytes(
+            file_bytes=self.evaluator_file_bytes,
+            files=self.evaluator_files,
+        )
+        if self.evaluator_tmpfs_bytes < minimum_bytes:
+            raise ModelSpecError(
+                "ceilings.evaluator_tmpfs_bytes must cover evaluator file bytes and per-file "
+                f"pages ({minimum_bytes})"
+            )
+        minimum_inodes = self.evaluator_files + EVALUATOR_DIRECTORY_ALLOWANCE
+        if self.evaluator_tmpfs_inodes < minimum_inodes:
+            raise ModelSpecError(
+                "ceilings.evaluator_tmpfs_inodes must cover evaluator files and directory "
+                f"structure ({minimum_inodes})"
+            )
 
     @classmethod
     def from_mapping(cls, value: object) -> Ceilings:
@@ -371,7 +437,7 @@ class ExecutionProfile:
     analysis_algorithm: str
 
     def __post_init__(self) -> None:
-        _WIRE.validate_schema_version(self.schema_version, label="execution profile")
+        _validate_execution_profile_schema_version(self.schema_version)
         _WIRE.validate_safe_id(self.id, label="execution profile.id")
         if not isinstance(self.qualification_limits, Limits):
             raise ModelSpecError("execution profile.qualification_limits must be Limits")
@@ -400,9 +466,10 @@ class ExecutionProfile:
             raise ModelSpecError("execution profile.ceilings must be Ceilings")
         if not isinstance(self.retry, RetryPolicy):
             raise ModelSpecError("execution profile.retry must be RetryPolicy")
-        if self.sandbox_contract_version != "linux-bwrap-v1":
+        if self.sandbox_contract_version != SANDBOX_CONTRACT_VERSION:
             raise ModelSpecError(
-                "execution profile.sandbox_contract_version must equal 'linux-bwrap-v1'"
+                "execution profile.sandbox_contract_version must equal "
+                f"{SANDBOX_CONTRACT_VERSION!r}"
             )
         if self.schedule_algorithm != "schedule-v1":
             raise ModelSpecError("execution profile.schedule_algorithm must equal 'schedule-v1'")
@@ -436,9 +503,7 @@ class ExecutionProfile:
             }
         )
         clean = _WIRE.require_exact_keys(value, expected, label="execution profile")
-        schema_version = _WIRE.validate_schema_version(
-            clean["schema_version"], label="execution profile"
-        )
+        schema_version = _validate_execution_profile_schema_version(clean["schema_version"])
         raw_policy = _WIRE.require_exact_keys(
             clean["run_policy"], frozenset(RUN_CLASSES), label="execution profile.run_policy"
         )

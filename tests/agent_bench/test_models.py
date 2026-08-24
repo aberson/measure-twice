@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
+import measure_twice.agent_bench._linux_capabilities as capabilities_module
+import measure_twice.agent_bench.isolation as isolation_module
+import measure_twice.agent_bench.models as models_module
+import measure_twice.agent_bench.process as process_module
 from measure_twice.agent_bench.models import (
+    Ceilings,
     ExecutionProfile,
     ModelSpec,
     ModelSpecError,
@@ -22,7 +27,7 @@ EXECUTION = ROOT / "profiles" / "agent-execution-v1.json"
 THREE_MODELS = Path(__file__).parent / "fixtures" / "wire" / "inputs" / "agent-models-three.json"
 
 SELECTED_PROFILE_HASH = "6b10e22d3f89e7f541ea3efb358367084de934b9b2a76f6b1fefe06012da27c2"
-EXECUTION_PROFILE_HASH = "44e1aad9c48fa5f8d7ffeeaf31e8b6d43f567a8bfdd622f68ed9fac29a436669"
+EXECUTION_PROFILE_HASH = "815525c081252c97689370d068ae0fb2595c0a7ba2e98333d08fb40b92697420"
 
 
 def _payload(path: Path) -> dict[str, object]:
@@ -201,6 +206,9 @@ def test_execution_profile_frozen_defaults_and_hash() -> None:
     assert profile.ceilings.evaluator_processes == 64
     assert profile.ceilings.evaluator_files == 10_000
     assert profile.ceilings.evaluator_file_bytes == 10_485_760
+    assert profile.ceilings.evaluator_cpu_bandwidth_percent == 100
+    assert profile.ceilings.evaluator_tmpfs_bytes == 67_108_864
+    assert profile.ceilings.evaluator_tmpfs_inodes == 20_001
 
 
 def test_execution_profile_hash_covers_nested_policy(tmp_path: Path) -> None:
@@ -255,3 +263,88 @@ def test_execution_profile_rejects_unknown_nested_and_missing_keys(tmp_path: Pat
     retry.pop("default_delay_s")
     with pytest.raises(ModelSpecError, match="missing"):
         load_execution_profile(_write(tmp_path, payload, "missing.json"))
+
+
+def test_shape_constants_resolve_to_one_shared_object() -> None:
+    """Identity, not equality: a re-duplicated copy fails here even while the values agree.
+
+    Both constants gate the same invariant from two modules -- ``SANDBOX_CONTRACT_VERSION``
+    is the persisted contract marker validated in models.py and exported by isolation.py,
+    and ``EVALUATOR_DIRECTORY_ALLOWANCE`` sizes the evaluator tmpfs inode budget that
+    models.py validates and process.py mounts against. An ``==`` assertion would keep
+    passing through the drift window this guards.
+    """
+
+    assert isolation_module.SANDBOX_CONTRACT_VERSION is models_module.SANDBOX_CONTRACT_VERSION
+    assert (
+        process_module.EVALUATOR_DIRECTORY_ALLOWANCE is models_module.EVALUATOR_DIRECTORY_ALLOWANCE
+    )
+
+
+def test_tmpfs_byte_floor_has_one_owner_across_modules() -> None:
+    """Identity, not equality, for the FUNCTION that computes the tmpfs byte floor.
+
+    The sibling of the constant test above.  Config-load validation (``Ceilings``) and launch
+    validation (``EvaluatorScratch`` / ``_validate_evaluator_tmpfs``) must compute the identical
+    floor; when they did not, a profile could load cleanly and then die with
+    ``ProcessContractError`` inside ``build_evaluator_sandbox``.
+    """
+
+    assert (
+        process_module.evaluator_tmpfs_minimum_bytes is models_module.evaluator_tmpfs_minimum_bytes
+    )
+
+
+def test_directory_allowance_is_derived_from_the_walker_tree_bound() -> None:
+    """The inode allowance is exactly the walker's whole-tree directory bound plus the root inode.
+
+    That derivation used to live only in prose.  Raising ``_MAX_TREE_DIRECTORIES`` without raising
+    the allowance silently under-provisions the tmpfs so a structurally LEGAL tree hits the
+    physical inode envelope -- the same cross-module drift the constant dedup closed, one file
+    over from where it was fixed.
+    """
+
+    assert (
+        models_module.EVALUATOR_DIRECTORY_ALLOWANCE == capabilities_module._MAX_TREE_DIRECTORIES + 1
+    )
+
+
+def test_ceilings_accepts_exactly_what_the_evaluator_scratch_requires() -> None:
+    """Producer -> consumer round trip on the tmpfs byte bound.
+
+    The floor is asserted against an independently written formula, not against the helper, so
+    this fails if the shared helper's arithmetic changes -- not merely if the two callers drift.
+    """
+
+    files = 7
+    file_bytes = 64 * 1024
+    # Independently written: the floor is a fixed granularity, not the running host's page
+    # size, so this expectation is identical on the Windows config host and inside WSL2.
+    expected_floor = file_bytes + files * 4096
+    assert models_module.EVALUATOR_PAGE_GRANULARITY == 4096
+    assert (
+        models_module.evaluator_tmpfs_minimum_bytes(file_bytes=file_bytes, files=files)
+        == expected_floor
+    )
+
+    def _ceilings(tmpfs_bytes: int) -> Ceilings:
+        return Ceilings(
+            changed_paths=100,
+            patch_bytes=5 * 1024 * 1024,
+            stream_bytes_each=10 * 1024 * 1024,
+            cell_artifact_bytes=25 * 1024 * 1024,
+            evaluator_cpu_s=2,
+            evaluator_memory_bytes=256 * 1024 * 1024,
+            evaluator_processes=16,
+            evaluator_files=files,
+            evaluator_file_bytes=file_bytes,
+            evaluator_cpu_bandwidth_percent=100,
+            evaluator_tmpfs_bytes=tmpfs_bytes,
+            evaluator_tmpfs_inodes=files + models_module.EVALUATOR_DIRECTORY_ALLOWANCE,
+        )
+
+    # Exactly at the floor loads...
+    assert _ceilings(expected_floor).evaluator_tmpfs_bytes == expected_floor
+    # ...and one byte under is rejected AT LOAD, not later at evaluator launch.
+    with pytest.raises(ModelSpecError, match="per-file pages"):
+        _ceilings(expected_floor - 1)

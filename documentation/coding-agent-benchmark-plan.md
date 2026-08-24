@@ -1,6 +1,6 @@
 # Provider-Neutral Coding Agent Benchmark
 
-**Status:** WRAPPED - Step 26 capability revision ready for repo sync (2026-08-22)
+**Status:** WRAPPED - Step 26 resource-guard revision ready for recovery build (2026-08-23)
 
 **Roadmap allocation:** Steps 25-55. Canonical `plan.md` owns Steps 1-17 and the approved
 operations plan owns Steps 18-24.
@@ -353,10 +353,12 @@ RunPolicy = {
 Ceilings = {
   changed_paths: int+, patch_bytes: int+, stream_bytes_each: int+,
   cell_artifact_bytes: int+, evaluator_cpu_s: int+, evaluator_memory_bytes: int+,
-  evaluator_processes: int+, evaluator_files: int+, evaluator_file_bytes: int+
+  evaluator_processes: int+, evaluator_files: int+, evaluator_file_bytes: int+,
+  evaluator_cpu_bandwidth_percent: int+, evaluator_tmpfs_bytes: int+,
+  evaluator_tmpfs_inodes: int+
 }
 ExecutionProfile = {
-  schema_version: 1, id: SafeId,
+  schema_version: 2, id: SafeId,
   qualification_limits: Limits,
   run_policy: {smoke: RunPolicy, pilot: RunPolicy, observation: RunPolicy},
   repetitions: 2, concurrency: 1, ceilings: Ceilings,
@@ -364,7 +366,7 @@ ExecutionProfile = {
     eligible: list["rate-limit"|"provider-5xx"|"preterminal-transport"],
     max_fresh_retries: 1, retry_after_cap_s: 60, default_delay_s: 5
   },
-  sandbox_contract_version: "linux-bwrap-v1",
+  sandbox_contract_version: "linux-bwrap-v2",
   schedule_algorithm: "schedule-v1", analysis_algorithm: "bootstrap-v1"
 }
 Suite = {
@@ -417,7 +419,7 @@ QualificationEnvironment = {
 Environment = {
   os: str!, os_version: str!, architecture: str!, python_version: str!,
   dependency_lock_sha256: hex64, benchmark_commit: git_oid,
-  sandbox_contract_version: "linux-bwrap-v1",
+  sandbox_contract_version: "linux-bwrap-v2",
   qualification_environment: QualificationEnvironment, executables: list[Executable]
 }
 ScheduleCell = {
@@ -473,18 +475,27 @@ Containment = {
   credential_read_denied: bool, child_network_denied: bool, web_tool_denied: bool
 }
 TestSummary = {passed: int0, failed: int0, skipped: int0, repetitions_agree: bool}
+ResourceLimitEvidence = {
+  name: "cpu"|"memory"|"processes"|"file-count"|"file-bytes",
+  provenance: "hard-guard"|"sampled-threshold", limit: int+, observed: int0?
+}
+TreePolicyViolation = {
+  reason: "invalid-name"|"special-file"|"structural-shape"|"symlink"|"unreadable",
+  relative_path_utf8_prefix: str?
+}
 EvaluationRepetition = {
-  ordinal: 1|2, applied_tree_sha256: hex64, result_tree_sha256: hex64,
-  outcome: "pass"|"tests-failed"|"tests-timeout"|"resource-limit"|
+  ordinal: 1|2, applied_tree_sha256: hex64, result_tree_sha256: hex64?,
+  outcome: "pass"|"tests-failed"|"tests-timeout"|"resource-limit"|"forbidden-edit"|
            "evaluator-infrastructure",
   passed: int0, failed: int0, skipped: int0, elapsed_ms: int0,
-  stdout: Artifact, stderr: Artifact
+  stdout: Artifact, stderr: Artifact, resource_limit: ResourceLimitEvidence?,
+  tree_policy_violation: TreePolicyViolation?
 }
 EvaluationResult = {
   schema_version: 1, evaluator_version: str!, oracle_sha256: hex64,
   repetitions: list[EvaluationRepetition], repetitions_agree: bool,
-  outcome: "pass"|"tests-failed"|"tests-timeout"|"resource-limit"|"nondeterministic"|
-           "evaluator-infrastructure"|"evaluator-nondeterministic"
+  outcome: "pass"|"tests-failed"|"tests-timeout"|"resource-limit"|"forbidden-edit"|
+           "nondeterministic"|"evaluator-infrastructure"|"evaluator-nondeterministic"
 }
 TerminalRow = {
   schema_version: 1, run_id: RunId, cell_id: str!, ordinal: int0,
@@ -537,7 +548,7 @@ QualificationSnapshot = {
   model_spec_sha256: hex64, execution_profile_sha256: hex64,
   qualification_environment_sha256: hex64,
   cli_version: str!, executable_sha256: hex64, invocation_sha256: hex64,
-  sandbox_contract_version: "linux-bwrap-v1", effective_tools: list[str!],
+  sandbox_contract_version: "linux-bwrap-v2", effective_tools: list[str!],
   canaries: {
     allowed_write: bool, outside_write_denied: bool, instruction_read_denied: bool,
     credential_read_denied: bool, child_network_denied: bool, web_tool_denied: bool
@@ -549,7 +560,7 @@ DoctorRawRecord = {
   provider: "codex-cli"|"claude-cli", started_at: utc, ended_at: utc,
   executable: Executable, model_spec_sha256: hex64, execution_profile_sha256: hex64,
   qualification_environment: QualificationEnvironment,
-  sandbox_contract_version: "linux-bwrap-v1", effective_tools: list[str!],
+  sandbox_contract_version: "linux-bwrap-v2", effective_tools: list[str!],
   observations: list[{
     name: "allowed-write"|"outside-write"|"instruction-read"|"credential-read"|
           "child-network"|"first-class-web",
@@ -644,6 +655,14 @@ credentials, account identifiers, and absolute paths. The Step-31 and Step-34 go
 literal canonical examples for every object above; implementation dataclasses may be split across
 modules, but persisted key sets and enum spelling must match this contract.
 
+`TreePolicyViolation.relative_path_utf8_prefix` is diagnostic-only, never pathname authority, and is
+null when the offending name cannot be decoded as UTF-8; otherwise it is a component-boundary prefix
+of at most 1,024 UTF-8 bytes. It is non-null exactly when a post-empty strict scan confirms the
+violation. That repetition records `forbidden-edit`, retains any independently proven resource
+evidence, and leaves `result_tree_sha256` null because no policy-invalid tree is authorized as a
+canonical snapshot. `forbidden-edit` takes precedence over `resource-limit`, timeout, and ordinary
+test status for the repetition outcome without erasing those underlying artifacts/evidence.
+
 `CellRecord.finalization_token` and `row_sha256` are both null only while running and both non-null
 when terminal; terminal `row.json` is byte-identical to the `TerminalRow` appended to `rows.jsonl`.
 `WorkspaceFiles`, `AgentInvocation`, and `EvaluationResult` are the exact schemas for the other
@@ -677,12 +696,23 @@ The causal mapping is normative and prevents model behavior from censoring a run
 | Observed cause | Row treatment |
 |---|---|
 | Ordinary visible/hidden assertion failure | `scored`, `score=0`, `tests-failed` |
-| Submitted code exceeds evaluator wall time, CPU, memory, process, file-count, or byte limit while host enforcement remains healthy | `scored`, `score=0`, `tests-timeout` for wall time or `resource-limit` otherwise |
+| Submitted code reaches evaluator wall timeout, triggers a verified memory/task hard guard, leaves the retained private tmpfs terminally byte/inode exhausted, or crosses a sampled cumulative-CPU/logical-tree threshold while the applicable guard health and attribution remain proven | `scored`, `score=0`, `tests-timeout` for wall time or `resource-limit` otherwise; a resource result records `hard-guard` or `sampled-threshold` provenance, configured limit, and observed value when available |
 | Agent behavior exceeds changed-path, patch, captured-stream, or total-cell-artifact ceiling | Preserve bounded evidence; `scored`, `score=0`, `resource-limit` |
-| Submitted tree touches a forbidden/protected path or introduces a symlink/submodule | `scored`, `score=0`, `forbidden-edit` |
+| Submitted tree touches a forbidden/protected path, introduces a symlink/submodule, or the quiescent evaluator result tree has a typed policy violation | `scored`, `score=0`, `forbidden-edit`; retain simultaneous resource and bounded process evidence |
 | Agent timeout/crash leaves no usable patch | `scored`, `score=0`, `patch-unavailable`; a usable cutoff patch is evaluated normally |
 | Submitted patch repetitions disagree in result or post-evaluation tree | `scored`, `score=0`, `nondeterministic` |
-| Baseline/reference anchor repetitions disagree/fail, host sandbox/limit enforcement fails, containment escape succeeds, harness storage I/O/quota fails, or patch capture/apply/evidence hash fails | `invalid` with the matching closed error class; halt/suppress inference as specified |
+| Baseline/reference anchor repetitions disagree/fail; cgroup guard setup, readback, attribution, monitoring, or teardown fails; tmpfs setup, readback, or teardown fails; containment escape succeeds; harness storage I/O fails; or patch capture/apply/evidence hash fails | `invalid` with the matching closed error class; halt/suppress inference as specified |
+
+The private tmpfs is always a hard host-safety envelope, but Linux exposes no per-mount event counter
+that proves a transient `ENOSPC` after a target deletes its writes. The harness may record a
+`file-bytes` or `file-count` `hard-guard` result only when retained-FD terminal evidence unambiguously
+shows exhausted blocks or inodes, using the physical tmpfs limit. Otherwise it must not invent
+tmpfs-hit attribution: sampled logical-tree evidence or the ordinary test outcome governs scoring.
+Likewise, concurrent model-controlled namespace churn during a live logical-tree poll is an
+inconclusive sample, not evaluator invalidity and not evidence below the threshold. The strict
+authoritative scan occurs only after the evaluator cgroup is proven empty. A stable symlink, special
+object, denied entry, or structural tree-policy violation is surfaced as a typed model-tree outcome
+for Step 27 rather than being mislabeled as harness failure.
 
 - Safe suite, task, cluster, and profile IDs match `^[a-z0-9][a-z0-9._-]{0,63}$` and reject `.` and
   `..`. They are author-assigned and unique in their containing registry or suite.
@@ -935,12 +965,15 @@ The clean evaluator is itself an untrusted-code sandbox, not merely another Git 
 separate Bubblewrap mount/PID/network namespace with no provider credentials, operator home, project
 checkout, run store, or sibling cell mounted. Only the evaluator tree is writable; runtime and the
 injected oracle are read-only; the environment is allowlisted; the network namespace has no egress;
-and wall, CPU, memory, process, file-count, byte, and descendant limits are enforced. Timeout kills
-the entire process group before collection. Malicious-patch fixtures attempt host-sentinel reads,
-outside writes, oracle mutation, credential and parent-`/proc` reads, TCP/UDP/DNS access, and detached
-children; a stateful fixture also leaves residue and proves that the second repetition cannot see it.
-Any containment success records invalid error class `containment`, suppresses run inference, and is
-never a model zero.
+and no target byte executes until a fresh cgroup has active, read-back memory, zero-swap, task, and
+CPU-bandwidth guards and the evaluator tree is backed by a private byte/inode-bounded tmpfs. The
+owner enforces wall timeout, while cumulative CPU seconds and logical tree file/byte counts are
+sampled scoring thresholds rather than hard maxima; every resource-limit result records which layer
+fired. Timeout kills the entire process group before collection. Malicious-patch fixtures attempt
+host-sentinel reads, outside writes, oracle mutation, credential and parent-`/proc` reads,
+TCP/UDP/DNS access, and detached children; a stateful fixture also leaves residue and proves that the
+second repetition cannot see it. Any containment success records invalid error class `containment`,
+suppresses run inference, and is never a model zero.
 
 The v1 evaluator convention is fixed rather than task-authored. Every seed contains visible tests
 under `tests/`; every oracle contains hidden tests under `tests/`. In each repetition the applied
@@ -1040,13 +1073,27 @@ otherwise `UNRESOLVED`. This is a quality eligibility result, not a cost/latency
 ### 6.8 Pin limits, artifacts, tranches, and retries
 
 The versioned execution profile fixes every resource rule that can affect fairness or resume
-identity:
+identity. `evaluator_memory_bytes` is the cgroup memory hard guard and
+`evaluator_processes` is the whole-cgroup task guard (Linux counts threads/TIDs). Swap is disabled
+by the sandbox contract. `evaluator_cpu_bandwidth_percent`, `evaluator_tmpfs_bytes`, and
+`evaluator_tmpfs_inodes` pin the independent CPU-rate and writable-storage safety envelope.
+`evaluator_cpu_s`, `evaluator_files`, and `evaluator_file_bytes` are sampled aggregate scoring
+thresholds; crossing one can overshoot between observations, and the observed value plus provenance
+is evidence rather than a claim that the threshold was a hard maximum. The bounded tmpfs must fit
+the applied-tree baseline before target release; inability to materialize that baseline is evaluator
+infrastructure failure, not a model resource limit:
+
+- The committed v2 sandbox profile fixes the hard guard at 1 GiB memory, zero swap, 64 tasks,
+  100% CPU bandwidth (one CPU of quota per period), 64 MiB tmpfs capacity, and 20,001 tmpfs inodes.
+  Its sampled thresholds are 60 cumulative CPU seconds, 10,000 logical files, and 10 MiB of logical
+  tree bytes. The larger storage guard allows page rounding and directory metadata without turning
+  the logical scoring thresholds into host-capacity claims.
 
 - Pilot and observation cells: one process at a time; agent timeout 600 seconds; evaluator timeout 60 seconds
   for each of two repetitions; maximum 100 changed paths; 5 MiB binary patch; 10 MiB captured bytes
   per stdout/stderr/trace stream; and 25 MiB total cell artifacts. Crossing a model-controlled
   process/trace/patch/artifact limit terminates collection, preserves bounded evidence, and records
-  `resource-limit` score zero. Independent harness storage I/O/quota or enforcement failure is
+  `resource-limit` score zero. Independent harness storage I/O or guard-enforcement failure is
   `artifact-store` or `evaluator-infrastructure` invalidity and is never silently truncated.
 - Qualification and smoke cells: agent timeout 60 seconds and evaluator timeout 30 seconds
   per repetition, with the same path/patch/trace ceilings.
@@ -1129,6 +1176,7 @@ post-Step-55 work; this plan does not alter the prompt-run scope reserved for St
 | Linux isolation integration from Windows | `pwsh -File scripts/test-agent-bench-wsl.ps1` |
 | Linux isolation integration inside WSL | `uv run pytest -q -m linux_isolation` |
 | Bubblewrap capability prerequisite | A trusted installed `bwrap` must pass Step 26's live `--bind-fd` and `--ro-bind-fd` probes. Upstream 0.11.2 is pinned known-good; Ubuntu 24.04's stock 0.9.0 package is rejected. |
+| Resource-guard prerequisite | The fixed trusted `/usr/bin/systemd-run` must create a delegated transient user scope whose effective cgroup-v2 memory, zero-swap, task, and CPU-bandwidth controls can be read back before target release; unprivileged private tmpfs mounts must enforce both byte and inode limits. |
 
 Live work requires `measure-twice` and `switchboard` as sibling sources because the existing
 `pyproject.toml` resolves `../switchboard`. A WSL-local clone is preferred; when orchestration began
@@ -1202,47 +1250,120 @@ report paths do not require inference.
   invariant: every host filesystem source is opened once as an owned Linux file-descriptor (FD)
   capability, so later rename, unlink, or symlink replacement cannot redirect sandbox mounts,
   subprocess cwd, capture enumeration, live resource monitoring, or terminal tree validation.
-  Preserve the immutable stdin/environment contract, bounded streams, secret scrubbing, aggregate
-  evaluator ceilings, and whole-process-tree termination. This step supplies mechanics and canaries
-  only; it neither understands provider event formats nor makes inference calls.
+  Preserve the immutable stdin/environment contract, bounded streams, secret scrubbing, and
+  whole-process-tree termination. Replace polling-as-containment with a two-layer evaluator resource
+  contract: hard cgroup and private-tmpfs host guards are active and read back before target release,
+  while cumulative CPU and logical-tree thresholds remain explicitly sampled scoring rules with
+  recorded provenance. This step supplies mechanics and canaries only; it neither understands
+  provider event formats nor makes inference calls.
 - **Type:** code
 - **Issue:** #28
 - **Flags:** --reviewers deep --isolation worktree
 - **Environment prerequisite:** The non-skipping Linux gate runs on WSL2 Ubuntu 24.04 with every
-  untrusted workspace and scratch path on ext4. Bubblewrap must pass live behavioral probes for
-  `--bind-fd` and `--ro-bind-fd`; version text is evidence only. Upstream Bubblewrap 0.11.2 is the
-  pinned known-good implementation, while Ubuntu 24.04's stock 0.9.0 package is unsupported.
-  Missing or incompatible Bubblewrap raises a stable `IsolationUnavailableError` and fails the WSL
-  gate rather than skipping it. No provider authentication or live model call is required.
-- **Capability contract:** Pathnames are accepted only at capability acquisition. Caller-controlled
-  roots are opened with Linux `openat2` beneath a pinned directory FD using
+  caller-supplied workspace and staging path on WSL ext4. Its unified cgroup v2 delegation and user
+  service manager must behaviorally support a fresh transient scope whose effective memory, swap,
+  pids, and CPU controls can be read back by the harness, and an unprivileged private mount namespace
+  must support tmpfs `size` and `nr_inodes` hard limits. Bubblewrap must pass live
+  behavioral probes for `--bind-fd` and `--ro-bind-fd`; version text is evidence only. Upstream
+  Bubblewrap 0.11.2 is the pinned known-good implementation, while Ubuntu 24.04's stock 0.9.0 package
+  is unsupported. Missing or incompatible cgroup delegation, bounded-tmpfs behavior, or Bubblewrap
+  raises a stable `IsolationUnavailableError` and fails the WSL gate rather than skipping it. There
+  is no polling-only or path-bind fallback. No provider authentication or live model call is
+  required.
+- **Capability contract:** Pathnames are accepted only at root capability acquisition.
+  Caller-controlled roots are opened with Linux `openat2` beneath a pinned directory FD using
   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`; unsupported kernel semantics fail
   preflight. Filesystem/type/identity checks use the opened descriptor (`fstat`/`fstatfs`), never a
-  second pathname lookup. Harness runtime files, network files, and the Bubblewrap executable are
-  likewise pinned before use; only sandbox destination paths remain pathname strings. Capability
-  overlap checks compare the held objects and FD-relative ancestry, not canonical strings.
+  later pathname reconstruction. Direct-child traversal treats `readdir` output only as an untrusted,
+  validated component name: a no-follow `openat2` is that child's acquisition boundary, type and
+  identity come only from `fstat` of the held FD, and FD-relative name rebindings before and after use
+  must still resolve to that held object. Harness runtime files, network files, and the fixed trusted
+  executables `/usr/bin/systemd-run` and `/usr/local/bin/bwrap` are likewise pinned before use; only sandbox
+  destination paths remain pathname strings. Capability overlap checks compare the held objects and
+  FD-relative ancestry, not canonical strings.
 
   | Internal type | Required fields and lifetime |
   |---|---|
   | `LinuxPathCapability` | owned `fd`; diagnostic-only `display_path`; `st_dev`, `st_ino`, `st_mode`, and filesystem evidence captured from that FD; explicit open/closed state; non-copyable, non-serializable, context-managed, and idempotently closed |
-  | `SandboxLaunch` | profile, command/environment, FD-backed source mounts `(writable/read-only, destination, capability)`, limits, and one-shot consumed state; it renders `--bind-fd`/`--ro-bind-fd` only while creating the process request and retains an evaluator-workspace FD through terminal validation |
-  | `ProcessRequest` | immutable argv/stdin/environment/limits plus an owned cwd capability, inherited mount FDs, optional duplicated tree-monitor capability, and one-shot consumed state |
+  | `LinuxResourceGuard` | immutable hard-control configuration: positive memory/task limits and at most 100% CPU bandwidth; the internal runtime guard owns the fresh exact scope path/identity, cgroup-directory capability, pre-opened non-inheritable `cgroup.kill` FD, read-back controls/counters, pre-release namespace-supervisor identity, and active/empty/closed/collected evidence |
+  | `EvaluatorScratch` | one-shot private tmpfs configuration plus the pinned applied-tree source and retained root FD; read-back `size`/`nr_inodes`, an internal exclusive-copy-destination capability, applied-tree baseline evidence, mount-namespace teardown evidence, and explicit closed state; the same root FD survives namespace detach and is used for the Bubblewrap mount, live scans, terminal usage validation, and later Step-27 authoritative result-tree snapshot |
+  | `SandboxLaunch` | profile, command/environment, FD-backed writable/read-only source mounts, optional evaluator scratch replacing the evaluator's direct writable source mount, resource guard, limits, and one-shot consumed state; it renders `--bind-fd`/`--ro-bind-fd` only while creating the process request and retains the evaluator tmpfs root FD through terminal usage validation |
+  | `ProcessRequest` | immutable argv/stdin/environment/limits plus an owned cwd capability, inherited mount FDs, optional duplicated tree-monitor capability, owned resource guard/release barrier, and one-shot consumed state |
+  | `ProcessResult` | bounded streams and terminal status plus nullable resource name, configured limit, observed value, and `hard-guard` or `sampled-threshold` provenance; live tree-sample inconclusive count; guard-health failure is an execution error, never a resource result |
 
   On Linux, `run_process` supplies every inherited descriptor through `Popen(pass_fds=...,
-  close_fds=True)`, enters cwd through `/proc/self/fd/<cwd-fd>`, and executes the pinned Bubblewrap
-  descriptor through `/proc/self/fd/<bwrap-fd>`. Launch-only parent descriptors close after
-  successful `Popen`; monitoring descriptors remain open through collection; every success, startup
-  failure, timeout, interrupt, ceiling failure, and caller exception closes all remaining
-  descriptors. Reusing a consumed request or launch fails.
-- **Traversal contract:** Capture and evaluator walkers call `os.scandir(directory_fd)`, reopen each
-  single-component child relative to that FD with no-follow flags, compare the enumerated
-  `(st_dev, st_ino, file type)` with `fstat` of the opened child, and queue child directory FDs rather
-  than `entry.path`. A changed entry, symlink, special file, unreadable object, or identity mismatch
-  fails closed. One shared FD-relative walker supplies both the live evaluator ceiling monitor and
-  terminal `measure_tree_usage`, preventing the two scanners from drifting.
-- **Files:** `measure_twice/agent_bench/{_linux_capabilities,process,isolation}.py`,
-  `scripts/test-agent-bench-wsl.ps1`, `pyproject.toml`,
-  `tests/agent_bench/test_process.py`, `tests/agent_bench/test_isolation.py`,
+  close_fds=True)`, enters cwd through `/proc/self/fd/<cwd-fd>`, and executes pinned executable
+  descriptors through `/proc/self/fd/<executable-fd>`. It invokes `systemd-run --user --scope
+  --collect --slice=app.slice` with a harness-generated `measure-twice-<128-bit-lowercase-hex>` unit
+  name (whose resulting scope is suffixed `.scope`) and only the
+  controller environment needed to reach `/run/user/<uid>/bus`; that controller environment never
+  enters the target's separately allowlisted environment. Scope creation places the outer namespace
+  owner in the cgroup before it can create the target. The namespace supervisor mounts the bounded
+  evaluator tmpfs directly over the existing `/var/tmp` only in its private outer mount namespace—
+  leaving Bubblewrap's hard-coded `/tmp` setup path unobscured—and opens
+  `cgroup.kill` relative to its exact cgroup directory, and sends exactly three FDs to
+  the parent in one pre-release Unix-socket `SCM_RIGHTS` handshake: cgroup directory, mandatory
+  evaluator tmpfs root, and pre-opened `cgroup.kill`. Receipt atomically requests close-on-exec and
+  explicitly clears inheritance before interpretation. The parent verifies the generated scope's
+  exact cgroup-v2 path and held identity, rejects missing, extra, malformed, or mismatched
+  capabilities, and keeps the target behind the release
+  barrier until every effective control and required event counter has been read back and exactly one
+  cgroup member has been bound as the PID-namespace supervisor by `(host pid, starttime)`, an `NSpid`
+  chain ending in namespace PID 1, and exact unified-cgroup membership; attachment after target
+  execution begins is forbidden. The received tmpfs root becomes an exclusive copy destination only
+  after its filesystem, physical bounds, and emptiness are validated while the target remains behind
+  the barrier. The applied tree is copied FD-relative into the already bounded private tmpfs before
+  release. Its
+  baseline and terminal usage are validated through the retained tmpfs root FD, never by reopening a
+  staging pathname; Step 27 later owns the authoritative result-tree snapshot and hash through that
+  same capability. Launch-only parent descriptors close after successful `Popen`; monitoring, guard,
+  and evaluator-scratch descriptors remain open through process collection and terminal validation.
+  Every success, startup failure, timeout, interrupt, resource crossing, and caller exception kills
+  the scope if it is populated, proves it empty through the held directory when controls remain, and
+  boundedly proves that `--collect` removed the same fresh cgroup without authorizing a replacement
+  object. Systemd may retire a fast-empty scope's path and controls even while a stale directory FD is
+  retained. That collected branch is terminal only after the pre-release path/identity is proved, the
+  exact namespace-supervisor `(pid, starttime)` is gone, the exact path is absent, and a complete
+  trusted supervisor record supplies terminal cgroup CPU/event attribution; stale handles then close
+  and exact-path absence is proved again. Before any valid handshake, the direct `systemd-run` owner
+  must be reaped and the generated scope path must remain absent for a full bounded interval—a first
+  `ENOENT` is not proof. The host namespace's `/var/tmp` identity never changes and no generated host
+  mountpoint exists. Bubblewrap consumes the linked private `/var/tmp` root by FD as `/workspace`
+  while creating its own inner `/tmp`; namespace-owner exit/reap detaches the outer mount. The parent-held
+  root FD deliberately retains that detached tree through terminal validation and Step 27, and the
+  final owned FD close releases it. Setup, readback, attribution, namespace teardown, or collection
+  uncertainty fails closed. Only after the exact cgroup is empty and the namespace owner is reaped may
+  the retained scratch capability supply the strict terminal logical-tree scan; a pre-kill forced poll
+  is still a live sample and cannot authorize invalidity from model-controlled churn.
+  Reusing a consumed request or launch fails.
+- **Traversal contract:** Capture and evaluator walkers call `os.scandir(directory_fd)` only to
+  discover validated single-component names. They immediately acquire each child relative to the
+  held parent with a no-follow open, derive type/identity/metadata solely from `fstat` of that opened
+  object, retain the child FD across the race seam and use, and prove the current name still binds to
+  that same held identity. An earlier `DirEntry.stat()` tuple is never durable authority, so inode
+  unlink/recreate reuse cannot redirect a later read. Directory namespaces and metadata are checked
+  across each completed visit; regular-file copy checks pre/post metadata and verifies copied bytes
+  against a second stable read, rejecting same-size in-place mutation. Symlinks, special files,
+  unreadable objects, post-acquisition name replacement, or source drift fail closed before a
+  replacement object's bytes are consumed. A replacement completed before the no-follow open may be
+  acquired as the current object only when the enclosing namespace remains coherent; otherwise the
+  operation fails closed, and it never falls back to a stale enumerated identity. This contract does
+  not claim an atomic whole-tree snapshot against pre-acquisition churn. The walker preserves a typed
+  distinction among per-visit namespace/metadata drift, stable model-created tree-policy violations,
+  configured logical-limit crossings, and genuine capability/kernel/I/O failures. Copy, capture, and
+  post-empty terminal use remain strict. A live sampled scan catches only the drift/policy outcomes,
+  records no successful sample, preserves prior high-water evidence, and retries; all other failures
+  retain their fail-closed classification. The already-validated private tmpfs
+  exclusivity—not a
+  racy `mkdir`/`stat` tuple—authorizes destination creation; ordinary destination capabilities are
+  rejected. One shared FD-relative walker supplies both the sampled live evaluator threshold
+  monitor and terminal `measure_tree_usage`/snapshot from the retained tmpfs root FD, preventing the
+  scanners from drifting. Polling never supplies a host-safety boundary.
+- **Files:** `measure_twice/agent_bench/{_linux_capabilities,models,process,isolation}.py`,
+  `profiles/agent-execution-v1.json`, `scripts/test-agent-bench-wsl.ps1`, `pyproject.toml`,
+  `tests/agent_bench/test_linux_capabilities.py`, `tests/agent_bench/test_models.py`,
+  `tests/agent_bench/test_process.py`,
+  `tests/agent_bench/test_isolation.py`,
   `tests/agent_bench/fixtures/isolation/`
 - **Done when:** `uv build`, full pytest, Ruff lint/format, strict mypy, and the non-skipping
   `pwsh -File scripts/test-agent-bench-wsl.ps1` gate pass with all of this evidence:
@@ -1250,9 +1371,37 @@ report paths do not require inference.
     detection remain frozen; success and every error/interrupt path leave no FD leak.
   - Timeout and interrupt kill and reap the complete Linux-owned descendant tree, including detach
     and double-fork fixtures identified by `(pid, starttime)`.
-  - Evaluator CPU, resident-memory, process-count, file-count, and tree-byte ceilings aggregate
-    across owned descendants; per-process `RLIMIT_FSIZE` and `RLIMIT_NOFILE` remain backstops rather
-    than being reported as aggregate enforcement.
+  - A barrier canary proves no evaluator target byte executes before cgroup membership and effective
+    `memory.max`, `memory.swap.max=0`, `pids.max`, and `cpu.max` are read back. Multi-descendant
+    allocation and fork-bomb canaries hit the hard memory/task guards; CPU bandwidth remains bounded.
+    Missing controllers, delegation, mismatched readback, attribution loss, monitor failure, or
+    non-empty/failed cgroup teardown fails closed as evaluator infrastructure, with no polling
+    fallback. Protocol regressions cover exactly-three-FD close-on-exec receipt, malformed/mismatched
+    cgroup, scratch, or `cgroup.kill` capabilities, release failure, every post-handshake startup
+    failure, direct-owner reap failure, stable no-handshake absence, fast normal scope collection,
+    and a descendant that outlives the nominal target.
+  - Every evaluator repetition receives a fresh private tmpfs whose byte and inode safety envelope is
+    active before the applied tree is copied. Parallel large-writer and many-small-file canaries hit
+    that envelope without consuming the backing ext4 volume. Baseline validation, the writable
+    Bubblewrap mount, live scans, and terminal usage validation all consume the same held tmpfs root
+    identity that Step 27 will use for its result-tree snapshot. Success and pre-release-failure
+    regressions prove the host `/var/tmp` identity never changes while real Bubblewrap and the terminal
+    scanner consume the private retained FD before and after outer-namespace teardown; cancellation or
+    namespace-teardown uncertainty remains an infrastructure failure while cgroup cleanup completes.
+  - Cumulative CPU seconds aggregate through cgroup accounting, while logical file-count and
+    tree-byte thresholds use the shared FD-relative walker. These are sampled scoring thresholds and
+    may overshoot between observations; live namespace churn records an inconclusive poll and retries
+    without erasing prior evidence, while the strict authoritative scan runs only after cgroup-empty
+    proof. Tests assert correct termination and recorded configured
+    limit, observed value, and `sampled-threshold` provenance rather than claiming a hard maximum.
+    Hard memory/task events record `hard-guard` provenance. Terminally exhausted tmpfs blocks/inodes
+    may record `file-bytes`/`file-count` `hard-guard` provenance with the physical tmpfs limit only
+    when the retained FD proves exhaustion; a transient handled `ENOSPC` is never inferred after
+    deletion. Per-process `RLIMIT_FSIZE` and `RLIMIT_NOFILE` remain backstops and are never reported as
+    aggregate enforcement. Regressions cover live drift followed by a stable retry, persistent live
+    churn with a post-empty threshold crossing, post-empty drift failing closed, a stable model-tree
+    policy violation remaining distinguishable for Step 27, and an unrelated capability/I/O error
+    remaining evaluator infrastructure.
   - Real Bubblewrap canaries prove workspace-only writes, absent suite/oracle/run/operator-home
     mounts, read-only oracle/runtime mounts, capture with submitted `.git` absent, empty child
     network for capture/evaluator, and no host/credential/parent-`/proc` disclosure.
@@ -1261,7 +1410,9 @@ report paths do not require inference.
     child; capture repository; evaluator workspace, oracle, and runtime; process cwd; live tree
     scanner child; terminal tree scanner child. Root/cwd cases must consume the originally opened
     inode; child-entry identity changes must produce the documented fail-closed error; no case may
-    read, mount, execute from, or count the replacement target.
+    read, mount, execute from, or count the replacement target. Direct-child regressions include
+    unlink/recreate inode reuse after the no-follow acquisition, same-size mutation during copy, late
+    add/remove/rename, rejection of non-exclusive copy destinations, and success/error FD baselines.
   - Existing hostile fixtures still cannot mutate an oracle, write outside the sandbox, reach
     TCP/UDP/DNS, inspect parent credential state, or leave a detached child. No provider credentials
     or live calls are used.
@@ -1284,14 +1435,19 @@ report paths do not require inference.
   round-trips into a fresh evaluator tree with an identical tree hash; malicious agent `.git`
   config, hooks, attributes, clean/smudge filters, external diff/textconv, environment injection,
   and metadata-only commits never execute and cannot affect the patch; submitted forbidden
-  paths/symlinks/submodules, test timeout/resource exhaustion, model-caused ceilings, and submitted
-  repetition disagreement map to their specified scored-zero outcomes; successful escape/oracle
+  paths/symlinks/submodules, test timeout/resource exhaustion, model-caused hard guards or sampled
+  thresholds, and submitted repetition disagreement map to their specified scored-zero outcomes;
+  successful escape/oracle
   mutation, anchor/enforcement failure, and baseline/reference disagreement map to their specified
   invalid categories; stateful and malicious fixtures prove separately materialized repetitions;
   full `mt agent validate` runs all anchors only in the accepted Linux sandbox and never turns a
   harness fault into a model zero, while native Windows fails before task execution unless
-  `--structure-only` is set.
-- **Depends on:** 26
+  `--structure-only` is set. Each repetition captures and consumes its result-tree snapshot through
+  Step 26's retained tmpfs-root capability and carries its hard-guard versus sampled-threshold resource
+  provenance into evaluator evidence; it cannot substitute a pathname reconstruction or
+  monitor-only launch.
+- **Depends on:** 26, including its non-optional cgroup, bounded-tmpfs, and retained terminal-FD
+  contract
 
 <!-- autofix-applied: 2026-08-21 -->
 ### Step 28: Codex adapter and doctor contract
@@ -1867,6 +2023,7 @@ are gates to prove rather than assumptions to waive.
 |---|---|---|
 | WSL2 CLI availability/auth | Windows-authenticated CLIs may not already be installed or authenticated inside WSL2. | Steps 28-29 provide fail-loud preflight code and the runbook; Step 30 is the operator qualification gate. Do not fall back to asymmetric native Windows execution. |
 | Bubblewrap FD-bind availability | Ubuntu 24.04 may provide a path-bind-only Bubblewrap that cannot preserve an opened filesystem identity through namespace setup. | Step 26 live-probes FD-bound writable/read-only mounts, records executable/version evidence, and fails before executing untrusted code. Upstream 0.11.2 is pinned known-good; the operator installs a compatible trusted build, and the harness never downloads one or falls back to pathname binds. |
+| Linux resource-guard availability | Polling `/proc` or a writable tree cannot prevent a hostile burst from exhausting host memory, tasks, or storage. | Step 26 requires read-back cgroup memory/zero-swap/task/CPU-bandwidth controls before target release and a fresh byte/inode-bounded tmpfs for each evaluator repetition. Missing setup, attribution, or teardown fails closed; sampled CPU/logical-tree thresholds are scoring evidence only. |
 | Provider flag or stream drift | CLI updates can remove isolation flags or change JSONL events. | Pin exact argv/event contracts in offline tests, record executable/version hashes, and fail preflight on missing required capability. |
 | Model alias drift | `sonnet` or a future `haiku` alias can silently move. | Record requested and stream-reported identity per cell, abort within-run drift, and pin the qualified full identity before v1 where the provider exposes it. Never invent a resolved Codex field that JSONL does not supply; retain request plus catalog/executable evidence. |
 | Unequal native internals | Tool loops and system prompts differ across products. | Define the claim as end-to-end agent-product performance; equalize inputs, environment, permissions, and outcome scorer, and record the remaining provider differences. |
@@ -1895,10 +2052,10 @@ are gates to prove rather than assumptions to waive.
   anchors; timeout; nondeterministic repeat; evaluator versus model failure taxonomy.
 - Process/adapters: exact argv, prompt bytes on UTF-8 stdin, descriptor-bound cwd, scrubbed
   environment without secret logging, timeout/process-tree kill, FD-bound Bubblewrap mount sources,
-  shared FD-relative tree traversal, one-shot ownership and leak checks, deterministic
+  pre-release cgroup guard readback, bounded-tmpfs creation/snapshot/teardown, sampled resource
+  provenance, shared FD-relative tree traversal, one-shot ownership and leak checks, deterministic
   post-acquisition rename-to-symlink races, every Codex JSONL and Claude stream terminal/error shape,
-  model
-  mismatch, missing capability, empty output, exact effective-tool drift, first-class web denial,
+  model mismatch, missing capability, empty output, exact effective-tool drift, first-class web denial,
   MCP/plugin/browser absence, one-shot confirmation receipts, and executable fingerprints.
 - Runner/store: seeded pair order, unique workspaces, budget abort, atomic cell finalization,
   torn/corrupt rows, missing/hash-mismatched artifacts, quarantine and resume, exclusive run locks,
