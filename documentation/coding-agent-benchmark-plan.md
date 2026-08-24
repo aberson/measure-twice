@@ -2109,7 +2109,7 @@ autonomously after the command returns.
 
 ## Shipped: Steps 25-26 - strict agent inputs and the Linux isolation substrate
 
-**Both steps merged to `master`. Issues #27-#28 closed.** The instrument can now be *defined* and a
+**Both steps merged to `master`. Issues #27-#28 closed.** Guided tour of what shipped: https://claude.ai/code/artifact/8e355106-c354-4338-9cff-4bcdd0d8f63a The instrument can now be *defined* and a
 process can be *contained*; nothing yet makes an inference call. Steps 27-29 build the sandboxed
 evaluator and the provider adapters on top of this substrate.
 
