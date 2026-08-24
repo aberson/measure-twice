@@ -5,10 +5,12 @@ from pathlib import Path
 
 import pytest
 
+import measure_twice.agent_bench._linux_capabilities as capabilities_module
 import measure_twice.agent_bench.isolation as isolation_module
 import measure_twice.agent_bench.models as models_module
 import measure_twice.agent_bench.process as process_module
 from measure_twice.agent_bench.models import (
+    Ceilings,
     ExecutionProfile,
     ModelSpec,
     ModelSpecError,
@@ -277,3 +279,70 @@ def test_shape_constants_resolve_to_one_shared_object() -> None:
     assert (
         process_module.EVALUATOR_DIRECTORY_ALLOWANCE is models_module.EVALUATOR_DIRECTORY_ALLOWANCE
     )
+
+
+def test_tmpfs_byte_floor_has_one_owner_across_modules() -> None:
+    """Identity, not equality, for the FUNCTION that computes the tmpfs byte floor.
+
+    The sibling of the constant test above.  Config-load validation (``Ceilings``) and launch
+    validation (``EvaluatorScratch`` / ``_validate_evaluator_tmpfs``) must compute the identical
+    floor; when they did not, a profile could load cleanly and then die with
+    ``ProcessContractError`` inside ``build_evaluator_sandbox``.
+    """
+
+    assert (
+        process_module.evaluator_tmpfs_minimum_bytes is models_module.evaluator_tmpfs_minimum_bytes
+    )
+
+
+def test_directory_allowance_is_derived_from_the_walker_tree_bound() -> None:
+    """The inode allowance is exactly the walker's whole-tree directory bound plus the root inode.
+
+    That derivation used to live only in prose.  Raising ``_MAX_TREE_DIRECTORIES`` without raising
+    the allowance silently under-provisions the tmpfs so a structurally LEGAL tree hits the
+    physical inode envelope -- the same cross-module drift the constant dedup closed, one file
+    over from where it was fixed.
+    """
+
+    assert (
+        models_module.EVALUATOR_DIRECTORY_ALLOWANCE == capabilities_module._MAX_TREE_DIRECTORIES + 1
+    )
+
+
+def test_ceilings_accepts_exactly_what_the_evaluator_scratch_requires() -> None:
+    """Producer -> consumer round trip on the tmpfs byte bound.
+
+    The floor is asserted against an independently written formula, not against the helper, so
+    this fails if the shared helper's arithmetic changes -- not merely if the two callers drift.
+    """
+
+    files = 7
+    file_bytes = 64 * 1024
+    page_size = models_module.evaluator_page_size()
+    expected_floor = file_bytes + files * page_size
+    assert (
+        models_module.evaluator_tmpfs_minimum_bytes(file_bytes=file_bytes, files=files)
+        == expected_floor
+    )
+
+    def _ceilings(tmpfs_bytes: int) -> Ceilings:
+        return Ceilings(
+            changed_paths=100,
+            patch_bytes=5 * 1024 * 1024,
+            stream_bytes_each=10 * 1024 * 1024,
+            cell_artifact_bytes=25 * 1024 * 1024,
+            evaluator_cpu_s=2,
+            evaluator_memory_bytes=256 * 1024 * 1024,
+            evaluator_processes=16,
+            evaluator_files=files,
+            evaluator_file_bytes=file_bytes,
+            evaluator_cpu_bandwidth_percent=100,
+            evaluator_tmpfs_bytes=tmpfs_bytes,
+            evaluator_tmpfs_inodes=files + models_module.EVALUATOR_DIRECTORY_ALLOWANCE,
+        )
+
+    # Exactly at the floor loads...
+    assert _ceilings(expected_floor).evaluator_tmpfs_bytes == expected_floor
+    # ...and one byte under is rejected AT LOAD, not later at evaluator launch.
+    with pytest.raises(ModelSpecError, match="per-file pages"):
+        _ceilings(expected_floor - 1)

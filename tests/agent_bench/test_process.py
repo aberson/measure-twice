@@ -492,13 +492,19 @@ def test_linux_scope_absence_interval_restarts_when_the_path_reappears(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An asynchronously reappearing scope restarts the bounded absence interval."""
+    """An asynchronously reappearing scope restarts the bounded absence interval.
+
+    The path must be ABSENT at entry, then REAPPEAR mid-interval, then go absent again.  A
+    present-then-absent transition never reaches the reset at all: ``stable_absence_deadline``
+    is still ``None`` when the path first goes absent, so deleting the reset line would leave
+    such a test green.  Only a genuine reappearance discriminates it.
+    """
 
     stable_interval = 1.0
     monkeypatch.setattr(process_module, "_REAP_TIMEOUT_S", stable_interval)
     monkeypatch.setattr(process_module, "_POLL_INTERVAL_S", 0.005)
     scope = tmp_path / "phantom.scope"
-    scope.mkdir()
+    assert not scope.exists()
     returned: list[float] = []
     errors: list[BaseException] = []
 
@@ -510,8 +516,12 @@ def test_linux_scope_absence_interval_restarts_when_the_path_reappears(
             errors.append(exc)
 
     worker = threading.Thread(target=wait_for_collection, daemon=True)
+    started = time.monotonic()
     worker.start()
-    time.sleep(0.05)
+    # Let a partial absence interval accumulate, then make the scope reappear well inside it.
+    time.sleep(stable_interval * 0.3)
+    scope.mkdir()
+    time.sleep(stable_interval * 0.2)
     removed_at = time.monotonic()
     scope.rmdir()
     worker.join(timeout=5 * stable_interval + 5)
@@ -519,8 +529,11 @@ def test_linux_scope_absence_interval_restarts_when_the_path_reappears(
     assert not worker.is_alive()
     assert not errors, errors
     assert len(returned) == 1
-    # The interval restarts from the LAST absence, not from the call, and not from a first ENOENT.
+    # The interval restarts from the LAST absence.  Without the reset the worker would return at
+    # roughly `started + stable_interval`, i.e. BEFORE `removed_at + stable_interval` -- the
+    # partial interval banked before the reappearance would have counted toward the proof.
     assert returned[0] - removed_at >= stable_interval
+    assert returned[0] - started >= stable_interval * 1.5
 
 
 def _packed_supervisor_status(
@@ -715,6 +728,35 @@ def test_linux_normal_exit_still_kills_a_populated_scope_and_proves_it_empty(
         guard.close()
         process_module._close_fd(runtime.status_read_fd)
     _assert_linux_fd_baseline(baseline)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SCM_RIGHTS handshake invariant")
+def test_supervisor_status_wire_shape_has_one_owner_and_survives_large_ceilings() -> None:
+    """The supervisor and the parent read ONE wire shape, wide enough for real ceilings.
+
+    ``hard_observed`` carries cgroup ``memory.peak`` and tmpfs byte capacity, both sourced from
+    ``Ceilings`` values that are validated only as positive ints.  As a signed 32-bit field it
+    overflowed above 2 GiB, and the terminal ``_write_status`` runs OUTSIDE the supervisor's
+    guarded ``try``, so ``struct.error`` escaped, the supervisor died without writing a record,
+    and a REAL hard cgroup event surfaced as an ``invalid status record`` infrastructure failure
+    -- precisely when the guard fired.
+    """
+
+    # One owner: the format the supervisor packs with is substituted from the parent's constant.
+    assert process_module._SUPERVISOR_STATUS_FORMAT in process_module._SUPERVISOR_CODE
+    assert "__MT_STATUS_FORMAT__" not in process_module._SUPERVISOR_CODE
+    assert "__MT_STATUS_MAGIC__" not in process_module._SUPERVISOR_CODE
+    compile(process_module._SUPERVISOR_CODE, "<supervisor>", "exec")
+
+    # A ceiling above the old signed-32-bit bound must round-trip rather than raise.
+    oversized = 4 * 1024 * 1024 * 1024
+    payload = process_module._SUPERVISOR_STATUS.pack(
+        process_module._SUPERVISOR_MAGIC, 0, 0, 12_345, 1, oversized, 0
+    )
+    assert len(payload) == process_module._SUPERVISOR_STATUS.size
+    unpacked = process_module._SUPERVISOR_STATUS.unpack(payload)
+    assert unpacked[0] == process_module._SUPERVISOR_MAGIC
+    assert unpacked[5] == oversized
 
 
 def _request(
@@ -1350,11 +1392,17 @@ def test_linux_outer_pid_namespace_mounts_procfs_for_its_target(tmp_path: Path) 
     assert result.stdout.strip().isdigit()
 
 
+# The detached descendant waits this long for its release marker.  The promptness bound in
+# test_namespace_owner_cleans_descendant_when_direct_child_exits is derived from it: if
+# cleanup ever blocks on the descendant instead of reaping it, the run takes this long.
+_DESCENDANT_RELEASE_DEADLINE_S: float = 10.0
+
+
 def _post_cleanup_write_code(leaked: Path, *, release: Path | None = None) -> str:
     if release is None:
         return f"time.sleep(1.0); open({str(leaked)!r},'w',encoding='utf-8').write('leaked')"
     return (
-        f"release={str(release)!r}; deadline=time.monotonic()+10; "
+        f"release={str(release)!r}; deadline=time.monotonic()+{_DESCENDANT_RELEASE_DEADLINE_S}; "
         "\nwhile not os.path.exists(release) and time.monotonic()<deadline: time.sleep(.01)\n"
         f"if os.path.exists(release): "
         f"open({str(leaked)!r},'w',encoding='utf-8').write('leaked')"
@@ -1436,6 +1484,7 @@ def test_namespace_owner_cleans_descendant_when_direct_child_exits(tmp_path: Pat
     ready = tmp_path / "orphan-ready"
     leaked = tmp_path / "orphan-leaked"
     release = tmp_path / "orphan-release"
+    started = time.monotonic()
     result = run_process(
         _request(
             tmp_path,
@@ -1444,10 +1493,20 @@ def test_namespace_owner_cleans_descendant_when_direct_child_exits(tmp_path: Pat
             stream_limit_bytes=1024,
         )
     )
+    elapsed = time.monotonic() - started
 
     assert result.termination == "exited"
     assert result.exit_code == 0
     assert ready.is_file()
+    # Promptness, not just correctness: the namespace owner REAPS the detached descendant rather
+    # than waiting on it.  The descendant blocks for _DESCENDANT_RELEASE_DEADLINE_S and the
+    # release marker is only written below, so a cleanup path that waits on it instead of
+    # reaping it returns at ~that deadline.  Without this bound such a regression would only
+    # make the test slower -- every other assertion here still passes once the descendant's
+    # own deadline elapses, and no pytest-timeout is configured.
+    assert elapsed < _DESCENDANT_RELEASE_DEADLINE_S / 2, (
+        f"cleanup appears to block on the detached descendant: {elapsed:.2f}s"
+    )
     release.write_text("release", encoding="utf-8")
     _assert_path_stays_absent(leaked)
 

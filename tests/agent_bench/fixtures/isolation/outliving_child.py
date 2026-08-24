@@ -12,6 +12,16 @@ from pathlib import Path
 def _child(marker: str, ready: str, release: str) -> None:
     if os.name == "posix":
         os.setsid()
+        # Drop the inherited stdio.  Holding the target's pipes open would keep run_process
+        # waiting for EOF until this descendant's own deadline elapsed -- the harness would then
+        # be blocked on the descendant rather than observing a cleanly-exited target, and the
+        # descendant's polling would burn the evaluator CPU ceiling while it waited.  Releasing
+        # them is what makes this a real outliving-descendant canary instead of a slow target.
+        null = os.open(os.devnull, os.O_RDWR)
+        for stream in (0, 1, 2):
+            os.dup2(null, stream)
+        if null > 2:
+            os.close(null)
     Path(ready).write_text("ready", encoding="utf-8")
     deadline = time.monotonic() + 10
     release_path = Path(release)

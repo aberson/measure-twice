@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import array
 import ctypes
+import errno
 import math
 import os
 import select
@@ -40,7 +41,10 @@ from measure_twice.agent_bench._linux_capabilities import (
     copy_tree,
     walk_tree,
 )
-from measure_twice.agent_bench.models import EVALUATOR_DIRECTORY_ALLOWANCE
+from measure_twice.agent_bench.models import (
+    EVALUATOR_DIRECTORY_ALLOWANCE,
+    evaluator_tmpfs_minimum_bytes,
+)
 
 _READ_CHUNK_BYTES: Final[int] = 64 * 1024
 _POLL_INTERVAL_S: Final[float] = 0.01
@@ -54,7 +58,13 @@ _LINUX_RUN_LOCK = threading.Lock()
 _LINUX_NAMESPACE_EXECUTABLE: Final[str] = "/usr/bin/unshare"
 _LINUX_SUPERVISOR_EXECUTABLE: Final[str] = "/usr/bin/python3"
 _LINUX_SYSTEMD_RUN_EXECUTABLE: Final[str] = "/usr/bin/systemd-run"
-_SUPERVISOR_STATUS = struct.Struct("!4siiqiii")
+# magic, wait_status, exec_error, cpu_microseconds(q), hard_limit, hard_observed(q),
+# setup_error.  hard_observed carries cgroup memory.peak and tmpfs byte capacity, both
+# sourced from unbounded Ceilings values -- a signed 32-bit field overflowed at a >2 GiB
+# ceiling, and the terminal _write_status runs OUTSIDE the supervisor's guarded try, so
+# struct.error escaped and a real hard cgroup event surfaced as "invalid status record".
+_SUPERVISOR_STATUS_FORMAT: Final[str] = "!4siiqiqi"
+_SUPERVISOR_STATUS = struct.Struct(_SUPERVISOR_STATUS_FORMAT)
 _SUPERVISOR_MAGIC: Final[bytes] = b"MT26"
 EVALUATOR_WORKSPACE_FD_TOKEN: Final[str] = "__measure_twice_evaluator_workspace_fd__"  # noqa: S105 - argv placeholder, not a secret.
 _TMPFS_SUPER_MAGIC: Final[int] = 0x01021994
@@ -64,7 +74,7 @@ _CGROUP2_SUPER_MAGIC: Final[int] = 0x63677270
 # It is deliberately independent of ProcessRequest.timeout_s -- no submitted byte executes
 # before the release barrier, so the target's wall clock cannot be the right budget here.
 SANDBOX_SETUP_TIMEOUT_S: Final[float] = 10.0
-_SUPERVISOR_CODE: Final[str] = """
+_SUPERVISOR_CODE_TEMPLATE: Final[str] = """
 import errno
 import ctypes
 import os
@@ -99,8 +109,8 @@ def _write_status(
     wait_status, exec_error, cpu_microseconds, hard_limit, hard_observed, setup_error
 ):
     payload = struct.pack(
-        "!4siiqiii",
-        b"MT26",
+        "__MT_STATUS_FORMAT__",
+        b"__MT_STATUS_MAGIC__",
         wait_status,
         exec_error,
         cpu_microseconds,
@@ -413,6 +423,12 @@ exit_code = os.waitstatus_to_exitcode(wait_status)
 os._exit(exit_code if exit_code >= 0 else 128 - exit_code)
 """
 
+# Substituted, not duplicated: the supervisor and the parent read the same wire shape from one
+# owner, so widening or reordering a field cannot silently desync the two ends of the pipe.
+_SUPERVISOR_CODE: Final[str] = _SUPERVISOR_CODE_TEMPLATE.replace(
+    "__MT_STATUS_FORMAT__", _SUPERVISOR_STATUS_FORMAT
+).replace("__MT_STATUS_MAGIC__", _SUPERVISOR_MAGIC.decode("ascii"))
+
 Termination = Literal["exited", "signalled", "timeout", "stream-limit", "resource-limit"]
 ResourceLimitName = Literal["cpu", "memory", "processes", "file-count", "file-bytes"]
 ResourceLimitProvenance = Literal["hard-guard", "sampled-threshold"]
@@ -499,11 +515,10 @@ class EvaluatorScratch:
     def __post_init__(self) -> None:
         for name in ("file_limit", "byte_limit", "tmpfs_bytes", "tmpfs_inodes"):
             _positive_int(getattr(self, name), label=f"evaluator scratch {name}")
-        try:
-            page_size = int(cast("Any", os).sysconf("SC_PAGE_SIZE"))
-        except (AttributeError, OSError, ValueError):
-            page_size = 4096
-        required_bytes = self.byte_limit + self.file_limit * page_size
+        required_bytes = evaluator_tmpfs_minimum_bytes(
+            file_bytes=self.byte_limit,
+            files=self.file_limit,
+        )
         if self.tmpfs_bytes < required_bytes:
             raise ProcessContractError(
                 "evaluator scratch tmpfs_bytes must cover logical bytes and per-file pages"
@@ -1915,6 +1930,21 @@ def _nonnegative_cgroup_value(capability: LinuxPathCapability, name: str) -> int
     return value
 
 
+def _is_collected_cgroup_error(cause: BaseException | None) -> bool:
+    """Does this control-read failure mean the cgroup itself is gone?
+
+    A retired cgroup v2 scope fails in two distinct shapes, and the caller must recognise both:
+    ``open()`` raises ``ENOENT`` when the control file is already unlinked, but when the open
+    wins the race the subsequent ``read()`` raises ``ENODEV`` on the now-removed cgroup.  Only
+    those two errnos qualify -- every other cgroup read failure stays fail-closed, because the
+    caller goes on to prove owner exit and exact-path absence before treating this as terminal.
+    """
+
+    if isinstance(cause, FileNotFoundError):
+        return True
+    return isinstance(cause, OSError) and cause.errno == errno.ENODEV
+
+
 @dataclass(slots=True)
 class _LinuxResourceGuardState:
     """Owner-side held cgroup controls received before target release."""
@@ -2170,10 +2200,18 @@ class _LinuxResourceGuardState:
         """
 
         cause = error.__cause__
-        if not isinstance(cause, FileNotFoundError):
+        if not _is_collected_cgroup_error(cause):
             return False
-        if not self.outer_owner_exited():
-            return False
+        # systemd retires the controls and reaps the transient scope's owner independently, and
+        # either order is legal.  Waiting the same bounded interval the collection proof already
+        # uses keeps the plan's "the exact namespace-supervisor (pid, starttime) is gone"
+        # requirement intact while removing a false infrastructure failure on a healthy but slow
+        # teardown; a genuinely surviving owner still fails closed when the interval expires.
+        owner_deadline = time.monotonic() + _REAP_TIMEOUT_S
+        while not self.outer_owner_exited():
+            if time.monotonic() >= owner_deadline:
+                return False
+            time.sleep(_POLL_INTERVAL_S)
         # systemd can tear down control files just before it unlinks the cgroup directory.  The
         # fresh identity remains authoritative while we boundedly wait for that same object to
         # disappear; replacement or a surviving path is still a fail-closed infrastructure error.
@@ -2266,7 +2304,10 @@ def _validate_evaluator_tmpfs(
         raise ProcessExecutionError("could not inspect evaluator tmpfs bounds") from exc
     capacity_bytes = int(values.f_blocks) * int(values.f_frsize)
     configured_bytes = ((scratch.tmpfs_bytes + page_size - 1) // page_size) * page_size
-    required_bytes = scratch.byte_limit + scratch.file_limit * page_size
+    required_bytes = evaluator_tmpfs_minimum_bytes(
+        file_bytes=scratch.byte_limit,
+        files=scratch.file_limit,
+    )
     if capacity_bytes < required_bytes or capacity_bytes > configured_bytes:
         raise ProcessExecutionError("evaluator tmpfs byte bound readback mismatch")
     required_inodes = scratch.file_limit + EVALUATOR_DIRECTORY_ALLOWANCE
@@ -3139,10 +3180,37 @@ def _cleanup_process(runtime: _RunningProcess, *, abnormal: bool) -> None:
         except BaseException as exc:
             errors.append(exc)
     if runtime.scratch_tree is not None:
-        runtime.scratch_tree.close()
-        runtime.scratch_tree = None
+        if runtime.tracker_thread is not None and runtime.tracker_thread.is_alive():
+            # Deliberately leak this descriptor rather than close it.  `detach_resource_guard`
+            # above makes teardown of the cgroup descriptors atomic against an in-flight monitor
+            # read, but the tree capability has no such exclusion: `_tmpfs_hard_exhaustion` and
+            # `walk_tree` take the raw `fd` int and release the capability's own lock before
+            # issuing their syscalls, so closing here lets a surviving monitor's next fstatvfs or
+            # scandir land on a REUSED descriptor number -- an unrelated object.  A monitor that
+            # outlived its bounded join has already produced "Linux descendant monitor did not
+            # stop" in `errors`, so this run is failing regardless; one leaked FD on a failing
+            # run is strictly safer than a use-after-close on someone else's descriptor.
+            # An exclusion held across a whole tree walk is NOT the fix: unlike the short cgroup
+            # control reads `guard_lock` covers, a walk is long enough that waiting on it would
+            # trade this hazard for a cleanup hang.
+            runtime.scratch_tree = None
+        else:
+            runtime.scratch_tree.close()
+            runtime.scratch_tree = None
     if errors:
         raise errors[0]
+
+
+def _target_finished_at(runtime: _RunningProcess) -> float:
+    """When the target stopped.
+
+    ``is not None``, not truthiness: a monotonic clock can legitimately read ``0.0`` and an
+    ``or`` would silently swap it for "now".  The fallback is unreachable today -- the only
+    ``_render_result`` caller sets ``finished`` first -- but a future error path that forgets to
+    stop the clock should degrade to a defined value here rather than inherit a wrong origin.
+    """
+
+    return runtime.finished if runtime.finished is not None else time.monotonic()
 
 
 def _render_result(
@@ -3259,10 +3327,7 @@ def _render_result(
         stderr=stderr,
         exit_code=exit_code,
         signal=signal_number,
-        elapsed_ms=max(
-            0,
-            int(((runtime.finished or time.monotonic()) - runtime.started) * 1000),
-        ),
+        elapsed_ms=max(0, int((_target_finished_at(runtime) - runtime.started) * 1000)),
         termination=termination,
         stdout_limit_exceeded=stdout_capture.exceeded,
         stderr_limit_exceeded=stderr_capture.exceeded,

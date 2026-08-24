@@ -8,10 +8,11 @@ sorted-key UTF-8 JSON and never include an unselected registry entry.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, cast
+from typing import Any, Final, cast
 
 from measure_twice.agent_bench._wire import AgentInputError, WireCodec
 
@@ -24,6 +25,29 @@ _EXECUTION_PROFILE_SCHEMA_VERSION = 2
 # drift shape code-quality.md forbids -- test_models.py asserts identity, not equality.
 SANDBOX_CONTRACT_VERSION: Final[str] = "linux-bwrap-v2"
 EVALUATOR_DIRECTORY_ALLOWANCE: Final[int] = 10_001
+
+
+def evaluator_tmpfs_minimum_bytes(*, file_bytes: int, files: int) -> int:
+    """The tmpfs byte floor: logical bytes plus one page of slack per file.
+
+    ONE owner for this formula.  Config-load validation (``Ceilings``) and launch validation
+    (``EvaluatorScratch`` / ``_validate_evaluator_tmpfs``) must compute the identical floor, or a
+    profile that loads cleanly dies with ``ProcessContractError`` inside the evaluator launch --
+    the late rejection the shared ``EVALUATOR_DIRECTORY_ALLOWANCE`` already closed for inodes.
+    tmpfs charges a whole page per file, so a bound that covers only the logical bytes is not a
+    bound the kernel will honour.
+    """
+
+    return file_bytes + files * evaluator_page_size()
+
+
+def evaluator_page_size() -> int:
+    """Host page size, with the same documented 4096 fallback on every caller."""
+
+    try:
+        return int(cast("Any", os).sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, ValueError):
+        return 4096
 
 
 class ModelSpecError(AgentInputError):
@@ -308,8 +332,15 @@ class Ceilings:
             _WIRE.require_positive_int(getattr(self, name), label=f"ceilings.{name}")
         if self.evaluator_cpu_bandwidth_percent > 100:
             raise ModelSpecError("ceilings.evaluator_cpu_bandwidth_percent may not exceed 100")
-        if self.evaluator_tmpfs_bytes < self.evaluator_file_bytes:
-            raise ModelSpecError("ceilings.evaluator_tmpfs_bytes must cover evaluator_file_bytes")
+        minimum_bytes = evaluator_tmpfs_minimum_bytes(
+            file_bytes=self.evaluator_file_bytes,
+            files=self.evaluator_files,
+        )
+        if self.evaluator_tmpfs_bytes < minimum_bytes:
+            raise ModelSpecError(
+                "ceilings.evaluator_tmpfs_bytes must cover evaluator file bytes and per-file "
+                f"pages ({minimum_bytes})"
+            )
         minimum_inodes = self.evaluator_files + EVALUATOR_DIRECTORY_ALLOWANCE
         if self.evaluator_tmpfs_inodes < minimum_inodes:
             raise ModelSpecError(

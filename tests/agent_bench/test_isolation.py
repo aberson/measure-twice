@@ -53,6 +53,7 @@ from measure_twice.agent_bench.isolation import (
 from measure_twice.agent_bench.models import (
     EVALUATOR_DIRECTORY_ALLOWANCE,
     Ceilings,
+    evaluator_tmpfs_minimum_bytes,
     load_execution_profile,
 )
 from measure_twice.agent_bench.process import (
@@ -72,6 +73,9 @@ SANDBOX_HOME = "/tmp/home"  # noqa: S108 - private sandbox path asserted by the 
 # Long enough that a release-then-verify inversion is caught with a wide margin: a released
 # target reaches os.write in tens of milliseconds against a 1000 ms dwell polled every 20 ms.
 _BARRIER_DWELL_S = 1.0
+# Long enough to dominate poll granularity and interpreter start, short enough that
+# it costs the gate half a second.
+_TARGET_SLEEP_S = 0.5
 _FAKE_ROOT = PurePosixPath("/var/lib/measure-twice-test")
 
 
@@ -86,7 +90,12 @@ def _ceilings(
     tmpfs_bytes: int | None = None,
     tmpfs_inodes: int | None = None,
 ) -> Ceilings:
-    bounded_tmpfs_bytes = max(file_bytes + files * 4096, 2 * 1024 * 1024)
+    # Fourth copy of the byte floor removed: the helper is the one owner, so a page size
+    # other than 4096 can no longer make these ceilings load-valid but launch-invalid.
+    bounded_tmpfs_bytes = max(
+        evaluator_tmpfs_minimum_bytes(file_bytes=file_bytes, files=files),
+        2 * 1024 * 1024,
+    )
     return Ceilings(
         changed_paths=100,
         patch_bytes=5 * 1024 * 1024,
@@ -1408,9 +1417,11 @@ def test_linux_evaluator_kills_a_descendant_that_outlives_the_nominal_target(
                 "/workspace/ready.txt",
                 "/workspace/release.txt",
             ),
-            ceilings=_ceilings(files=16),
+            # Generous CPU headroom on purpose: the descendant polls inside the same cgroup,
+            # and this canary is about containment, not about racing a sampled CPU ceiling.
+            ceilings=_ceilings(files=16, cpu=30),
         ) as launch:
-            result = _run_launch(launch, timeout=10)
+            result = _run_launch(launch, timeout=20)
             # The nominal target exits cleanly; containment may not depend on a timeout kill.
             assert result.termination == "exited", result.stderr
             assert result.exit_code == 0
@@ -2086,3 +2097,63 @@ def test_linux_terminal_validation_upgrades_a_sampled_threshold_with_the_physica
                 assert tracker.resource_limit_observed == capacity
             finally:
                 scratch.close()
+
+
+@pytest.mark.linux_isolation
+def test_linux_evaluator_elapsed_ms_measures_the_target_not_the_harness(
+    tmp_path: Path,
+) -> None:
+    """``elapsed_ms`` spans the release barrier to target exit -- not bring-up, not teardown.
+
+    This is the discriminating anchor for the three-phase clock, and it is load-bearing rather
+    than cosmetic: Step 27 scores on this number, so charging harness time to the model is a
+    corrupted measurement in exactly the sense ``measurement-validity.md`` forbids.
+
+    The target is a no-op, so essentially ALL of the wall-clock time this call takes is harness
+    time: systemd-run scope creation, cgroup delegation and readback, the bounded private tmpfs,
+    the applied-tree copy, Bubblewrap, the FD handshake, then the teardown reap chain.  Anchoring
+    the clock at the start of ``_start_process`` (or stopping it after ``_cleanup_process``) makes
+    ``elapsed_ms`` approach the outer measurement; anchoring it at the release barrier and
+    stopping it before teardown makes it a small fraction of it.
+    """
+
+    workspace = tmp_path / "workspace-elapsed"
+    oracle = tmp_path / "oracle-elapsed"
+    runtime = tmp_path / "runtime-elapsed"
+    workspace.mkdir()
+    oracle.mkdir()
+    runtime.mkdir()
+    with _real_preflight(tmp_path) as preflight:
+        with build_evaluator_sandbox(
+            preflight,
+            workspace=workspace,
+            oracle=oracle,
+            runtime=runtime,
+            command=(
+                "/usr/bin/python3",
+                "-I",
+                "-c",
+                f"import time; time.sleep({_TARGET_SLEEP_S})",
+            ),
+            ceilings=_ceilings(files=8),
+        ) as launch:
+            outer_started = time.monotonic()
+            result = _run_launch(launch, timeout=20)
+            outer_elapsed_ms = (time.monotonic() - outer_started) * 1000
+
+    # Not vacuous: the target really ran and really exited cleanly.
+    assert result.termination == "exited", result.stderr
+    assert result.exit_code == 0
+    # The target's own sleep is INSIDE the measurement.
+    assert result.elapsed_ms >= _TARGET_SLEEP_S * 1000 * 0.9
+    # ...and the harness bring-up and teardown are OUTSIDE it.  Measuring the excluded time
+    # directly is what makes this robust: it does not assume the host is slow (an earlier
+    # version asserted a floor on total wall-clock and failed on a warm machine that stood the
+    # whole sandbox up in 98 ms), and it does not assume a ratio between two quantities that
+    # scale differently.  Anchoring the clock before bring-up, or stopping it after the reap
+    # chain, drives this difference to roughly zero.
+    excluded_ms = outer_elapsed_ms - result.elapsed_ms
+    assert excluded_ms >= 20, (
+        f"elapsed_ms {result.elapsed_ms} is charging harness time against the target "
+        f"(outer {outer_elapsed_ms:.0f} ms, excluded {excluded_ms:.0f} ms)"
+    )
