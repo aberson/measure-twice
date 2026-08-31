@@ -187,6 +187,7 @@
   .item-id { font-family:var(--mono); font-size:.755rem; color:var(--ink-3) }
   .item-prompt { font-size:.85rem; color:var(--ink-2); overflow:hidden;
                  text-overflow:ellipsis; white-space:nowrap }
+  .sample-pills { display:flex; flex-wrap:wrap; gap:3px }
   .chev { color:var(--ink-3); font-size:.7rem; text-align:center }
   .item[open] .chev { transform:rotate(90deg) }
   .item-body { padding:4px 14px 22px; background:var(--surface-2); border-top:1px solid var(--rule-2) }
@@ -317,9 +318,10 @@
 <section>
   <div class="sec-head">
     <div class="eyebrow">06 &middot; The ledger</div>
-    <h2>Every item, every model, every response</h2>
+    <h2>Every item, every model, every sample</h2>
     <p class="small">Open any row for the full prompt, the expected verdict, each model&rsquo;s complete
-      raw response, and the scorer&rsquo;s reason. Nothing is summarized away.</p>
+      raw response for every stored sample, its sample identity, and the scorer&rsquo;s reason. Nothing
+      is summarized away.</p>
   </div>
   <div class="controls">
     <div class="ctl"><span class="eyebrow">Outcome</span><div class="chips" id="f-outcome"></div></div>
@@ -544,7 +546,9 @@
     if(F.q && it.prompt.toLowerCase().indexOf(F.q)===-1 && it.id.toLowerCase().indexOf(F.q)===-1) return false;
     if(F.outcome!=="all"){
       var ms = F.model==="all" ? M : [F.model];
-      if(!ms.some(function(m){ var r=it.cells[m]; return r && r.outcome===F.outcome; })) return false;
+      if(!ms.some(function(m){
+        return (it.cells[m]||[]).some(function(r){ return r.outcome===F.outcome; });
+      })) return false;
     }
     return true;
   }
@@ -554,6 +558,7 @@
       +'</span><span class="pill p-silent">not run</span></div></div>';
     var o=OUT[r.outcome]||OUT.AMBIGUOUS;
     var head='<div class="resp-head"><span class="model-name">'+esc(m)+'</span>'
+      +'<span class="tiny mono">sample_k '+esc(r.sample_k)+'</span>'
       +'<span class="pill '+o.cls+'">'+esc(o.label)+'</span>'
       +'<span class="tiny mono">scored '+(r.score==null?"n/a":r.score.toFixed(0))
       +(r.elapsed_s==null?"":" · "+r.elapsed_s.toFixed(1)+"s")+'</span>';
@@ -582,9 +587,12 @@
       sum.className="item-head"; sum.style.gridTemplateColumns=cols;
       sum.innerHTML='<span class="item-id">'+esc(it.id)+'</span>'
         +'<span class="item-prompt">'+esc(it.prompt)+'</span>'
-        + M.map(function(m){ var r=it.cells[m];
-            return '<span>'+(r?'<span class="pill '+(OUT[r.outcome]||OUT.AMBIGUOUS).cls+'">'
-              +esc((OUT[r.outcome]||OUT.AMBIGUOUS).label)+'</span>':'')+'</span>';
+        + M.map(function(m){ var rs=it.cells[m]||[];
+            return '<span class="sample-pills">'+rs.map(function(r){
+              var o=OUT[r.outcome]||OUT.AMBIGUOUS;
+              return '<span class="pill '+o.cls+'" title="sample_k '+esc(r.sample_k)+'">s'
+                +esc(r.sample_k)+' '+esc(o.label)+'</span>';
+            }).join('')+'</span>';
           }).join('')
         +'<span class="chev">&#9656;</span>';
       d.appendChild(sum);
@@ -599,7 +607,10 @@
         +'<div class="qa"><div class="eyebrow">Prompt sent to every model, verbatim</div>'
         +'<p class="qa-text">'+esc(it.prompt)+'</p></div>'
         +'<div class="resp-grid">'
-        + M.map(function(m){return respBlock(m,it.cells[m]);}).join('')+'</div>';
+        + M.map(function(m){ var rs=it.cells[m]||[];
+            return rs.length ? rs.map(function(r){return respBlock(m,r);}).join('')
+              : respBlock(m,null);
+          }).join('')+'</div>';
       d.appendChild(body);
       frag.appendChild(d);
     });

@@ -9,11 +9,12 @@ parse-fail rather than a hand-written row. Coverage:
   * the per-cell taxonomy RECONCILES with ``report.build_run_report``'s independent roll-up
   * the reproduction gate fails loud when the run store and the scorer disagree, and the
     RED-ON-GARBAGE ANCHOR proves that gate can actually go red (a mutated stored ``parsed`` raises)
+  * every (item, model, sample) cell in a two-sample run survives into the report and HTML payload
   * untrusted model text containing ``</script>`` and markup cannot escape the JSON island
   * a non-verdict suite and an unscored run both fail loud rather than rendering a hollow page
   * DETERMINISTIC render: same run -> byte-identical HTML (no render timestamp)
   * facets are auto-derived from suite tags and ordered by the suite's AUTHORED difficulty prior
-  * CLI wiring: ``mt report <run_id> --html`` writes the page and does not dump it to stdout
+  * CLI wiring: HTML is file-only, while ``--compare`` takes precedence and prints its Markdown
 """
 
 from __future__ import annotations
@@ -78,7 +79,13 @@ def _taxonomy_suite() -> Suite:
     )
 
 
-def _sweep(suite: Suite, *, out_dir: Path, answer=lambda p: _ANSWERS[_iid(p)]) -> RunResult:
+def _sweep(
+    suite: Suite,
+    *,
+    out_dir: Path,
+    answer=lambda p: _ANSWERS[_iid(p)],
+    samples_per_cell: int = 1,
+) -> RunResult:
     """Sweep ``suite`` with the REAL deterministic scorer through the shared stub adapters."""
     stub = StubAdapters(local=answer, claude=answer)
     return run(
@@ -86,7 +93,7 @@ def _sweep(suite: Suite, *, out_dir: Path, answer=lambda p: _ANSWERS[_iid(p)]) -
         config=RunConfig(),
         out_dir=out_dir,
         roster=["haiku"],
-        samples_per_cell=1,
+        samples_per_cell=samples_per_cell,
         scorer=make_deterministic_scorer(suite.scoring),
         local_transport_factory=stub.local_factory(),
         claude_runner_factory=stub.claude_factory(),
@@ -108,12 +115,7 @@ def test_three_kinds_of_zero_are_separated(tmp_path: Path) -> None:
     result = _sweep(_taxonomy_suite(), out_dir=tmp_path)
     report = build_transparency_report(result.run_id, tmp_path)
 
-    outcomes = {
-        item.item_id: cell.outcome
-        for item in report.items
-        for cell in [item.cells["haiku"]]
-        if cell is not None
-    }
+    outcomes = {item.item_id: item.cells["haiku"][0].outcome for item in report.items}
     assert outcomes == {
         "ok": OUTCOME_CORRECT,
         "wrong": OUTCOME_WRONG,
@@ -121,8 +123,8 @@ def test_three_kinds_of_zero_are_separated(tmp_path: Path) -> None:
         "silent": OUTCOME_NO_VERDICT,
     }
     # All three zero-scoring buckets really did score 0 — they differ in CAUSE, not in score.
-    cells = [i.cells["haiku"] for i in report.items]
-    zeros = [c for c in cells if c is not None and c.score == 0.0]
+    cells = [i.cells["haiku"][0] for i in report.items]
+    zeros = [c for c in cells if c.score == 0.0]
     assert len(zeros) == 3
     assert len({c.outcome for c in zeros}) == 3
 
@@ -136,8 +138,8 @@ def test_taxonomy_reconciles_with_the_independent_roll_up(tmp_path: Path) -> Non
     parse_fails = sum(
         1
         for item in report.items
-        for cell in [item.cells["haiku"]]
-        if cell is not None and cell.outcome in (OUTCOME_REFUSED, OUTCOME_NO_VERDICT)
+        for cell in item.cells["haiku"]
+        if cell.outcome in (OUTCOME_REFUSED, OUTCOME_NO_VERDICT)
     )
     assert parse_fails == roll_up.total_parse_fail
 
@@ -146,8 +148,7 @@ def test_refusal_records_both_recognized_labels(tmp_path: Path) -> None:
     """A refusal names the conflicting labels, so the reader can see WHY the scorer declined."""
     result = _sweep(_taxonomy_suite(), out_dir=tmp_path)
     report = build_transparency_report(result.run_id, tmp_path)
-    cell = next(i.cells["haiku"] for i in report.items if i.item_id == "refuse")
-    assert cell is not None
+    cell = next(i.cells["haiku"][0] for i in report.items if i.item_id == "refuse")
     assert set(cell.labels_present) == {"pass", "flag"}
     # Its FIRST label was the expected one -- the diagnostic, which must not change the score.
     assert cell.diagnostic_recoverable is True
@@ -163,8 +164,7 @@ def test_a_label_embedded_in_a_longer_word_is_not_a_verdict(tmp_path: Path) -> N
         answer=lambda p: "`flag` because the password check is inverted",
     )
     report = build_transparency_report(result.run_id, tmp_path)
-    cell = next(i.cells["haiku"] for i in report.items if i.item_id == "wrong")
-    assert cell is not None
+    cell = next(i.cells["haiku"][0] for i in report.items if i.item_id == "wrong")
     assert cell.labels_present == ("flag",)  # 'pass' inside 'password' is not a label
     assert cell.outcome == OUTCOME_CORRECT  # item 'wrong' expects flag; this answer is right
 
@@ -176,6 +176,67 @@ def test_reproduction_gate_passes_on_an_untampered_run(tmp_path: Path) -> None:
     result = _sweep(_taxonomy_suite(), out_dir=tmp_path)
     report = build_transparency_report(result.run_id, tmp_path)
     assert report.reproduced_cells == 4
+
+
+def test_two_sample_run_preserves_and_renders_every_stored_cell(tmp_path: Path) -> None:
+    """Every (item, model, sample_k) row survives both the report model and JSON island."""
+    result = _sweep(_taxonomy_suite(), out_dir=tmp_path, samples_per_cell=2)
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    stored = {
+        (
+            row["item_id"],
+            row["model"],
+            row["sample_k"],
+            row["response_raw"],
+            row["parsed"],
+            row["score"],
+        )
+        for row in rows
+    }
+    assert len(rows) == len(stored) == 8
+
+    report = build_transparency_report(result.run_id, tmp_path)
+    represented = {
+        (
+            item.item_id,
+            model,
+            cell.sample_k,
+            cell.raw,
+            cell.parsed,
+            cell.score,
+        )
+        for item in report.items
+        for model, cells in item.cells.items()
+        for cell in cells
+    }
+    assert represented == stored
+    assert report.reproduced_cells == len(rows)
+    assert all([cell.sample_k for cell in item.cells["haiku"]] == [0, 1] for item in report.items)
+
+    payload = _island(render_transparency_report(report))
+    payload_items = payload["items"]
+    assert isinstance(payload_items, list)
+    rendered: set[tuple[object, ...]] = set()
+    for item in payload_items:
+        assert isinstance(item, dict)
+        cells_by_model = item["cells"]
+        assert isinstance(cells_by_model, dict)
+        for model, cells in cells_by_model.items():
+            assert isinstance(cells, list)
+            for cell in cells:
+                assert isinstance(cell, dict)
+                rendered.add(
+                    (
+                        item["id"],
+                        model,
+                        cell["sample_k"],
+                        cell["raw"],
+                        cell["parsed"],
+                        cell["score"],
+                    )
+                )
+    assert rendered == stored
 
 
 def test_reproduction_gate_goes_red_when_the_store_is_tampered_with(tmp_path: Path) -> None:
@@ -323,3 +384,30 @@ def test_cli_html_surfaces_a_report_error_as_rc_1(
     captured = capsys.readouterr()
     assert rc == 1
     assert captured.err.startswith("report: ")
+
+
+def test_cli_compare_takes_precedence_over_html_and_prints_markdown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = _sweep(_taxonomy_suite(), out_dir=tmp_path)
+    second = _sweep(_taxonomy_suite(), out_dir=tmp_path)
+
+    rc = main(
+        [
+            "report",
+            first.run_id,
+            "--compare",
+            second.run_id,
+            "--html",
+            "--out",
+            str(tmp_path),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "# measure-twice cross-run comparison" in captured.out
+    assert first.run_id in captured.out
+    assert second.run_id in captured.out
+    assert (tmp_path / "reports" / f"compare-{first.run_id}.md").is_file()
+    assert not (tmp_path / "reports" / f"{first.run_id}.html").exists()

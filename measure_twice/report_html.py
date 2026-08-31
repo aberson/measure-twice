@@ -85,9 +85,10 @@ _TEMPLATE_NAME = "report_template.html"
 
 @dataclass(frozen=True, slots=True)
 class CellReport:
-    """One (item, model) cell: what was returned, what the scorer made of it, and why."""
+    """One (item, model, sample) cell: its identity, response, score, and explanation."""
 
     model: str
+    sample_k: int
     raw: str
     parsed: str | None
     score: float | None
@@ -101,7 +102,7 @@ class CellReport:
 
 @dataclass(frozen=True, slots=True)
 class ItemReport:
-    """One suite item plus every model's cell for it, in manifest roster order."""
+    """One suite item plus every model's sample cells, in manifest and sample order."""
 
     item_id: str
     prompt: str
@@ -109,7 +110,7 @@ class ItemReport:
     prior: float | None
     provenance: str
     facets: dict[str, str]
-    cells: dict[str, CellReport | None]
+    cells: dict[str, list[CellReport]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +188,7 @@ def _classify(row: RunRow, item: Item, labels: Sequence[str]) -> CellReport:
     if row.error is not None:
         return CellReport(
             model=row.model,
+            sample_k=row.sample_k,
             raw=raw,
             parsed=row.parsed,
             score=row.score,
@@ -200,6 +202,7 @@ def _classify(row: RunRow, item: Item, labels: Sequence[str]) -> CellReport:
     if row.scorer == NO_RESPONSE_SCORER:
         return CellReport(
             model=row.model,
+            sample_k=row.sample_k,
             raw=raw,
             parsed=row.parsed,
             score=row.score,
@@ -215,7 +218,7 @@ def _classify(row: RunRow, item: Item, labels: Sequence[str]) -> CellReport:
     outcome_recheck = score_verdict(item, raw, labels=labels)
     if (outcome_recheck.parsed, outcome_recheck.score) != (row.parsed, row.score):
         raise ReportError(
-            f"cell {row.item_id}/{row.model} does not reproduce: stored "
+            f"cell {row.item_id}/{row.model}/sample_k={row.sample_k} does not reproduce: stored "
             f"(parsed={row.parsed!r}, score={row.score!r}) but re-scoring the stored response "
             f"gives (parsed={outcome_recheck.parsed!r}, score={outcome_recheck.score!r}). "
             "The run store and the scorer disagree; no report was written."
@@ -257,6 +260,7 @@ def _classify(row: RunRow, item: Item, labels: Sequence[str]) -> CellReport:
         )
     return CellReport(
         model=row.model,
+        sample_k=row.sample_k,
         raw=raw,
         parsed=row.parsed,
         score=row.score,
@@ -329,9 +333,11 @@ def build_transparency_report(run_id: str, out_dir: str | Path = "data") -> Tran
     roll_up = build_run_report(run_id, out_dir)
     models = [model.model for model in roll_up.models]
 
-    rows_by_cell: dict[tuple[str, str], RunRow] = {}
+    rows_by_cell: dict[tuple[str, str], list[RunRow]] = {}
     for row in rows:
-        rows_by_cell.setdefault((row.item_id, row.model), row)
+        rows_by_cell.setdefault((row.item_id, row.model), []).append(row)
+    for cell_rows in rows_by_cell.values():
+        cell_rows.sort(key=lambda row: row.sample_k)
     if not any(row.scorer == VERDICT_SCORER for row in rows):
         raise ReportError(
             f"run {run_id} has no verdict-scored cells to report on — score it first "
@@ -342,15 +348,11 @@ def build_transparency_report(run_id: str, out_dir: str | Path = "data") -> Tran
     items: list[ItemReport] = []
     reproduced = 0
     for item in suite.items:
-        cells: dict[str, CellReport | None] = {}
+        cells: dict[str, list[CellReport]] = {}
         for model in models:
-            cell_row = rows_by_cell.get((item.id, model))
-            if cell_row is None:
-                cells[model] = None
-                continue
-            cells[model] = _classify(cell_row, item, labels)
-            if cell_row.scorer == VERDICT_SCORER:
-                reproduced += 1
+            cell_rows = rows_by_cell.get((item.id, model), [])
+            cells[model] = [_classify(row, item, labels) for row in cell_rows]
+            reproduced += sum(row.scorer == VERDICT_SCORER for row in cell_rows)
         item_facets = {
             prefix: value
             for prefix, values in facets
@@ -401,8 +403,7 @@ def _median(values: Sequence[float]) -> float | None:
 
 def _model_totals(report: TransparencyReport, model: str) -> dict[str, object]:
     """Per-model roll-up computed from the SAME cells the page renders (no second source)."""
-    cells = [item.cells[model] for item in report.items if item.cells.get(model) is not None]
-    graded = [c for c in cells if c is not None]
+    graded = [cell for item in report.items for cell in item.cells.get(model, [])]
     scores = [c.score for c in graded if c.score is not None]
     outcomes: dict[str, int] = {}
     for cell in graded:
@@ -451,8 +452,9 @@ def _facet_payload(report: TransparencyReport) -> list[dict[str, object]]:
             for model in report.models:
                 cell_scores = [
                     c.score
-                    for c in (i.cells.get(model) for i in members)
-                    if c is not None and c.score is not None
+                    for item in members
+                    for c in item.cells.get(model, [])
+                    if c.score is not None
                 ]
                 scores[model] = 100.0 * sum(cell_scores) / len(cell_scores) if cell_scores else None
             rows.append({"value": value, "n": len(members), "scores": scores})
@@ -466,14 +468,29 @@ def _provenance_rows(report: TransparencyReport) -> list[list[str]]:
     budget = ""
     if isinstance(budgets, Mapping):
         budget = str(budgets.get("max_calls", ""))
-    cells = sum(1 for item in report.items for m in report.models if item.cells.get(m))
+    cells = sum(len(item.cells.get(model, [])) for item in report.items for model in report.models)
+    samples = manifest.get("samples_per_cell")
+    planned_cells = (
+        len(report.items) * len(report.models) * samples if isinstance(samples, int) else None
+    )
     rows = [
         ["Run id", report.run_id],
         ["Suite", report.suite],
         ["Suite hash", report.suite_hash],
         ["Roster", ", ".join(report.models)],
-        ["Items x models", f"{len(report.items)} x {len(report.models)} = {cells} cells"],
-        ["Samples per cell", str(manifest.get("samples_per_cell", ""))],
+        [
+            "Items x models x samples",
+            (
+                f"{len(report.items)} x {len(report.models)} x {samples} = "
+                f"{planned_cells} planned cells"
+                if planned_cells is not None
+                else f"{len(report.items)} x {len(report.models)} x {samples}"
+            ),
+        ],
+        [
+            "Stored cells",
+            f"{cells} / {planned_cells} planned" if planned_cells is not None else str(cells),
+        ],
         ["Call budget", f"{cells} / {budget} used" if budget else str(cells)],
         ["Started (UTC)", report.started_utc],
         ["Config source", str(manifest.get("config_source", ""))],
@@ -548,10 +565,9 @@ def _payload(report: TransparencyReport) -> dict[str, object]:
                 "provenance": item.provenance,
                 "facets": item.facets,
                 "cells": {
-                    model: (
-                        None
-                        if cell is None
-                        else {
+                    model: [
+                        {
+                            "sample_k": cell.sample_k,
                             "raw": cell.raw,
                             "parsed": cell.parsed,
                             "score": cell.score,
@@ -561,8 +577,9 @@ def _payload(report: TransparencyReport) -> dict[str, object]:
                             "labels_present": list(cell.labels_present),
                             "diagnostic_recoverable": cell.diagnostic_recoverable,
                         }
-                    )
-                    for model, cell in item.cells.items()
+                        for cell in cells
+                    ]
+                    for model, cells in item.cells.items()
                 },
             }
             for item in report.items

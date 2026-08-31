@@ -331,6 +331,7 @@ def _handle_report(args: argparse.Namespace) -> int:
     ``<out>/reports/`` (plan §7); a :class:`ReportError` surfaces as a clean non-zero exit.
     """
     out_dir = Path(args.out)
+    print_to_stdout = True
     try:
         if args.compare:
             comparison = build_comparison([args.run_id, *args.compare], out_dir)
@@ -339,6 +340,7 @@ def _handle_report(args: argparse.Namespace) -> int:
         elif args.html:
             rendered = render_transparency_report(build_transparency_report(args.run_id, out_dir))
             dest_name = f"{args.run_id}.html"
+            print_to_stdout = False
         elif args.jsonl:
             rendered = run_report_jsonl(build_run_report(args.run_id, out_dir))
             dest_name = f"{args.run_id}.jsonl"
@@ -348,7 +350,7 @@ def _handle_report(args: argparse.Namespace) -> int:
     except ReportError as exc:
         print(f"report: {exc}", file=sys.stderr)
         return 1
-    if not args.html:  # a whole HTML page is a file, not terminal output
+    if print_to_stdout:  # only the selected HTML rendering is file-only
         print(rendered)
     reports_dir = out_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
