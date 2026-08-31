@@ -66,6 +66,7 @@ from measure_twice.report import (
     render_run_report,
     run_report_jsonl,
 )
+from measure_twice.report_html import build_transparency_report, render_transparency_report
 from measure_twice.runner import RunError, Scorer, collect_only_scorer
 from measure_twice.scoring import (
     JUDGE_SAMPLE_K,
@@ -335,6 +336,9 @@ def _handle_report(args: argparse.Namespace) -> int:
             comparison = build_comparison([args.run_id, *args.compare], out_dir)
             rendered = render_comparison(comparison)
             dest_name = f"compare-{args.run_id}.md"
+        elif args.html:
+            rendered = render_transparency_report(build_transparency_report(args.run_id, out_dir))
+            dest_name = f"{args.run_id}.html"
         elif args.jsonl:
             rendered = run_report_jsonl(build_run_report(args.run_id, out_dir))
             dest_name = f"{args.run_id}.jsonl"
@@ -344,7 +348,8 @@ def _handle_report(args: argparse.Namespace) -> int:
     except ReportError as exc:
         print(f"report: {exc}", file=sys.stderr)
         return 1
-    print(rendered)
+    if not args.html:  # a whole HTML page is a file, not terminal output
+        print(rendered)
     reports_dir = out_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     dest = reports_dir / dest_name
@@ -668,9 +673,15 @@ def _build_parser(
         help="also-compare run id(s); renders a cross-run table (equal suite hash required)",
     )
     report_parser.add_argument(
+        "--html",
+        action="store_true",
+        help="write a self-contained item-level HTML page: every item, every raw response, and "
+        "the scorer's reason for each cell (verdict suites only; ignored with --compare)",
+    )
+    report_parser.add_argument(
         "--jsonl",
         action="store_true",
-        help="emit per-model JSONL instead of markdown (ignored with --compare)",
+        help="emit per-model JSONL instead of markdown (ignored with --compare or --html)",
     )
     report_parser.add_argument(
         "--out",

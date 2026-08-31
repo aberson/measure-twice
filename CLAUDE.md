@@ -27,6 +27,8 @@ uv run mt validate suites/smoke.json
 uv run mt smoke --claude
 uv run mt run --suite suites/tier-judging-v0.json --models general-35b,haiku,sonnet
 uv run mt report <run_id>
+uv run mt report <run_id> --html   # item-level page: every item, raw response, scorer reason
+.\scripts\report-latest-html.ps1   # same for the newest run, then open it (observatory verb)
 uv run mt claims audit
 uv run mt agent validate suites/agents/smoke --structure-only
 .\scripts\test-agent-bench-wsl.ps1 -Distribution Ubuntu   # real Linux containment gate
@@ -38,6 +40,7 @@ uv run mt agent validate suites/agents/smoke --structure-only
 
 ```
 measure_twice/           # package: config, suite, runner, ledger, author, report, cli
+  report_html.py         # item-level transparency page + report_template.html (wheel data)
   adapters/              # local.py (OpenAI-compat), claude_cli.py (subprocess + OAuth)
   scoring/               # deterministic.py (verdict/exact + spine), judge.py (k=3 median)
   agent_bench/           # models, analysis, suite (strict loaders + hashing), cli,

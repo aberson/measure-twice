@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  /* System stacks only: a report on disk must render with no network. */
+  :root {
+    --paper:#F6F7F6; --surface:#FFFFFF; --surface-2:#FBFCFB;
+    --ink:#14181A; --ink-2:#454F54; --ink-3:#6B767C;
+    --rule:#D6DCDA; --rule-2:#E8ECEA;
+    --accent:#12595E; --accent-soft:#E2EFEF;
+    --ok:#2A6B41;     --ok-bg:#E4EFE7;    --ok-line:#7FB894;
+    --miss:#9C5518;   --miss-bg:#F6E9DC;  --miss-line:#D8A473;
+    --refuse:#6F3E92; --refuse-bg:#EDE5F4; --refuse-line:#B48FD0;
+    --silent:#4E5A61; --silent-bg:#E6EAEC; --silent-line:#9AA6AD;
+    --shadow:0 1px 2px rgba(20,24,26,.06), 0 8px 24px -16px rgba(20,24,26,.18);
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,"Cascadia Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper:#0F1315; --surface:#171C1F; --surface-2:#1B2124;
+      --ink:#E9EEED; --ink-2:#AAB5B9; --ink-3:#7E8A92;
+      --rule:#2B3337; --rule-2:#212829;
+      --accent:#54B7AA; --accent-soft:#123331;
+      --ok:#74C490;     --ok-bg:#16301F;    --ok-line:#3E7A54;
+      --miss:#DCA066;   --miss-bg:#332310;  --miss-line:#8A5E2E;
+      --refuse:#BB96DC; --refuse-bg:#281C34; --refuse-line:#6E4E8C;
+      --silent:#98A5AD; --silent-bg:#1E2528; --silent-line:#5A666D;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.7);
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper:#0F1315; --surface:#171C1F; --surface-2:#1B2124;
+    --ink:#E9EEED; --ink-2:#AAB5B9; --ink-3:#7E8A92;
+    --rule:#2B3337; --rule-2:#212829;
+    --accent:#54B7AA; --accent-soft:#123331;
+    --ok:#74C490;     --ok-bg:#16301F;    --ok-line:#3E7A54;
+    --miss:#DCA066;   --miss-bg:#332310;  --miss-line:#8A5E2E;
+    --refuse:#BB96DC; --refuse-bg:#281C34; --refuse-line:#6E4E8C;
+    --silent:#98A5AD; --silent-bg:#1E2528; --silent-line:#5A666D;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.7);
+  }
+
+  *,*::before,*::after { box-sizing:border-box }
+  body {
+    background:var(--paper); color:var(--ink); margin:0;
+    font-family:var(--sans); font-size:15px; line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap { max-width:1140px; margin:0 auto; padding:0 28px 96px }
+  @media (max-width:640px) { .wrap { padding:0 16px 64px } }
+
+  h1,h2,h3 { margin:0; text-wrap:balance }
+  h1 { font-size:clamp(1.9rem,4.2vw,2.9rem); font-weight:700; letter-spacing:-.022em; line-height:1.05 }
+  h2 { font-size:1.3rem; font-weight:650; letter-spacing:-.012em }
+  h3 { font-size:1rem; font-weight:650 }
+  p { margin:0 }
+  a { color:var(--accent); text-underline-offset:2px }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:2px }
+
+  .mono { font-family:var(--mono); font-variant-numeric:tabular-nums }
+  .eyebrow {
+    font-family:var(--mono); font-size:.685rem; font-weight:500;
+    letter-spacing:.15em; text-transform:uppercase; color:var(--ink-3);
+  }
+  .lede { font-size:1.04rem; color:var(--ink-2); max-width:66ch }
+  .small { font-size:.85rem; color:var(--ink-2) }
+  .tiny { font-size:.78rem; color:var(--ink-3) }
+
+  header.plate {
+    border-bottom:2px solid var(--ink); padding:52px 0 22px; margin-bottom:30px;
+    display:flex; flex-direction:column; gap:16px;
+  }
+  .plate-top { display:flex; justify-content:space-between; align-items:flex-start; gap:24px; flex-wrap:wrap }
+  .stamp {
+    font-family:var(--mono); font-size:.7rem; letter-spacing:.08em;
+    border:1px solid var(--rule); border-radius:2px; padding:7px 11px;
+    color:var(--ink-2); background:var(--surface); white-space:nowrap;
+  }
+
+  section { margin:0 0 50px }
+  .sec-head {
+    display:flex; flex-direction:column; gap:7px;
+    margin-bottom:18px; padding-top:10px; border-top:1px solid var(--rule);
+  }
+
+  .prov { background:var(--surface); border:1px solid var(--rule); border-radius:3px;
+          box-shadow:var(--shadow); overflow:hidden }
+  .prov-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(232px,1fr)) }
+  .prov-cell { padding:15px 18px; border-right:1px solid var(--rule-2); border-bottom:1px solid var(--rule-2) }
+  .prov-cell dt {
+    font-family:var(--mono); font-size:.655rem; letter-spacing:.13em;
+    text-transform:uppercase; color:var(--ink-3); margin-bottom:5px;
+  }
+  .prov-cell dd { margin:0; font-family:var(--mono); font-size:.855rem;
+                  word-break:break-all; font-variant-numeric:tabular-nums }
+  .prereg { padding:19px 20px; background:var(--accent-soft); border-top:1px solid var(--rule) }
+  .prereg .eyebrow { color:var(--accent) }
+  .prereg blockquote {
+    margin:9px 0 0; font-size:.96rem; line-height:1.62; color:var(--ink);
+    border-left:2px solid var(--accent); padding-left:14px;
+  }
+
+  .readout { display:grid; grid-template-columns:repeat(auto-fit,minmax(268px,1fr)); gap:16px }
+  .card { background:var(--surface); border:1px solid var(--rule); border-radius:3px;
+          padding:20px; box-shadow:var(--shadow) }
+  .score-row { display:flex; align-items:baseline; gap:11px; margin:4px 0 2px }
+  .score { font-size:3.2rem; font-weight:700; line-height:1; letter-spacing:-.03em;
+           font-variant-numeric:tabular-nums }
+  .score-of { font-family:var(--mono); font-size:.8rem; color:var(--ink-3) }
+  .model-name { font-family:var(--mono); font-size:.94rem; font-weight:600; letter-spacing:.02em }
+
+  .gauge { margin-top:15px; position:relative; height:34px }
+  .gauge-track { position:absolute; inset:auto 0 12px; height:7px; background:var(--rule-2); border-radius:1px }
+  .gauge-fill { position:absolute; left:0; bottom:12px; height:7px; background:var(--accent); border-radius:1px }
+  .gauge-floor { position:absolute; bottom:6px; width:2px; height:19px; background:var(--miss) }
+  .gauge-label {
+    position:absolute; bottom:23px; font-family:var(--mono); font-size:.63rem;
+    color:var(--miss); white-space:nowrap; transform:translateX(-50%);
+  }
+  .gauge-scale {
+    position:absolute; inset:auto 0 0; display:flex; justify-content:space-between;
+    font-family:var(--mono); font-size:.63rem; color:var(--ink-3);
+  }
+
+  .stack { display:flex; height:30px; border-radius:2px; overflow:hidden;
+           border:1px solid var(--rule); margin:9px 0 7px }
+  .stack span { display:block; height:100% }
+  .seg-ok { background:var(--ok-line) }
+  .seg-miss { background:var(--miss-line) }
+  .seg-refuse { background:var(--refuse-line) }
+  .seg-silent { background:var(--silent-line) }
+  .legend { display:flex; flex-wrap:wrap; gap:7px 16px; margin-top:11px }
+  .lg { display:flex; align-items:center; gap:7px; font-size:.81rem; color:var(--ink-2) }
+  .sw { width:11px; height:11px; border-radius:2px; flex:none }
+
+  .pill {
+    display:inline-flex; align-items:center; gap:5px; padding:2px 8px; border-radius:2px;
+    font-family:var(--mono); font-size:.7rem; font-weight:500; letter-spacing:.03em;
+    white-space:nowrap; border:1px solid transparent;
+  }
+  .p-ok { background:var(--ok-bg); color:var(--ok); border-color:var(--ok-line) }
+  .p-miss { background:var(--miss-bg); color:var(--miss); border-color:var(--miss-line) }
+  .p-refuse { background:var(--refuse-bg); color:var(--refuse); border-color:var(--refuse-line) }
+  .p-silent { background:var(--silent-bg); color:var(--silent); border-color:var(--silent-line) }
+
+  .tw { overflow-x:auto; border:1px solid var(--rule); border-radius:3px;
+        background:var(--surface); box-shadow:var(--shadow) }
+  table { border-collapse:collapse; width:100%; font-size:.87rem }
+  th,td { text-align:left; padding:10px 13px; border-bottom:1px solid var(--rule-2) }
+  thead th {
+    font-family:var(--mono); font-size:.655rem; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--ink-3); font-weight:500; background:var(--surface-2);
+    border-bottom:1px solid var(--rule);
+  }
+  td.num,th.num { text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums }
+  tbody tr:last-child td { border-bottom:none }
+
+  .controls { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-end; margin-bottom:14px }
+  .ctl { display:flex; flex-direction:column; gap:6px }
+  .ctl > .eyebrow { font-size:.63rem }
+  .chips { display:flex; flex-wrap:wrap; gap:5px }
+  .chip {
+    font-family:var(--mono); font-size:.73rem; padding:4px 10px;
+    border:1px solid var(--rule); background:var(--surface); color:var(--ink-2);
+    border-radius:2px; cursor:pointer;
+  }
+  .chip:hover { border-color:var(--accent); color:var(--ink) }
+  .chip[aria-pressed="true"] { background:var(--accent); border-color:var(--accent); color:var(--paper) }
+  input[type="search"] {
+    font-family:var(--mono); font-size:.8rem; padding:6px 10px; min-width:210px;
+    border:1px solid var(--rule); border-radius:2px; background:var(--surface); color:var(--ink);
+  }
+  .count { font-family:var(--mono); font-size:.79rem; color:var(--ink-3); margin-left:auto }
+
+  .item { border-bottom:1px solid var(--rule-2) }
+  .item:last-child { border-bottom:none }
+  .item-head {
+    display:grid; gap:12px; align-items:center; padding:11px 14px; cursor:pointer;
+    list-style:none;
+  }
+  .item-head::-webkit-details-marker { display:none }
+  .item-head:hover { background:var(--surface-2) }
+  .item-id { font-family:var(--mono); font-size:.755rem; color:var(--ink-3) }
+  .item-prompt { font-size:.85rem; color:var(--ink-2); overflow:hidden;
+                 text-overflow:ellipsis; white-space:nowrap }
+  .chev { color:var(--ink-3); font-size:.7rem; text-align:center }
+  .item[open] .chev { transform:rotate(90deg) }
+  .item-body { padding:4px 14px 22px; background:var(--surface-2); border-top:1px solid var(--rule-2) }
+  .meta-row { display:flex; flex-wrap:wrap; gap:6px; margin:14px 0 }
+  .tag {
+    font-family:var(--mono); font-size:.68rem; padding:2px 7px; border:1px solid var(--rule);
+    border-radius:2px; color:var(--ink-3); background:var(--surface);
+  }
+  .qa { margin:12px 0 0; padding:12px 14px; background:var(--surface);
+        border:1px solid var(--rule); border-radius:2px }
+  .qa-text { margin-top:6px; font-size:.88rem; line-height:1.62; white-space:pre-wrap }
+  .resp-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(310px,1fr));
+               gap:12px; margin-top:12px }
+  .resp { background:var(--surface); border:1px solid var(--rule); border-radius:2px; overflow:hidden }
+  .resp-head {
+    display:flex; align-items:center; gap:9px; padding:9px 12px; flex-wrap:wrap;
+    border-bottom:1px solid var(--rule-2); background:var(--surface-2);
+  }
+  .resp-raw {
+    margin:0; padding:12px; font-family:var(--mono); font-size:.775rem; line-height:1.58;
+    white-space:pre-wrap; word-break:break-word; max-height:270px; overflow:auto; color:var(--ink);
+  }
+  .why { padding:10px 12px; border-top:1px dashed var(--rule); font-size:.81rem;
+         color:var(--ink-2); background:var(--surface-2) }
+  .why b { color:var(--ink); font-weight:600 }
+
+  .note {
+    border-left:3px solid var(--accent); background:var(--surface); padding:14px 18px;
+    border-radius:0 3px 3px 0; box-shadow:var(--shadow);
+  }
+  .warn { border-left-color:var(--miss) }
+  .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px }
+  ul.tight { margin:9px 0 0; padding-left:19px }
+  ul.tight li { margin-bottom:7px }
+  code { font-family:var(--mono); font-size:.855em; background:var(--rule-2);
+         padding:1px 5px; border-radius:2px }
+  pre.cmd {
+    margin:10px 0 0; padding:13px 15px; background:var(--surface); border:1px solid var(--rule);
+    border-radius:3px; overflow-x:auto; font-family:var(--mono); font-size:.79rem; line-height:1.62;
+  }
+  footer { border-top:1px solid var(--rule); padding-top:20px }
+  @media (prefers-reduced-motion:reduce) { * { transition:none !important; animation:none !important } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="plate">
+  <div class="plate-top">
+    <div>
+      <div class="eyebrow">measure-twice &middot; item-level reading</div>
+      <h1 id="h-title"></h1>
+    </div>
+    <div class="stamp" id="stamp"></div>
+  </div>
+  <p class="lede">
+    Every item that ran, every response returned, every scoring decision and the reason for it &mdash;
+    unabridged, so the numbers can be checked rather than believed.
+  </p>
+</header>
+
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">01 &middot; Provenance</div>
+    <h2>What was run, and under what commitment</h2>
+    <p class="small">The suite was snapshotted into the run directory and hashed, so the instrument
+      that produced these numbers is pinned to them. Any preregistered claim was recorded in the
+      manifest before results were seen.</p>
+  </div>
+  <div class="prov">
+    <dl class="prov-grid" id="prov"></dl>
+    <div class="prereg" id="prereg-box" hidden>
+      <div class="eyebrow">Preregistered claim &mdash; recorded before the run</div>
+      <blockquote id="prereg"></blockquote>
+    </div>
+  </div>
+  <pre class="cmd" id="repro"></pre>
+</section>
+
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">02 &middot; Headline</div>
+    <h2>Suite score per model</h2>
+    <p class="small">Score is the suite mean &times; 100. The marker on each gauge is the
+      <strong>degenerate floor</strong> &mdash; what a model scores by ignoring the question and always
+      answering the single most common expected label. A score at the floor carries no evidence of
+      reasoning.</p>
+  </div>
+  <div class="readout" id="readout"></div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">03 &middot; Anatomy</div>
+    <h2>Three different kinds of zero</h2>
+    <p class="small">A zero-scored cell can mean three unrelated things. Only the first is a judging
+      failure; collapsing them into one number hides that.</p>
+  </div>
+  <div class="grid2" id="anatomy"></div>
+  <div class="note" id="answered-note" style="margin-top:18px"></div>
+</section>
+
+<section id="sec-diagnostic">
+  <div class="sec-head">
+    <div class="eyebrow">04 &middot; Diagnostic</div>
+    <h2>How much of the gap is formatting rather than judging?</h2>
+  </div>
+  <div class="note warn">
+    <p class="small"><strong>This is a diagnostic, not a score.</strong> It re-reads the same stored
+      responses under a deliberately different rule &mdash; first recognizable label wins &mdash; purely
+      to size how much of each model&rsquo;s zero-scoring is answer formatting rather than judgment.
+      Choosing a parser after seeing the data is how a benchmark flatters itself, so this number is
+      reported beside the real score and must never be quoted in its place.</p>
+    <div class="tw" style="margin-top:12px"><table id="diagtbl"></table></div>
+  </div>
+</section>
+
+<section id="sec-facets">
+  <div class="sec-head">
+    <div class="eyebrow">05 &middot; Breakdown</div>
+    <h2>Score by suite-authored grouping</h2>
+    <p class="small">Groups come from the suite&rsquo;s own item tags. These are measured scores per
+      group, not a re-estimated difficulty.</p>
+  </div>
+  <div class="grid2" id="facets"></div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">06 &middot; The ledger</div>
+    <h2>Every item, every model, every response</h2>
+    <p class="small">Open any row for the full prompt, the expected verdict, each model&rsquo;s complete
+      raw response, and the scorer&rsquo;s reason. Nothing is summarized away.</p>
+  </div>
+  <div class="controls">
+    <div class="ctl"><span class="eyebrow">Outcome</span><div class="chips" id="f-outcome"></div></div>
+    <div class="ctl"><span class="eyebrow">Model</span><div class="chips" id="f-model"></div></div>
+    <div class="ctl" id="ctl-facets"></div>
+    <div class="ctl"><span class="eyebrow">Search prompts</span>
+      <input type="search" id="q" placeholder="substring of a prompt or item id"
+             aria-label="Search item prompts"></div>
+    <div class="count" id="count"></div>
+  </div>
+  <div class="tw" style="overflow-x:visible">
+    <div class="item-head" id="ledger-head" style="cursor:default;background:var(--surface-2);
+         border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:.655rem;
+         letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3)"></div>
+    <div id="ledger"></div>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">07 &middot; Limits</div>
+    <h2>What this reading does <em>not</em> show</h2>
+  </div>
+  <div class="note warn"><ul class="tight" id="limits"></ul></div>
+</section>
+
+<footer>
+  <p class="tiny" id="foot"></p>
+</footer>
+
+</div>
+
+<script id="payload" type="application/json">__DATA__</script>
+<script>
+(function(){
+  "use strict";
+  var D = JSON.parse(document.getElementById("payload").textContent);
+  var M = D.models, T = D.totals, FLOOR = D.floor.score;
+
+  function esc(s){ var d=document.createElement("div"); d.textContent=(s==null?"":String(s)); return d.innerHTML; }
+  function el(tag, cls, html){ var n=document.createElement(tag); if(cls)n.className=cls;
+    if(html!=null)n.innerHTML=html; return n; }
+
+  var OUT = {
+    CORRECT:    {label:"correct",       cls:"p-ok",     seg:"seg-ok",     sw:"var(--ok-line)"},
+    WRONG:      {label:"wrong answer",  cls:"p-miss",   seg:"seg-miss",   sw:"var(--miss-line)"},
+    REFUSED:    {label:"scorer refused",cls:"p-refuse", seg:"seg-refuse", sw:"var(--refuse-line)"},
+    NO_VERDICT: {label:"no verdict",    cls:"p-silent", seg:"seg-silent", sw:"var(--silent-line)"},
+    AMBIGUOUS:  {label:"ambiguous",     cls:"p-silent", seg:"seg-silent", sw:"var(--silent-line)"},
+    NO_RESPONSE:{label:"no response",   cls:"p-silent", seg:"seg-silent", sw:"var(--silent-line)"},
+    ERROR:      {label:"call error",    cls:"p-silent", seg:"seg-silent", sw:"var(--silent-line)"}
+  };
+  var ORDER = ["CORRECT","WRONG","REFUSED","NO_VERDICT","AMBIGUOUS","NO_RESPONSE","ERROR"];
+
+  document.title = D.title;
+  document.getElementById("h-title").textContent = D.title;
+  document.getElementById("stamp").textContent = D.run_id;
+  document.getElementById("foot").innerHTML =
+    "Rendered by <span class='mono'>mt report " + esc(D.run_id) + " --html</span> from the "
+    + "append-only run store. Item classification routes through the production verdict scorer; all "
+    + esc(D.integrity.cells) + " reproducible cells reproduced their stored verdict exactly, or this "
+    + "report would not have been produced.";
+
+  var pd = document.getElementById("prov");
+  D.provenance.forEach(function(p){
+    var c = el("div","prov-cell");
+    c.appendChild(el("dt",null,esc(p[0])));
+    c.appendChild(el("dd",null,esc(p[1])));
+    pd.appendChild(c);
+  });
+  if (D.preregistration) {
+    document.getElementById("prereg-box").hidden = false;
+    document.getElementById("prereg").textContent = D.preregistration;
+  }
+  document.getElementById("repro").textContent = D.repro;
+
+  var ro = document.getElementById("readout");
+  M.forEach(function(m){
+    var t=T[m], c=el("div","card");
+    c.appendChild(el("div","model-name",esc(m)));
+    var sr=el("div","score-row");
+    sr.appendChild(el("span","score mono", t.score==null ? "n/a" : t.score.toFixed(1)));
+    sr.appendChild(el("span","score-of","/ 100"));
+    c.appendChild(sr);
+    c.appendChild(el("p","tiny", t.correct+" of "+t.n+" cells correct"
+      + (t.median_s==null ? "" : " · median "+t.median_s.toFixed(1)+"s per call")));
+    if (t.score != null) {
+      var g=el("div","gauge");
+      g.innerHTML='<div class="gauge-track"></div>'
+        +'<div class="gauge-fill" style="width:'+t.score+'%"></div>'
+        +'<div class="gauge-floor" style="left:'+FLOOR+'%"></div>'
+        +'<div class="gauge-label" style="left:'+FLOOR+'%">floor '+FLOOR.toFixed(1)+'</div>'
+        +'<div class="gauge-scale"><span>0</span><span>100</span></div>';
+      c.appendChild(g);
+    }
+    ro.appendChild(c);
+  });
+
+  var an=document.getElementById("anatomy");
+  M.forEach(function(m){
+    var t=T[m], c=el("div","card");
+    c.appendChild(el("div","model-name",esc(m)));
+    var st=el("div","stack"), any=false;
+    ORDER.forEach(function(k){
+      var v=t.outcomes[k]||0;
+      if(v>0){ any=true; var sp=el("span",OUT[k].seg);
+        sp.style.width=(100*v/t.n)+"%"; sp.title=OUT[k].label+": "+v; st.appendChild(sp); }
+    });
+    if(any) c.appendChild(st);
+    var lg=el("div","legend");
+    ORDER.forEach(function(k){
+      var v=t.outcomes[k]||0; if(v===0) return;
+      var d=el("div","lg"), sw=el("span","sw"); sw.style.background=OUT[k].sw;
+      d.appendChild(sw);
+      d.appendChild(el("span",null,"<strong class='mono'>"+v+"</strong> "+esc(OUT[k].label)));
+      lg.appendChild(d);
+    });
+    c.appendChild(lg);
+    an.appendChild(c);
+  });
+
+  var noteBits = M.map(function(m){
+    var t=T[m];
+    if(!t.answered) return esc(m)+" answered nothing";
+    return "<strong>"+esc(m)+" "+t.answered_correct+"/"+t.answered+" ("
+      + (100*t.answered_correct/t.answered).toFixed(1)+"%)</strong>";
+  });
+  document.getElementById("answered-note").innerHTML =
+    "<p>On the cells where the scorer accepted a verdict at all, accuracy is "
+    + noteBits.join(" and ") + ", against a degenerate floor of <strong>" + FLOOR.toFixed(1)
+    + "</strong>. A model whose headline sits near the floor while its answered-only accuracy sits "
+    + "well above it is being scored on formatting as much as on judgment.</p>";
+
+  (function(){
+    var h='<thead><tr><th>Model</th><th class="num">as scored</th>'
+      +'<th class="num">first-label-wins</th><th class="num">delta</th>'
+      +'<th class="num">still unreadable</th></tr></thead><tbody>';
+    M.forEach(function(m){
+      var t=T[m];
+      if(t.score==null){ h+='<tr><td class="mono">'+esc(m)+'</td><td class="num" colspan="4">n/a</td></tr>'; return; }
+      h+='<tr><td class="mono">'+esc(m)+'</td><td class="num">'+t.score.toFixed(1)+'</td>'
+        +'<td class="num">'+t.diagnostic_score.toFixed(1)+'</td>'
+        +'<td class="num">'+(t.diagnostic_score-t.score>=0?"+":"")+(t.diagnostic_score-t.score).toFixed(1)+'</td>'
+        +'<td class="num">'+t.diagnostic_unreadable+'</td></tr>';
+    });
+    document.getElementById("diagtbl").innerHTML=h+'</tbody>';
+  })();
+
+  var FACETS = D.facets;
+  if(!FACETS.length){ document.getElementById("sec-facets").hidden = true; }
+  else {
+    var fh=document.getElementById("facets");
+    FACETS.forEach(function(f){
+      var c=el("div","card");
+      c.appendChild(el("div","eyebrow",esc(f.name)));
+      var h='<table style="margin-top:10px"><thead><tr><th>'+esc(f.name)+'</th>'
+        + M.map(function(m){return '<th class="num">'+esc(m)+'</th>';}).join('')
+        + '<th class="num">n</th></tr></thead><tbody>';
+      f.values.forEach(function(v){
+        h+='<tr><td class="mono">'+esc(v.value)+'</td>'
+          + M.map(function(m){
+              var s=v.scores[m];
+              return '<td class="num">'+(s==null?"&mdash;":s.toFixed(1))+'</td>';
+            }).join('')
+          + '<td class="num">'+v.n+'</td></tr>';
+      });
+      c.appendChild(el("div","tw",h+'</tbody></table>'));
+      c.querySelector(".tw").style.border="none";
+      c.querySelector(".tw").style.boxShadow="none";
+      fh.appendChild(c);
+    });
+  }
+
+  var cols = "74px 1fr " + M.map(function(){return "116px";}).join(" ") + " 26px";
+  var headEl = document.getElementById("ledger-head");
+  headEl.style.gridTemplateColumns = cols;
+  headEl.innerHTML = '<span>Item</span><span>Prompt</span>'
+    + M.map(function(m){return '<span>'+esc(m)+'</span>';}).join('') + '<span></span>';
+
+  var F={outcome:"all", model:"all", q:""};
+  FACETS.forEach(function(f){ F["facet:"+f.name]="all"; });
+
+  function mkChips(host,key,opts){
+    opts.forEach(function(o){
+      var b=el("button","chip",esc(o[1]));
+      b.type="button"; b.setAttribute("aria-pressed",String(F[key]===o[0]));
+      b.addEventListener("click",function(){
+        F[key]=o[0];
+        Array.prototype.forEach.call(host.children,function(c){c.setAttribute("aria-pressed","false");});
+        b.setAttribute("aria-pressed","true");
+        render();
+      });
+      host.appendChild(b);
+    });
+  }
+  var present = ORDER.filter(function(k){
+    return M.some(function(m){ return (T[m].outcomes[k]||0)>0; });
+  });
+  mkChips(document.getElementById("f-outcome"),"outcome",
+    [["all","All"]].concat(present.map(function(k){return [k,OUT[k].label];})));
+  mkChips(document.getElementById("f-model"),"model",
+    [["all","Either"]].concat(M.map(function(m){return [m,m];})));
+  var cf=document.getElementById("ctl-facets");
+  FACETS.forEach(function(f){
+    var box=el("div","ctl");
+    box.appendChild(el("span","eyebrow",esc(f.name)));
+    var chips=el("div","chips");
+    box.appendChild(chips); cf.parentNode.insertBefore(box,cf);
+    mkChips(chips,"facet:"+f.name,
+      [["all","All"]].concat(f.values.map(function(v){return [v.value,v.value];})));
+  });
+  cf.remove();
+  document.getElementById("q").addEventListener("input",function(e){
+    F.q=e.target.value.toLowerCase(); render();
+  });
+
+  function matches(it){
+    for(var i=0;i<FACETS.length;i++){
+      var f=FACETS[i], want=F["facet:"+f.name];
+      if(want!=="all" && (it.facets[f.name]||"") !== want) return false;
+    }
+    if(F.q && it.prompt.toLowerCase().indexOf(F.q)===-1 && it.id.toLowerCase().indexOf(F.q)===-1) return false;
+    if(F.outcome!=="all"){
+      var ms = F.model==="all" ? M : [F.model];
+      if(!ms.some(function(m){ var r=it.cells[m]; return r && r.outcome===F.outcome; })) return false;
+    }
+    return true;
+  }
+
+  function respBlock(m,r){
+    if(!r) return '<div class="resp"><div class="resp-head"><span class="model-name">'+esc(m)
+      +'</span><span class="pill p-silent">not run</span></div></div>';
+    var o=OUT[r.outcome]||OUT.AMBIGUOUS;
+    var head='<div class="resp-head"><span class="model-name">'+esc(m)+'</span>'
+      +'<span class="pill '+o.cls+'">'+esc(o.label)+'</span>'
+      +'<span class="tiny mono">scored '+(r.score==null?"n/a":r.score.toFixed(0))
+      +(r.elapsed_s==null?"":" · "+r.elapsed_s.toFixed(1)+"s")+'</span>';
+    if(r.diagnostic_recoverable)
+      head+='<span class="pill p-refuse" title="Under the diagnostic rule only">'
+        +'first label was correct</span>';
+    head+='</div>';
+    var why='<div class="why"><b>Scorer:</b> '+esc(r.why);
+    if(r.labels_present && r.labels_present.length)
+      why+=' <span class="tiny mono">[labels recognized: '+esc(r.labels_present.join(", "))+']</span>';
+    why+='</div>';
+    return '<div class="resp">'+head+'<pre class="resp-raw">'+esc(r.raw||"(empty response)")
+      +'</pre>'+why+'</div>';
+  }
+
+  function render(){
+    var host=document.getElementById("ledger");
+    host.textContent="";
+    var shown=D.items.filter(matches);
+    document.getElementById("count").textContent=
+      "showing "+shown.length+" of "+D.items.length+" items";
+    var frag=document.createDocumentFragment();
+    shown.forEach(function(it){
+      var d=el("details","item");
+      var sum=document.createElement("summary");
+      sum.className="item-head"; sum.style.gridTemplateColumns=cols;
+      sum.innerHTML='<span class="item-id">'+esc(it.id)+'</span>'
+        +'<span class="item-prompt">'+esc(it.prompt)+'</span>'
+        + M.map(function(m){ var r=it.cells[m];
+            return '<span>'+(r?'<span class="pill '+(OUT[r.outcome]||OUT.AMBIGUOUS).cls+'">'
+              +esc((OUT[r.outcome]||OUT.AMBIGUOUS).label)+'</span>':'')+'</span>';
+          }).join('')
+        +'<span class="chev">&#9656;</span>';
+      d.appendChild(sum);
+      var tags=Object.keys(it.facets).map(function(k){
+        return '<span class="tag">'+esc(k)+": "+esc(it.facets[k])+'</span>';
+      }).join('');
+      var body=el("div","item-body");
+      body.innerHTML='<div class="meta-row">'+tags
+        +'<span class="tag">expected: '+esc(it.expected)+'</span>'
+        +(it.prior==null?"":'<span class="tag">authored prior '+esc(it.prior)+'</span>')
+        +(it.provenance?'<span class="tag">'+esc(it.provenance)+'</span>':'')+'</div>'
+        +'<div class="qa"><div class="eyebrow">Prompt sent to every model, verbatim</div>'
+        +'<p class="qa-text">'+esc(it.prompt)+'</p></div>'
+        +'<div class="resp-grid">'
+        + M.map(function(m){return respBlock(m,it.cells[m]);}).join('')+'</div>';
+      d.appendChild(body);
+      frag.appendChild(d);
+    });
+    host.appendChild(frag);
+  }
+
+  var lim=document.getElementById("limits");
+  D.limits.forEach(function(t){ lim.appendChild(el("li",null,t)); });
+
+  render();
+})();
+</script>
+</body>
+</html>
