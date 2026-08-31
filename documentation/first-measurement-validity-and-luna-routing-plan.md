@@ -1,7 +1,8 @@
 # First-Measurement Validity Gates and Luna Routing
 
-**Status:** WRAPPED (2026-08-30) — 0/8 steps complete; redline publication v2 accepted;
-ready for `repo-sync`; not build-ready until the issue and working-tree preconditions pass
+**Status:** SYNCED (2026-08-30) — 0/8 steps complete; umbrella #60 and Step 56-63 issues
+#62/#63/#64/#65/#66/#67/#61/#68 backfilled; cross-plan links verified; ready for the filtered
+first code span after the ownership-separated working-tree checkpoint passes
 
 **Repo-sync phase identifier:** `first-measurement-validity-and-luna-routing` (must be passed
 explicitly; it cannot be inferred from this filename)
@@ -219,7 +220,7 @@ only run/evidence artifacts; they add no code and contain no confirmation prompt
   adapters, and an additive execution receipt; reject unknown providers before run creation and
   reject any legacy resume that would mix unsealed and sealed Claude rows.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #62
 - **Flags:** --reviewers deep --isolation worktree
 - **Files:** `measure_twice/adapters/base.py`, `measure_twice/adapters/claude_cli.py`,
   `measure_twice/adapters/local.py`, `measure_twice/config.py`,
@@ -248,7 +249,7 @@ only run/evidence artifacts; they add no code and contain no confirmation prompt
   old runs visibly ineligible without changing their score, and build one hostile-context canary
   suite plus an autonomous PowerShell qualification/verify-only wrapper for Step 58.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #63
 - **Flags:** --reviewers deep --isolation worktree
 - **Files:** `measure_twice/cli.py`, `measure_twice/report.py`,
   `measure_twice/report_html.py`, `measure_twice/report_template.html`,
@@ -274,7 +275,7 @@ only run/evidence artifacts; they add no code and contain no confirmation prompt
   environment, customization, and session sentinels before the full Step 13 sweep; require concrete
   provider identity and one execution-context hash for every arm.
 - **Type:** wait
-- **Issue:** #
+- **Issue:** #64
 - **Flags:** --reviewers auto
 - **Files:** `data/qualification/model-sweep-context-v1/index.json`,
   `data/qualification/model-sweep-context-v1/runs/`,
@@ -302,7 +303,7 @@ and an explicit config, then existing Step 14. The contaminated first run is not
   Keep the official scorer unchanged and fail closed on routing eligibility rather than choosing a
   post-hoc parser.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #65
 - **Flags:** --reviewers deep --isolation worktree
 - **Files:** `measure_twice/analyze/calibrate.py`, `measure_twice/cli.py`,
   `tests/test_calibrate.py`,
@@ -331,7 +332,7 @@ and an explicit config, then existing Step 14. The contaminated first run is not
   real `mt run`/`mt calibrate` entries, preserves fixed run IDs, refuses favorable reruns, and emits
   a machine-verifiable receipt for the cross-plan Step 16 gate.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #66
 - **Flags:** --reviewers deep --isolation worktree
 - **Files:** `scripts/run-model-sweep-replication.ps1`,
   `tests/test_model_sweep_replication.py`, `docs/methodology/model-sweep-v1-replication-protocol.md`
@@ -358,7 +359,7 @@ and an explicit config, then existing Step 14. The contaminated first run is not
   before run 1 and means that at most 15 of 100 binary cell outcomes may span the observed range; a
   failed gate cannot be repaired by selecting a fourth run.
 - **Type:** wait
-- **Issue:** #
+- **Issue:** #67
 - **Flags:** --reviewers auto
 - **Files:** `data/runs/`, `data/reports/model-sweep-v1-replication.json`,
   `docs/methodology/model-sweep-v1-replication.md`
@@ -390,7 +391,7 @@ and an explicit config, then existing Step 14. The contaminated first run is not
   implicit build input. Preserve the retained tmpfs-root FD and every existing cleanup invariant
   required by Step 27.
 - **Type:** code
-- **Issue:** #
+- **Issue:** #61
 - **Flags:** --reviewers deep --isolation worktree
 - **Files:** `measure_twice/agent_bench/process.py`, `scripts/soak-agent-bench-wsl.ps1`,
   `tests/agent_bench/test_process.py`, `tests/agent_bench/test_wsl_soak_script.py`
@@ -416,7 +417,7 @@ and an explicit config, then existing Step 14. The contaminated first run is not
   control-plane launcher, preserve every exit and staged-tree hash, and report a rate before Step 27
   consumes the retained tmpfs-root FD.
 - **Type:** wait
-- **Issue:** #
+- **Issue:** #68
 - **Flags:** --reviewers auto
 - **Files:** `data/qualification/agent-bench-containment-step63/`,
   `docs/agent-benchmark/containment-soak-step63.md`
