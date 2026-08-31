@@ -957,10 +957,73 @@ def _wait_for_live_linux_identity(
 
 
 def _assert_linux_identity_gone(identity: tuple[int, int]) -> None:
+    """Assert the descendant is contained, tolerating reap latency but never a live process.
+
+    Cleanup SIGKILLs the target and then waits only on the direct ``unshare`` child.  The target
+    itself is a grandchild inside the PID namespace -- this process is its ancestor but not its
+    parent, so it can never ``waitpid`` it, and *when* its ``/proc`` record disappears is decided
+    by kernel namespace teardown rather than by anything the test pins down.  A single
+    instantaneous read therefore asserted on a quantity the test does not control and went red on
+    a contained-but-unreaped zombie, whose start token is unchanged (measure-twice gate, run 4 of
+    24 at ``7ef408b``).
+
+    So poll the same bounded interval production's own collection proof uses, treating "record
+    gone" and ``Z`` (killed, awaiting reap) alike as contained, and fail closed at expiry naming
+    the last observed state -- a genuinely surviving process never reaches ``Z``, so a real escape
+    still fails, and it reports ``'R'``/``'S'`` instead of a bare timeout.
+    """
+
     host_pid, start_token = identity
-    assert process_module._pid_starttime(host_pid) != start_token, (
-        f"child process identity survived cleanup: pid={host_pid}, starttime={start_token}"
-    )
+    deadline = time.monotonic() + process_module._REAP_TIMEOUT_S
+    while True:
+        if process_module._pid_starttime(host_pid) != start_token:
+            return
+        state = process_module._pid_state(host_pid)
+        if state is None or state == "Z":
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"child process identity survived cleanup in state {state!r}: "
+                f"pid={host_pid}, starttime={start_token}"
+            )
+        time.sleep(process_module._POLL_INTERVAL_S)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc identity state semantics")
+def test_identity_settle_accepts_a_zombie_but_still_fails_on_a_live_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Red-on-garbage anchor for :func:`_assert_linux_identity_gone` itself.
+
+    That helper tolerates reap latency by accepting ``Z``, and every containment canary in this
+    module leans on it.  The tolerance is only safe while the helper still fails closed on a
+    process that is genuinely running, so pin both directions here: a future widening (accepting
+    ``S``, or returning on any readable record) would otherwise blind those canaries silently
+    rather than failing this test.
+    """
+
+    monkeypatch.setattr(process_module, "_REAP_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(process_module, "_POLL_INTERVAL_S", 0.005)
+    live = subprocess.Popen(("/bin/sleep", "30"))
+    try:
+        token = process_module._pid_starttime(live.pid)
+        assert token is not None
+        with pytest.raises(AssertionError, match="survived cleanup in state"):
+            _assert_linux_identity_gone((live.pid, token))
+
+        live.kill()
+        deadline = time.monotonic() + 5.0
+        while process_module._pid_state(live.pid) != "Z":
+            if time.monotonic() >= deadline:
+                raise AssertionError("setup: the killed child never became a zombie")
+            time.sleep(0.01)
+        # Same pid, same start token as the live case -- only the state differs, and that alone is
+        # what makes it contained rather than an escape.
+        assert process_module._pid_starttime(live.pid) == token
+        _assert_linux_identity_gone((live.pid, token))
+    finally:
+        live.kill()
+        live.wait()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux post-spawn cleanup invariant")
@@ -1001,10 +1064,13 @@ def test_linux_partial_thread_start_failure_reaps_process_and_closes_fds(
     with pytest.raises(ChildProcessError):
         os.waitpid(spawned[0].pid, os.WNOHANG)
     assert ready_identity is not None
-    _assert_linux_identity_gone(ready_identity)
+    # Escape proof before identity settle: this pair is the sound containment invariant and owns
+    # every quantity it reads, so ordering it first stops a reap-latency red from pre-empting the
+    # evidence that would classify it.
     assert not marker.exists()
     release.write_text("release", encoding="utf-8")
     assert not marker.exists()
+    _assert_linux_identity_gone(ready_identity)
     _assert_linux_fd_baseline(baseline)
 
 
@@ -1728,10 +1794,11 @@ def test_descendant_monitor_exception_fails_closed_and_kills_target(
 
     assert len(spawned) == 1
     assert ready_identity is not None
-    _assert_linux_identity_gone(ready_identity)
+    # Escape proof before identity settle, as in the partial-thread-start twin above.
     assert not marker.exists()
     release.write_text("release", encoding="utf-8")
     assert not marker.exists()
+    _assert_linux_identity_gone(ready_identity)
     _assert_linux_fd_baseline(baseline)
 
 

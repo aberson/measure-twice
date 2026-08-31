@@ -1164,6 +1164,21 @@ def _pid_starttime(pid: int) -> int | None:
         return None
 
 
+def _pid_state(pid: int) -> str | None:
+    """Return the Linux process state character, or ``None`` once the record is gone.
+
+    Kept beside :func:`_pid_starttime` so every ``/proc/<pid>/stat`` field index has one owner.
+    Containment proofs need the state because the start token alone cannot separate a SIGKILLed
+    but unreaped zombie (contained -- it executes nothing) from a process still running (an
+    escape): both keep a record whose token is unchanged.
+    """
+
+    fields = _pid_stat_fields(pid)
+    if not fields:
+        return None
+    return fields[0]
+
+
 def _pid_namespace_chain(pid: int) -> tuple[int, ...] | None:
     """Return host-visible PID-namespace IDs, preserving the process identity boundary."""
 
