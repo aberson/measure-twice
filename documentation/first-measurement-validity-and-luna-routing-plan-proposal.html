@@ -1,0 +1,658 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>First-Measurement Validity &amp; Luna Routing — redline proposal v2</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --page: #f4f1ea;
+      --surface: #fffdf8;
+      --surface-raised: #ffffff;
+      --ink: #18201d;
+      --muted: #5b6660;
+      --line: #ccd2ca;
+      --line-strong: #9ba79f;
+      --accent: #0a6a57;
+      --accent-ink: #004236;
+      --accent-soft: #d9eee7;
+      --operator: #805b08;
+      --operator-soft: #f5e8bc;
+      --default: #3158a4;
+      --default-soft: #dfe8fb;
+      --danger: #a13a2e;
+      --danger-soft: #f8ded9;
+      --code: #eef0ec;
+      --shadow: 0 16px 44px rgba(33, 45, 40, 0.09);
+      --radius: 18px;
+      --radius-sm: 10px;
+      --max: 1180px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #101513;
+        --surface: #171d1a;
+        --surface-raised: #1c2420;
+        --ink: #eef4f0;
+        --muted: #b6c0ba;
+        --line: #39443e;
+        --line-strong: #65736b;
+        --accent: #72d5bd;
+        --accent-ink: #a4f1de;
+        --accent-soft: #183e35;
+        --operator: #f0c765;
+        --operator-soft: #463914;
+        --default: #9ebbf7;
+        --default-soft: #24375c;
+        --danger: #ff9b8c;
+        --danger-soft: #4d2723;
+        --code: #222b27;
+        --shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font: 16px/1.62 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--accent-ink); text-underline-offset: 0.18em; }
+    a:hover { text-decoration-thickness: 0.14em; }
+    a:focus-visible, summary:focus-visible {
+      outline: 3px solid var(--accent);
+      outline-offset: 4px;
+      border-radius: 4px;
+    }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
+    code {
+      padding: 0.12em 0.32em;
+      border-radius: 5px;
+      background: var(--code);
+      overflow-wrap: anywhere;
+    }
+    pre {
+      margin: 0.8rem 0 0;
+      padding: 1rem;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--code);
+      color: var(--ink);
+      font-size: 0.86rem;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    h1, h2, h3 { line-height: 1.15; letter-spacing: -0.025em; }
+    h1 { margin: 0.35rem 0 1rem; max-width: 900px; font-size: clamp(2.35rem, 6vw, 5rem); }
+    h2 { margin: 0; font-size: clamp(1.8rem, 3.5vw, 2.7rem); }
+    h3 { margin: 0; font-size: 1.13rem; }
+    p { margin: 0.7rem 0 0; }
+    ul, ol { padding-left: 1.3rem; }
+    li + li { margin-top: 0.42rem; }
+
+    .skip-link {
+      position: fixed;
+      top: 0.75rem;
+      left: 0.75rem;
+      z-index: 50;
+      transform: translateY(-180%);
+      padding: 0.65rem 0.9rem;
+      border-radius: 8px;
+      background: var(--ink);
+      color: var(--surface);
+    }
+    .skip-link:focus { transform: translateY(0); }
+    .shell { width: min(calc(100% - 2rem), var(--max)); margin-inline: auto; }
+    .hero { padding: clamp(3.5rem, 9vw, 7rem) 0 3rem; }
+    .eyebrow {
+      margin: 0;
+      color: var(--accent-ink);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+    }
+    .deck { max-width: 820px; color: var(--muted); font-size: clamp(1.06rem, 2vw, 1.32rem); }
+    .chips { display: flex; flex-wrap: wrap; gap: 0.55rem; margin-top: 1.5rem; }
+    .chip, .id-badge {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      min-height: 1.8rem;
+      padding: 0.28rem 0.62rem;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .chip.reviewed { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-ink); }
+    .chip.blocked { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+    .hero-grid { display: grid; grid-template-columns: 1.5fr 0.8fr; gap: 1rem; margin-top: 2rem; }
+    .hero-card, .status-card {
+      padding: 1.25rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .hero-card strong { color: var(--danger); }
+    .status-card dl { display: grid; grid-template-columns: auto 1fr; gap: 0.4rem 0.8rem; margin: 0; }
+    .status-card dt { color: var(--muted); }
+    .status-card dd { margin: 0; font-weight: 750; text-align: right; }
+    .jump-nav {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      border-block: 1px solid var(--line);
+      background: color-mix(in srgb, var(--page) 91%, transparent);
+      backdrop-filter: blur(12px);
+    }
+    .jump-nav ul {
+      display: flex;
+      gap: 1rem;
+      margin: 0;
+      padding: 0.72rem 0;
+      overflow-x: auto;
+      list-style: none;
+      white-space: nowrap;
+    }
+    .jump-nav a { color: var(--muted); font-size: 0.85rem; font-weight: 700; text-decoration: none; }
+    .jump-nav a:hover { color: var(--accent-ink); }
+    main section { padding: clamp(3.5rem, 8vw, 6.5rem) 0; border-bottom: 1px solid var(--line); }
+    .section-head { display: grid; grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.28fr); gap: 2rem; margin-bottom: 2rem; }
+    .section-head > p { margin: 0; max-width: 720px; color: var(--muted); font-size: 1.06rem; }
+    .heard-grid, .risk-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+    .note {
+      padding: 1.15rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--surface);
+    }
+    .note .number { display: block; margin-bottom: 0.55rem; color: var(--accent-ink); font-weight: 850; }
+    .note p { color: var(--muted); }
+    .shape {
+      display: grid;
+      grid-template-columns: 0.9fr 1.1fr;
+      gap: 1.2rem;
+      align-items: start;
+    }
+    .shape-callout {
+      padding: 1.4rem;
+      border-left: 5px solid var(--accent);
+      border-radius: 0 var(--radius) var(--radius) 0;
+      background: var(--accent-soft);
+      font-size: 1.1rem;
+    }
+    .rails { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem; }
+    .rail {
+      padding: 1.25rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .rail-head { display: flex; justify-content: space-between; gap: 0.8rem; align-items: baseline; margin-bottom: 1rem; }
+    .rail-head p { margin: 0; color: var(--muted); font-size: 0.82rem; }
+    .flow { margin: 0; padding: 0; list-style: none; }
+    .flow li {
+      position: relative;
+      margin: 0 0 0 0.75rem;
+      padding: 0 0 1.25rem 1.45rem;
+      border-left: 2px solid var(--line-strong);
+    }
+    .flow li::before {
+      content: "";
+      position: absolute;
+      left: -0.44rem;
+      top: 0.12rem;
+      width: 0.72rem;
+      height: 0.72rem;
+      border: 2px solid var(--surface);
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent);
+    }
+    .flow li:last-child { padding-bottom: 0; }
+    .flow strong { display: block; }
+    .flow span { color: var(--muted); font-size: 0.88rem; }
+    .gate::after {
+      content: "WAIT / OBSERVE";
+      display: inline-block;
+      margin-top: 0.35rem;
+      padding: 0.15rem 0.42rem;
+      border-radius: 4px;
+      background: var(--danger-soft);
+      color: var(--danger);
+      font-size: 0.68rem;
+      font-weight: 850;
+      letter-spacing: 0.06em;
+    }
+    .afterwards { margin-top: 1.5rem; padding: 1.35rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+    .afterwards h3 { font-size: 1.35rem; }
+    details { margin-top: 0.9rem; padding: 0.85rem 1rem; border: 1px solid var(--line); border-radius: var(--radius-sm); }
+    summary { cursor: pointer; color: var(--accent-ink); font-weight: 800; }
+    .decision-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+    .decision {
+      scroll-margin-top: 5rem;
+      padding: 1.2rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      break-inside: avoid;
+    }
+    .decision.operator { border-top: 5px solid var(--operator); }
+    .decision.default { border-top: 5px solid var(--default); }
+    .decision header { display: flex; align-items: center; gap: 0.7rem; margin-bottom: 0.85rem; }
+    .operator .id-badge { border-color: var(--operator); background: var(--operator-soft); color: var(--operator); }
+    .default .id-badge { border-color: var(--default); background: var(--default-soft); color: var(--default); }
+    .decision dl { display: grid; grid-template-columns: 4.2rem 1fr; gap: 0.45rem 0.7rem; margin: 0; }
+    .decision dt { color: var(--muted); font-size: 0.78rem; font-weight: 850; letter-spacing: 0.05em; text-transform: uppercase; }
+    .decision dd { margin: 0; }
+    .decision-index { display: flex; flex-wrap: wrap; gap: 0.45rem; margin: 0 0 1.2rem; }
+    .decision-index a { padding: 0.23rem 0.48rem; border: 1px solid var(--line); border-radius: 6px; text-decoration: none; font-weight: 800; }
+    .out-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.8rem; margin: 0; padding: 0; list-style: none; }
+    .out-list li { margin: 0; padding: 1rem; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); }
+    .risk-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .risk { border-left: 4px solid var(--danger); }
+    .feedback-box { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; }
+    .feedback-copy, .sources { padding: 1.25rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+    .grammar { margin-top: 1rem; padding: 1rem; border: 2px solid var(--accent); border-radius: var(--radius-sm); background: var(--accent-soft); }
+    .grammar code { display: block; margin-top: 0.4rem; background: transparent; }
+    footer { padding: 2.5rem 0 4rem; color: var(--muted); font-size: 0.86rem; }
+    footer .shell { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+
+    @media (max-width: 820px) {
+      .hero-grid, .section-head, .shape, .rails, .feedback-box { grid-template-columns: 1fr; }
+      .heard-grid { grid-template-columns: 1fr; }
+      .decision-grid, .out-list, .risk-grid { grid-template-columns: 1fr; }
+      .section-head { gap: 0.8rem; }
+      .jump-nav { position: static; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+    }
+
+    @media print {
+      :root {
+        --page: #fff;
+        --surface: #fff;
+        --surface-raised: #fff;
+        --ink: #111;
+        --muted: #444;
+        --line: #aaa;
+        --line-strong: #777;
+        --accent: #145f50;
+        --accent-ink: #174f44;
+        --accent-soft: #eef7f4;
+        --operator: #6e4b00;
+        --operator-soft: #fff7dc;
+        --default: #284d91;
+        --default-soft: #f0f4ff;
+        --danger: #8f2f25;
+        --danger-soft: #fff0ed;
+        --code: #f3f3f3;
+        --shadow: none;
+      }
+      body { font-size: 10.5pt; }
+      .shell { width: 100%; }
+      .hero { padding: 0 0 1.5rem; }
+      h1 { font-size: 30pt; }
+      .jump-nav, .skip-link { display: none; }
+      main section { padding: 1.5rem 0; }
+      .hero-card, .status-card, .rail, .decision { box-shadow: none; }
+      .decision, .note, .rail, .risk, details, pre { break-inside: avoid; }
+      details > * { display: block; }
+      pre { white-space: pre-wrap; overflow: visible; }
+      a { color: inherit; text-decoration: none; }
+      a[href]::after { content: none; }
+      footer { padding-bottom: 0; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to proposal</a>
+
+  <header class="hero">
+    <div class="shell">
+      <p class="eyebrow">Plan redline · publication v2 · 2026-08-30</p>
+      <h1>Make the first measurement honest. Route Luna through the instrument built for agents.</h1>
+      <p class="deck">A review copy of the plan that seals Instrument A, quarantines the contaminated first run, and resumes the existing Luna coding-agent rail only after its Linux containment gate is owned and soaked.</p>
+
+      <div class="chips" aria-label="Proposal status">
+        <span class="chip reviewed">Reviewed</span>
+        <span class="chip blocked">Not synced</span>
+        <span class="chip blocked">Not build-ready</span>
+        <span class="chip">0 of 8 new steps complete</span>
+      </div>
+
+      <div class="hero-grid">
+        <div class="hero-card">
+          <p class="eyebrow">The immediate truth</p>
+          <p><strong>The first 200-row run is diagnostic-only.</strong> All calls had access to uncontrolled workspace context, so filtering the 23 visible leaks would not recover a comparable measurement. Its stored 50.0 / 81.0 scores remain reproducible forensic facts, not routing evidence.</p>
+        </div>
+        <aside class="status-card" aria-label="Publication facts">
+          <dl>
+            <dt>Plan status</dt><dd>REVIEWED</dd>
+            <dt>Publication</dt><dd>v2</dd>
+            <dt>New steps</dt><dd>56–63</dd>
+            <dt>First code span</dt><dd>56, 57, 62</dd>
+            <dt>Luna target</dt><dd>Instrument B · high</dd>
+          </dl>
+        </aside>
+      </div>
+    </div>
+  </header>
+
+  <nav class="jump-nav" aria-label="Proposal sections">
+    <div class="shell">
+      <ul>
+        <li><a href="#heard">What I heard</a></li>
+        <li><a href="#shape">Why this shape</a></li>
+        <li><a href="#timeline">Timeline</a></li>
+        <li><a href="#operator-choices">Operator choices</a></li>
+        <li><a href="#agent-defaults">Agent defaults</a></li>
+        <li><a href="#not-v1">Not in v1</a></li>
+        <li><a href="#risks">Risks</a></li>
+        <li><a href="#feedback">Feedback</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main">
+    <section id="heard">
+      <div class="shell">
+        <div class="section-head">
+          <h2>What I heard</h2>
+          <p>This is a validity repair and routing plan, not a request to make the first number look publishable. The two instruments answer different questions and retain separate evidence chains.</p>
+        </div>
+        <div class="heard-grid">
+          <article class="note">
+            <span class="number">01 · Instrument A</span>
+            <h3>Repair the prompt sweep</h3>
+            <p>Fail closed on provider selection, run Claude in a sealed prompt-only context, expose concrete identity evidence, calibrate the production scorer, then replicate a frozen v1 before any ledger claim.</p>
+          </article>
+          <article class="note">
+            <span class="number">02 · Instrument B</span>
+            <h3>Use the native agent benchmark for Luna</h3>
+            <p>Keep the registered <code>gpt-5.6-luna</code> candidate at <code>high</code> effort and resume its existing Steps 27–55 only after the zombie-aware WSL-ext4 containment repair passes review and an 8/8 soak.</p>
+          </article>
+          <article class="note">
+            <span class="number">03 · Boundaries</span>
+            <h3>Protect the existing contracts</h3>
+            <p>No parser rewrite, score pooling, default-roster change, canonical-step renumbering, operations publication, or one-sample ledger claim. Pending issue numbers wait for <code>repo-sync</code>.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="shape">
+      <div class="shell">
+        <div class="section-head">
+          <h2>Why this shape</h2>
+          <p>The plan adds only the gates that the first observation proved were missing. It reuses the already-planned calibration and coding-agent work instead of forking new evaluators or scoring contracts.</p>
+        </div>
+        <div class="shape">
+          <div class="shape-callout"><strong>Two independent rails, one coordinator.</strong><br>The step numbers are append-only IDs—not permission to execute the file as a numeric phase. Every cross-plan transition is explicit and machine-verified.</div>
+          <div>
+            <p><strong>Rail A</strong> fixes execution validity first, then relies on canonical Steps 13–17 for the instrument and ledger path.</p>
+            <p><strong>Rail B</strong> owns the current process-containment candidate, proves it after review, then returns to the preregistered Luna-versus-Sonnet plan.</p>
+            <p><strong>Parallelism is narrow:</strong> Steps 56 and 62 may start together. Wait steps and cross-plan gates remain hard stops.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="timeline">
+      <div class="shell">
+        <div class="section-head">
+          <h2>Phase timeline</h2>
+          <p>The first code span contains Steps 56, 57, and 62. From there, each rail stops at its observation gate; no <code>--resume</code> may jump between plan files.</p>
+        </div>
+
+        <div class="rails" aria-label="Parallel execution rails">
+          <article class="rail">
+            <div class="rail-head">
+              <h3>Rail A · measurement validity</h3>
+              <p>Prompt sweep</p>
+            </div>
+            <ol class="flow">
+              <li><strong>56 · Seal execution</strong><span>Validated providers, clean context, concrete identity, additive receipt.</span></li>
+              <li><strong>57 · Report the seal</strong><span>Identity summaries, legacy warning, hostile-context qualification path.</span></li>
+              <li class="gate"><strong>58 · Live Claude canary</strong><span>Three aliases; 3/3 or stop.</span></li>
+              <li><strong>Existing 13 → 14</strong><span>Full-roster calibration, then freeze the v1 suite and artifacts.</span></li>
+              <li><strong>Existing 15 · independent branch</strong><span>Profile output may proceed after Step 14; it remains separately owned and later joins Step 17.</span></li>
+              <li><strong>59 · Validity scorecard</strong><span>Production-scorer anchors and routing-eligibility verdict.</span></li>
+              <li><strong>60 · Replication orchestrator</strong><span>Freeze policy, budget, run IDs, and verify-only receipt.</span></li>
+              <li class="gate"><strong>61 · Three sealed replications</strong><span>Eligibility, direction, identity, and ≤15-point ranges must all pass.</span></li>
+              <li><strong>Existing 16</strong><span>Only now: fresh confirmatory runs for separately preregistered ledger claims.</span></li>
+              <li><strong>Existing 17 · join</strong><span>Close the canonical rail only after the independent Step 15 branch and Step 16 both complete.</span></li>
+            </ol>
+          </article>
+
+          <article class="rail">
+            <div class="rail-head">
+              <h3>Rail B · Luna routing</h3>
+              <p>Coding agent</p>
+            </div>
+            <ol class="flow">
+              <li><strong>62 · Own the Linux repair</strong><span>Zombie-aware identity settlement, live-process red anchor, retained-FD invariant.</span></li>
+              <li class="gate"><strong>63 · Post-review WSL soak</strong><span>Eight independent ext4 invocations; 8/8 or return to Step 62.</span></li>
+              <li><strong>Existing 27 → 31</strong><span>Resume the canonical benchmark rail. Step 30 is the first live Luna call.</span></li>
+              <li><strong>Existing 35</strong><span>First real two-provider pipeline smoke.</span></li>
+              <li><strong>Existing 41</strong><span>Non-ranking pilot calibration.</span></li>
+              <li><strong>Existing 54</strong><span>The sole decision-grade v1 Luna-versus-Sonnet observation.</span></li>
+              <li><strong>Existing 55</strong><span>Close the registered coding-agent phase.</span></li>
+            </ol>
+          </article>
+        </div>
+
+        <aside class="afterwards" aria-labelledby="afterwards-title">
+          <h3 id="afterwards-title">Afterwards?</h3>
+          <p>Redline decisions first. If the proposal stands, wrap it, preview the issue sync, checkpoint the current dirty worktree by ownership, and only then preview the first code span.</p>
+          <pre><code>/plan-wrap --plan documentation/first-measurement-validity-and-luna-routing-plan.md
+/repo-sync --plan documentation/first-measurement-validity-and-luna-routing-plan.md --phase first-measurement-validity-and-luna-routing --dry-run
+/repo-sync --plan documentation/first-measurement-validity-and-luna-routing-plan.md --phase first-measurement-validity-and-luna-routing</code></pre>
+          <p>After the real sync, backfill all eight emitted issue numbers, add blocking comments to existing issues <code>#13</code>, <code>#14</code>, <code>#16</code>, and <code>#29</code>, then pass this exact check:</p>
+          <pre><code>$blank = Select-String -LiteralPath .\documentation\first-measurement-validity-and-luna-routing-plan.md -Pattern '^- \*\*Issue:\*\* #\s*$'; if ($blank) { $blank; throw 'repo-sync issue numbers have not been backfilled' }; 13,14,16,29 | ForEach-Object { gh issue view $_ --comments }</code></pre>
+          <p>Only after the issue check and ownership-separated clean-tree checkpoint pass:</p>
+          <pre><code>/build-phase --plan documentation/first-measurement-validity-and-luna-routing-plan.md --steps 56,57,62 --dry-run
+/build-phase --plan documentation/first-measurement-validity-and-luna-routing-plan.md --steps 56,57,62</code></pre>
+
+          <details>
+            <summary>Exact transition checks after the first code span</summary>
+            <pre><code>powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\qualify-model-sweep-context.ps1 -VerifyOnly -Out .\data\qualification\model-sweep-context-v1
+
+uv run mt run --suite .\suites\tier-judging-v0.json --config .\profiles\model-sweep-execution-v1.json --models general-35b,coder-30b,haiku,sonnet,opus --samples 1 --budget 500 --preregister 'On a sealed tier-judging-v0 run of the explicit five-model roster at one sample per cell, every cell will be terminal, every arm will carry concrete provider identity, all five official scores will be strictly inside (0,100), and at least two official scores will differ; this is calibration only and creates no ledger update.'
+
+/build-phase --plan plan.md --steps 14
+/build-phase --plan documentation/first-measurement-validity-and-luna-routing-plan.md --steps 59,60
+
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-model-sweep-replication.ps1 -VerifyOnly -Out .\data
+
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\soak-agent-bench-wsl.ps1 -VerifyOnly -Out .\data\qualification\agent-bench-containment-step63
+/build-phase --plan documentation/coding-agent-benchmark-plan.md --steps 27</code></pre>
+          </details>
+          <p><strong>Issue numbers are intentionally absent here.</strong> They are pending the real <code>repo-sync</code>, backfill, and cross-link verification described in the source plan.</p>
+        </aside>
+      </div>
+    </section>
+
+    <section id="operator-choices">
+      <div class="shell">
+        <div class="section-head">
+          <h2>Operator choices</h2>
+          <p>These P-items came from the brief and are treated as selected constraints. Changing one is allowed, but it is a change to the plan’s operating contract—not an implementation tweak.</p>
+        </div>
+        <nav class="decision-index" aria-label="Operator choice index">
+          <a href="#P1">P1</a><a href="#P2">P2</a><a href="#P3">P3</a><a href="#P4">P4</a><a href="#P5">P5</a><a href="#P6">P6</a><a href="#P7">P7</a>
+        </nav>
+        <div class="decision-grid">
+          <article class="decision operator" id="P1">
+            <header><span class="id-badge">P1 · operator</span><h3>Keep the instruments independent</h3></header>
+            <p>Instrument A and Instrument B stay runtime- and evidence-independent; their scores are never pooled.</p>
+          </article>
+          <article class="decision operator" id="P2">
+            <header><span class="id-badge">P2 · operator</span><h3>Protect registered contracts</h3></header>
+            <p>Do not alter <code>tier-judging-v0</code>, <code>Suite</code>, <code>RunRow</code>, the verdict parser, <code>DEFAULT_ROSTER</code>, or pending canonical steps without an explicit owning step.</p>
+          </article>
+          <article class="decision operator" id="P3">
+            <header><span class="id-badge">P3 · operator</span><h3>No premature publication</h3></header>
+            <p>Do not expose the first run through Steps 18–24 or write a ledger claim from one unreplicated sample.</p>
+          </article>
+          <article class="decision operator" id="P4">
+            <header><span class="id-badge">P4 · operator</span><h3>Use evidence-bearing production paths</h3></header>
+            <p>Measure production entry points, abort on fallback, preregister numeric claims, and calibrate new metrics against known-good and known-garbage anchors.</p>
+          </article>
+          <article class="decision operator" id="P5">
+            <header><span class="id-badge">P5 · operator</span><h3>Autonomous PowerShell, real Linux evidence</h3></header>
+            <p>Keep execution autonomous and PowerShell-runnable; accept containment evidence only from WSL2 Ubuntu on ext4.</p>
+          </article>
+          <article class="decision operator" id="P6">
+            <header><span class="id-badge">P6 · operator</span><h3>Append steps and follow the house pipeline</h3></header>
+            <p>Number new work from Step 56 and follow <code>plan-feature → plan-review → plan-redline → plan-wrap → repo-sync → build-phase → repo-update</code>.</p>
+          </article>
+          <article class="decision operator" id="P7">
+            <header><span class="id-badge">P7 · operator</span><h3>Repeat the intermittent gate</h3></header>
+            <p>Exercise containment 6–8 times and report the pass rate.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="agent-defaults">
+      <div class="shell">
+        <div class="section-head">
+          <h2>Agent defaults</h2>
+          <p>These D-items are the plan’s current recommendations. Each has a concrete tweak axis; reply with an ID to change it without reopening unrelated decisions.</p>
+        </div>
+        <nav class="decision-index" aria-label="Agent default index">
+          <a href="#D1">D1</a><a href="#D2">D2</a><a href="#D3">D3</a><a href="#D4">D4</a><a href="#D5">D5</a><a href="#D6">D6</a><a href="#D7">D7</a><a href="#D8">D8</a><a href="#D9">D9</a>
+        </nav>
+        <div class="decision-grid">
+          <article class="decision default" id="D1">
+            <header><span class="id-badge">D1 · default</span><h3>Quarantine all 200 rows</h3></header>
+            <dl><dt>What</dt><dd>Treat the first run as diagnostic-only instead of deleting the 23 visible contamination hits.</dd><dt>Why</dt><dd>All calls shared the same uncontrolled capability; lexical hits are only a lower bound.</dd><dt>Tweak</dt><dd>Change archive or warning presentation. Promotion requires a new sealed run, not a row filter.</dd></dl>
+          </article>
+          <article class="decision default" id="D2">
+            <header><span class="id-badge">D2 · default</span><h3>Preserve the official score</h3></header>
+            <dl><dt>What</dt><dd>Keep end-to-end score semantics and report parse health and constant-label controls separately.</dd><dt>Why</dt><dd>The registered construct rewards an unambiguous answer, not bare-token obedience; controls diagnose rather than rescore.</dd><dt>Tweak</dt><dd>Change how controls are displayed or prospectively set eligibility—not the historical score or parser.</dd></dl>
+          </article>
+          <article class="decision default" id="D3">
+            <header><span class="id-badge">D3 · default</span><h3>Seal execution and identity</h3></header>
+            <dl><dt>What</dt><dd>Use a validated provider profile, clean cwd/environment, disabled tools/session behavior, and a concrete identity receipt.</dd><dt>Why</dt><dd>Provider fallback and ambient context invalidate comparisons; requested aliases are not proof of resolved identity.</dd><dt>Tweak</dt><dd>Adjust the environment allowlist, doctor-tested CLI flags, or receipt schema while preserving fail-closed behavior.</dd></dl>
+          </article>
+          <article class="decision default" id="D4">
+            <header><span class="id-badge">D4 · default</span><h3>Read legacy data; never mix contracts</h3></header>
+            <dl><dt>What</dt><dd>Keep old runs readable as <code>LEGACY_UNSEALED</code>, but reject resume into pending Claude cells.</dd><dt>Why</dt><dd>Historical inspection is valuable; combining unsealed and sealed rows inside one run is not comparable.</dd><dt>Tweak</dt><dd>Change archive/read-only wording. Mixed-contract resume remains forbidden.</dd></dl>
+          </article>
+          <article class="decision default" id="D5">
+            <header><span class="id-badge">D5 · default</span><h3>Target Luna only through Instrument B</h3></header>
+            <dl><dt>What</dt><dd>Use the preregistered native coding-agent comparison at <code>high</code> effort; omit Luna from Instrument A.</dd><dt>Why</dt><dd>The routing question concerns agent behavior—tool loop, sandbox, patch, and held-out evaluator—not scenario judging.</dd><dt>Tweak</dt><dd>Add a separate future Instrument A study with a response-only adapter, or preregister a new effort factorial.</dd></dl>
+          </article>
+          <article class="decision default" id="D6">
+            <header><span class="id-badge">D6 · default</span><h3>Add eight gates around canonical work</h3></header>
+            <dl><dt>What</dt><dd>Reuse Steps 13–17 and 27–55; add Steps 56–63 and allow only 56 and 62 to start in parallel.</dd><dt>Why</dt><dd>The existing plans already own calibration, adapters, qualification, pilot, and decision-grade runs.</dd><dt>Tweak</dt><dd>Change batching or safe parallelism without moving ownership or bypassing wait gates.</dd></dl>
+          </article>
+          <article class="decision default" id="D7">
+            <header><span class="id-badge">D7 · default</span><h3>Use three frozen replications</h3></header>
+            <dl><dt>What</dt><dd>Require every arm eligible, all ten pair signs and identity sets stable, score/parse ranges ≤15 points, and no favorable fourth run.</dd><dt>Why</dt><dd>One sample per cell needs run-to-run stability evidence without averaging away a failed arm or direction change.</dd><dt>Tweak</dt><dd>Change repetitions, range cap, or eligibility rule only before calls and with a new preregistration.</dd></dl>
+          </article>
+          <article class="decision default" id="D8">
+            <header><span class="id-badge">D8 · default</span><h3>Make containment strictly 8/8</h3></header>
+            <dl><dt>What</dt><dd>Resolve the operator’s 6–8 range to eight post-review WSL-ext4 invocations, all passing.</dd><dt>Why</dt><dd>The captured failure is intermittent; any failure is evidence of nondeterminism, not a rate to average into acceptance.</dd><dt>Tweak</dt><dd>Choose another explicit count within 6–8 or a different acceptance rule; the current default is 8/8.</dd></dl>
+          </article>
+          <article class="decision default" id="D9">
+            <header><span class="id-badge">D9 · default</span><h3>Verify every cross-plan handoff</h3></header>
+            <dl><dt>What</dt><dd>Keep scorer-policy identity in a preregistered replication receipt and gate transitions with <code>-VerifyOnly</code>.</dd><dt>Why</dt><dd>A coordinator spanning three plan files must fail closed on absent, stale, edited, or mismatched evidence.</dd><dt>Tweak</dt><dd>Change receipt location, versioned schema, or verification packaging without weakening the gate.</dd></dl>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="not-v1">
+      <div class="shell">
+        <div class="section-head">
+          <h2>Not in v1</h2>
+          <p>These exclusions keep a validity repair from becoming a new benchmark program or an operations product.</p>
+        </div>
+        <ul class="out-list">
+          <li>No Luna, Haiku, or other additions to <code>DEFAULT_ROSTER</code>; no Instrument A Luna adapter.</li>
+          <li>No changes to <code>tier-judging-v0</code>, <code>Suite</code>, <code>RunRow</code>, the official parser, conflict rule, or parse-failure zero.</li>
+          <li>No edits, renumbering, or duplication of pending canonical Steps 13–24 or 27–55.</li>
+          <li>No Steps 18–24 operations surfaces and no publication of the first run through them.</li>
+          <li>No row deletion salvage, first-label score, score pooling, or ledger claim from a single/unsealed run.</li>
+          <li>No service, scheduler, dashboard, or interactive mid-run approval workflow.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="risks">
+      <div class="shell">
+        <div class="section-head">
+          <h2>Risks and halt conditions</h2>
+          <p>A red result is evidence. The plan preserves artifacts and stops at the owning step instead of falling back, tuning after looking, or asking for approval mid-run.</p>
+        </div>
+        <div class="risk-grid">
+          <article class="note risk"><h3>Claude CLI drift</h3><p>Unsupported sealing flags, auth failure, a changed JSON envelope, or unresolved identity halt Step 56 before an unsealed call.</p></article>
+          <article class="note risk"><h3>Operator-started local endpoint</h3><p>Steps 13 and 59 require the explicit local OpenAI-compatible endpoint. An unresolved profile or unreachable endpoint aborts before any call; the plan never auto-starts or silently replaces it.</p></article>
+          <article class="note risk"><h3>Metric instability</h3><p>A below-control arm, changed pair direction, or &gt;15-point range blocks Step 16. The fixed three runs stay preserved; there is no favorable fourth.</p></article>
+          <article class="note risk"><h3>Containment nondeterminism</h3><p>Anything below 8/8 returns to Step 62. Native Windows tests, selected skips, live identities, and retained-FD escapes cannot qualify Step 27.</p></article>
+          <article class="note risk"><h3>Dirty-worktree isolation</h3><p>Build worktrees will not inherit the current user-owned process/test and report/CLI edits. Those changes must be checkpointed by ownership before execution.</p></article>
+          <article class="note risk"><h3>Historical contract mixing</h3><p>Legacy data remains inspectable, but sealed rows cannot append to an unsealed run and requested aliases cannot stand in for provider identity.</p></article>
+          <article class="note risk"><h3>Cross-plan bypass</h3><p>An absent or stale receipt blocks the next plan. Numeric <code>--resume</code> never substitutes for an explicit plan, step, and verify-only check.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section id="feedback">
+      <div class="shell">
+        <div class="section-head">
+          <h2>Redline by ID</h2>
+          <p>Reply tersely—one change per line. Accepted changes update the Markdown source first, then overwrite this same HTML path with an incremented publication version. Silence means the proposal stands.</p>
+        </div>
+        <div class="feedback-box">
+          <div class="feedback-copy">
+            <h3>Feedback grammar</h3>
+            <div class="grammar" aria-label="Feedback examples">
+              <code>D7 -&gt; cap max range at 10 points</code>
+              <code>D8 -&gt; use 6/6 instead of 8/8</code>
+              <code>D5 -&gt; add a separate Instrument A Luna study</code>
+              <code>P2 -&gt; change: authorize an explicit parser-owning step</code>
+              <code>accept</code>
+            </div>
+            <p>P-items are operator-picked constraints. D-items are recommended defaults. IDs never get deleted or renumbered; a reversed item is marked <code>changed YYYY-MM-DD</code> and a new choice is appended.</p>
+          </div>
+          <aside class="sources" aria-labelledby="sources-title">
+            <h3 id="sources-title">Authoritative source paths</h3>
+            <ul>
+              <li><a href="first-measurement-validity-and-luna-routing-plan.md"><code>documentation/first-measurement-validity-and-luna-routing-plan.md</code></a> — source of truth</li>
+              <li><a href="first-measurement-validity-and-luna-routing-plan-review.md"><code>documentation/first-measurement-validity-and-luna-routing-plan-review.md</code></a> — evidence-backed review</li>
+              <li><a href="coding-agent-benchmark-plan.md"><code>documentation/coding-agent-benchmark-plan.md</code></a> — canonical Instrument B rail</li>
+              <li><a href="../plan.md"><code>plan.md</code></a> — canonical Instrument A rail</li>
+              <li><a href="../profiles/agent-models-candidates.json"><code>profiles/agent-models-candidates.json</code></a> — registered Luna candidate</li>
+              <li><a href="first-measurement-validity-and-luna-routing-plan-proposal.html"><code>documentation/first-measurement-validity-and-luna-routing-plan-proposal.html</code></a> — stable proposal view</li>
+            </ul>
+          </aside>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell">
+      <span>First-Measurement Validity &amp; Luna Routing · redline proposal v2</span>
+      <span>The Markdown plan is authoritative. This file is a review surface.</span>
+    </div>
+  </footer>
+</body>
+</html>
