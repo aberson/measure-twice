@@ -3,7 +3,7 @@
 
 ## 1. Role taxonomy (exact definitions)
 
-Single source of truth: `C:\Users\abero\dev\.claude\references\skill-role-taxonomy.md` §1 (lines 21-29). Both skills CITE it and are forbidden from re-inlining it (guarded by `test_taxonomy_osot.py`). Verbatim rows:
+Single source of truth: `.claude/references/skill-role-taxonomy.md` §1 (lines 21-29). Both skills CITE it and are forbidden from re-inlining it (guarded by `test_taxonomy_osot.py`). Verbatim rows:
 
 - **ORCH** (l.23) — "Orchestration — drives a multi-step pipeline, dispatches sub-agents" / "Stateful coordinating spine; holds cross-step context"
 - **AUTHOR** (l.24) — "Authorship — writes code, prose, docs, plans, notebook cells" / "Produces content; each pass creates rather than scores"
@@ -70,5 +70,5 @@ A "benchmark says this slice is local-safe" claim plugs in as ONE entry: `"<skil
 
 ## 6. Produced artifacts (committed truth; samples in skill dirs are older shapes)
 
-- `C:\Users\abero\dev\offload-scan-out\inventory.md` + `offload-config.json` — 2026-07-12 scan, 43 skills, 8 local-safe slices (7 live, 1 gated). Gated: `skill-eval-setup-grader` (`false`, l.28); `build-step-style` flipped `true` (config l.8) — inventory found "Gate precondition SATISFIED in current skill text," flags tier-offload's own background parenthetical as stale.
-- `C:\Users\abero\dev\tier-escalate-out\escalation-map.md` — 2026-07-12 scan: 2 FABLE-SEED (plan-init, bug-fix/user-debug) · 4 CONDITIONAL (plan-feature, plan-merge, review-deep, review-memories/memory-distill) · 37 STAY. deep-research is NOT a SKILL.md — its seed phases live in `deep-research-pinned` workflow (§1 l.25-29). Headline: **arms-pinned audit found 16 skills dispatch unpinned arms, zero fully pinned** at scan time (§4). §5 records demotions (raw agents said 18 FABLE-SEED). Committed maps are the "monthly diff-baseline — do not retro-edit."
+- `offload-scan-out/inventory.md` + `offload-config.json` — 2026-07-12 scan, 43 skills, 8 local-safe slices (7 live, 1 gated). Gated: `skill-eval-setup-grader` (`false`, l.28); `build-step-style` flipped `true` (config l.8) — inventory found "Gate precondition SATISFIED in current skill text," flags tier-offload's own background parenthetical as stale.
+- `tier-escalate-out/escalation-map.md` — 2026-07-12 scan: 2 FABLE-SEED (plan-init, bug-fix/user-debug) · 4 CONDITIONAL (plan-feature, plan-merge, review-deep, review-memories/memory-distill) · 37 STAY. deep-research is NOT a SKILL.md — its seed phases live in `deep-research-pinned` workflow (§1 l.25-29). Headline: **arms-pinned audit found 16 skills dispatch unpinned arms, zero fully pinned** at scan time (§4). §5 records demotions (raw agents said 18 FABLE-SEED). Committed maps are the "monthly diff-baseline — do not retro-edit."

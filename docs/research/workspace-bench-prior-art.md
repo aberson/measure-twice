@@ -3,7 +3,7 @@
 
 ## Path corrections
 - VF runner is `void_furnace\src\void_furnace\benchmark\runner.py` (not `benchmark\runner.py` at repo root). Siblings: `judge.py`, `anchors.py`, `cli.py`, `report.py`; tests under `void_furnace\tests\test_benchmark\`.
-- switchboard package dir: `C:\Users\abero\dev\switchboard\switchboard\`; worktree copy at `C:\Users\abero\worktree_switchboard-endpoint-launcher\`.
+- switchboard package dir: `switchboard/switchboard/`; worktree copy at `~/worktree_switchboard-endpoint-launcher/`.
 - There is NO `harness.resolve_assignment` in switchboard. Routing/gating: `config.py` (`offload_allowed`, `model_for`). Bench engine: `harness.py`/`bakeoff.py`/`certify.py`.
 
 ## AREA 1 — void_furnace benchmark infra (`src/void_furnace/benchmark/`) — EXTRACT-PATTERN

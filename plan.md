@@ -222,7 +222,7 @@ measure-twice/
 ## 10. How to Run
 
 ```powershell
-cd c:\Users\abero\dev\measure-twice
+cd $env:USERPROFILE\dev\measure-twice
 uv sync --extra dev
 uv run pytest -q                                   # includes anchor ordering gates
 uv run mt validate suites/smoke.json
@@ -437,11 +437,11 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Issue:** #18
 - **Commands:**
   ```powershell
-  powershell -ExecutionPolicy Bypass -NoProfile -File c:\Users\abero\dev\switchboard\scripts\start-offload.ps1
+  powershell -ExecutionPolicy Bypass -NoProfile -File $env:USERPROFILE\dev\switchboard\scripts\start-offload.ps1
   ```
   Then, in a second terminal:
   ```powershell
-  cd c:\Users\abero\dev\measure-twice
+  cd $env:USERPROFILE\dev\measure-twice
   uv run mt smoke --local
   ```
 - **What to look for:**
@@ -456,7 +456,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Issue:** #19
 - **Commands:**
   ```powershell
-  cd c:\Users\abero\dev\measure-twice
+  cd $env:USERPROFILE\dev\measure-twice
   uv run mt calibrate --suite suites/tier-judging-v1.json
   ```
 - **What to look for:**
@@ -473,7 +473,7 @@ Run as e.g. `/build-phase --plan measure-twice/plan.md --phase A` after `/plan-e
 - **Issue:** #20
 - **Commands:**
   ```powershell
-  cd c:\Users\abero\dev\measure-twice
+  cd $env:USERPROFILE\dev\measure-twice
   uv run mt profile opus
   uv run mt claims list
   ```
