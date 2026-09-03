@@ -2,11 +2,36 @@
 
 A local benchmarking toolkit for deciding **which model should do which job — with measurements instead of assertions**. It provides a Python package + `mt` CLI to author benchmark suites, sweep them across a roster of models (local OpenAI-compatible endpoints and Claude tiers), score results through calibrated instruments, and keep an **evidence ledger** that ties every model-routing claim to the run that backs it (or honestly marks it `ASSERTED`). The flagship deliverable is a *discriminative* dataset: scored 0–100, designed and iterated so no roster model saturates either end.
 
-> **Status:** Core engine + evidence ledger complete — issues #1–#12 closed (`mt validate|run|score|report|claims|author|smoke`, a 28-claim quote-hashed ledger, and flagship dataset v0). The provider-neutral **coding-agent benchmark substrate** is now shipped — issues #27–#28 closed: strict agent-suite / model-registry / analysis-plan validation behind `mt agent validate`, plus a fail-closed Linux execution substrate (FD-capability isolation, cgroup + private-tmpfs hard guards, Bubblewrap sandboxing). 462 tests passing, 0 type errors, 0 lint violations. Next: `plan.md` Steps 13–17 (calibration sweep → first ledger measurements). Full design: [`plan.md`](plan.md) · coding-agent feature plan: [`documentation/coding-agent-benchmark-plan.md`](documentation/coding-agent-benchmark-plan.md).
+## Status
+
+> **Status:** Instruments are built; **no benchmark measurement has been produced yet.** Core engine + evidence ledger complete — issues #1–#12 closed (`mt validate|run|score|report|claims|author|smoke`, a 28-claim quote-hashed ledger, and flagship dataset v0). The provider-neutral **coding-agent benchmark substrate** is shipped — issues #27–#28 closed: strict agent-suite / model-registry / analysis-plan validation behind `mt agent validate`, plus a fail-closed Linux execution substrate (FD-capability isolation, cgroup + private-tmpfs hard guards, Bubblewrap sandboxing). It can define an instrument and contain a process; **no provider adapter and no inference call exists yet.** 478 tests passing / 111 skipped (Linux-only containment cases, deselected on Windows), 0 type errors, 0 lint violations.
+>
+> Of the 28 ledger claims, 1 is `MEASURED` and 2 carry evidence run ids — the loop below is built end-to-end but has been *exercised* for almost none of it. That gap is the project.
+>
+> **Three tracks are open, none of them finished:** `plan.md` Steps 13–17 (calibration sweep → first ledger measurements) have **not started** and need the local endpoint up; coding-agent Steps 27–55 are unblocked with **Step 27 next** (#29); and the first-measurement-validity phase Steps 56–63 (#61–#68) is **BLOCKED at Step 56** (#62). Full design: [`plan.md`](plan.md) · coding-agent feature plan: [`documentation/coding-agent-benchmark-plan.md`](documentation/coding-agent-benchmark-plan.md) · validity phase: [`documentation/first-measurement-validity-and-luna-routing-plan.md`](documentation/first-measurement-validity-and-luna-routing-plan.md).
 
 ## Why
 
 An audit of this workspace's model-routing policies found exactly **one** genuine head-to-head quality measurement behind every "which tier for which task" decision — the rest is role-shape heuristics (see [`docs/research/tier-skills-benchmark-map.md`](docs/research/tier-skills-benchmark-map.md)). measure-twice makes that gap enumerable and converts it, one pre-registered run at a time.
+
+## Workflow
+
+```mermaid
+flowchart LR
+    A["Author and curate suite<br/>mt author harvest / stub"] --> B["Validate and hash<br/>mt validate"]
+    B --> P["Preregister the claim sentence<br/>written BEFORE the run"]
+    P --> C["Run model sweep<br/>mt run, preregistration recorded in manifest.json"]
+    C --> D["Store raw responses<br/>append-only rows.jsonl, response_raw verbatim"]
+    D --> E["Score or re-score<br/>mt score, models under test never re-called"]
+    E --> F["Report or compare<br/>mt report, cross-run compare needs an equal suite hash"]
+    F --> G["Attach the run id to the claim's evidence<br/>hand edit of data/ledger/claims.jsonl"]
+    G --> H["Audit and render the ledger<br/>mt claims audit, mt claims render"]
+    F -->|"Refine suite: new items, new hash, new instrument"| A
+```
+
+`mt smoke` drives this same spine end to end on the 2-item smoke suite, with its exit
+code as the gate. The coding-agent benchmark is a **second instrument on the same
+doctrine** and is not drawn here: today it stops at `mt agent validate`.
 
 ## Stack
 
@@ -56,7 +81,7 @@ explicitly selected out and reported as skips — they are never silently absent
 ## Key design decisions
 
 - **Fail loud, never warn.** Unreachable endpoint, malformed suite, tripped judge parse-gate — runs abort. A silently degraded bench produces numbers indistinguishable from real ones.
-- **Score the production artifact.** Raw responses stored verbatim; no-response force-scored 0 before any judging; scoring re-runs offline (`mt score`) without burning model calls.
+- **Score the production artifact.** Raw responses stored verbatim; no-response force-scored 0 before any judging; scoring re-runs from stored responses (`mt score`) so **the models under test are never re-called**. Note this is not the same as "offline": a rubric suite still makes fresh k=3 judge calls when re-scored.
 - **Calibrate before comparing.** Every scorer ships a frozen good/garbage anchor pair; CI asserts `score(good) > score(garbage)` forever. The flagship dataset carries an acceptance band ([5, 95] for every roster model) and a pre-registered kill criterion.
 - **No judge circularity on the claims that matter.** Tier-ordering claims rest on deterministic gold answers only; LLM rubric judging (k=3, median, per-judge parse gate) profiles capabilities but never flips a ledger claim alone.
 - **Evidence ledger as first-class.** Claims carry `MEASURED / PARTIAL / ASSERTED / STALE`, quote-hashed source citations, and pre-registration sentences written before the run.

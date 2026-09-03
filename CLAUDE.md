@@ -65,7 +65,7 @@ Suites carry ALL item content (no prompt templates in adapters — the fallback-
 
 The Linux substrate rests on one **kernel-object-identity invariant**: every caller-supplied filesystem source is opened once via `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)` and thereafter referred to only by that owned descriptor (`LinuxPathCapability`), so a later rename, unlink, or symlink swap cannot redirect a mount, a cwd, a capture scan, or a resource walk. Processes launch through `systemd-run --user --scope` into a fresh transient cgroup (`LinuxResourceGuard`) with a private tmpfs per evaluator repetition (`EvaluatorScratch`), sandboxed by Bubblewrap using `--bind-fd`/`--ro-bind-fd`. Resource enforcement is explicitly **two-layer and self-labelling**: memory/pids/tmpfs ceilings are hard host guards read back before the target is released and record `hard-guard` provenance, while cumulative CPU and logical-tree thresholds are sampled scoring rules that record `sampled-threshold` provenance and may overshoot. There is no polling-only or path-bind fallback: a missing or incompatible dependency raises `IsolationUnavailableError` and fails the gate rather than degrading.
 
-## Current state
+## Status
 
 **Phase A (core engine) COMPLETE** (2026-07-17): Steps 1–7 shipped + merged to master (issues #1–#7 closed) — `config` resolver, `suite` schema + canonical item-hash + `mt validate`, model `adapters` (local OpenAI-compat + `claude` CLI, both behind DI seams), the sweep `runner` (append-only JSONL, cell-level resume, budgets, no-response force-0), deterministic verdict/exact `scoring` + the §5.6 parse spine + frozen anchors, the k=3-median rubric `judge` (per-judge parse-fail gate), and `report` + `mt smoke`. Step M1 local-endpoint smoke (#18) is closed.
 
@@ -81,7 +81,15 @@ Gate evidence at wrap: native suite from the repo root **462 passed, 110 skipped
 
 **Next: canonical `plan.md` Steps 13–17** — 13 calibration sweep (observation run), 14 discriminative calibration + dataset iteration, 15 capability profiling, 16 first ledger measurements (observation run), 17 methodology rollup + README. Steps 13 and 16 are operator observation runs needing the local endpoint up. `measure_twice/analyze/` (calibrate, profile, agreement) does not exist yet — Steps 14–15 create it.
 
-Coding-agent Steps 27–55 are also unblocked and may proceed in parallel: that plan states it does not require the pending Steps 13–24, which is why 25–26 were built ahead of them.
+Coding-agent Steps 27–55 are also unblocked and may proceed in parallel: that plan states it does not require the pending Steps 13–24, which is why 25–26 were built ahead of them. **Step 27 (#29) is the next one there.**
+
+**A fourth plan exists and is the most recent work:** `documentation/first-measurement-validity-and-luna-routing-plan.md`, Steps 56–63 (issues #61–#68 under umbrella #60). **Step 56 is BLOCKED** (2026-08-31, #62) — "Seal and fail-close Instrument A execution". Its in-progress work is preserved *uncommitted* in the worktree at `../worktree_build-step-56-20260831053108` (14 files, incl. `measure_twice/model_sweep_execution.py`, `profiles/model-sweep-execution-v1.json`, `tests/test_model_sweep_execution.py`). **That worktree is not junk — do not remove or clean it until Step 56 resumes.**
+
+So there are **four** plan documents partitioning step ids (1–17 / 18–24 / 25–55 / 56–63); `plan.md` is canonical for the Instrument A spine but is *not* the whole picture. `same-page.toml` declares all four, because any status tool that sees only `plan.md` treats every step above 17 as an unknown reference.
+
+**Current gate numbers: 478 passed / 111 skipped** at `9d949e9` (the "462 passed, 110 skipped" above is the Steps 25–26 wrap record, kept as history).
+
+> **Before trusting a red `test_smoke_bundle_contract_and_instrument_hash_golden`, check for generated files in the bundle.** `agent_bench` instrument identity is a recursive hash over *every* regular file under a task's `seed/` and `oracle/` trees, with no filter for build artifacts — and `__pycache__/` is gitignored, so a contaminated bundle still reports a clean `git status`. A stray `__pycache__` (e.g. from a bare `python -m pytest` on the ambient interpreter rather than `uv run`) silently changes the instrument hash and turns master red. Fix: `find suites/agents -name __pycache__ -type d` and remove. Tracked as **#69** — the loader should reject this, not ignore it.
 
 > **Do NOT build `plans/benchmark-operations-surfaces-plan.md` (Steps 18–24) yet.** That plan is APPROVED but *blocked*: its surfaces (suite catalog, instrument fingerprints, comparable-run leaderboard, refresh selector, `/change-benchmark`, observatory contract, real benchmark smoke) all read measurement output that Steps 13–17 have not produced. Steps 13–17 have **not started**. Build 18–24 before them and the surfaces render an empty or fabricated benchmark.
 

@@ -1,0 +1,51 @@
+# same-page manifest for measure-twice.
+# Schema: same-page v1 (same-page/src/same_page/manifest.py).
+# Roles: canonical-plan | readme-summary | issue-export.
+#
+# Refresh the issue export before every run (it is gitignored, never committed):
+#   gh issue list --repo aberson/measure-twice --state all \
+#     --json number,title,state,url,body --limit 300 > data/exports/issues.json
+# --limit 300 is mandatory: gh defaults to 30, which would hide #1-#38 and make
+# every plan reference to them look dangling.
+#
+#   uv run --project ../same-page same-page check same-page.toml
+# Exit: 0 clean | 1 contradictions | 2 parse diagnostics | 64 usage error.
+
+schema_version = 1
+approved_roots = ["."]
+
+# --- Canonical plans (authoritative).
+# measure-twice partitions step ids across FOUR plan documents (1-17 / 18-24 /
+# 25-55 / 56-63). All four must be declared, or same-page treats every step id
+# defined outside plan.md as an unknown reference.
+[[artifact]]
+path = "plan.md"
+role = "canonical-plan"
+
+[[artifact]]
+path = "plans/benchmark-operations-surfaces-plan.md"
+role = "canonical-plan"
+
+[[artifact]]
+path = "documentation/coding-agent-benchmark-plan.md"
+role = "canonical-plan"
+
+[[artifact]]
+path = "documentation/first-measurement-validity-and-luna-routing-plan.md"
+role = "canonical-plan"
+
+# --- Secondary summaries: the side that goes stale when the plans move on.
+# Each needs a level-2 heading whose text is exactly "Status"; a
+# "> **Status:**" blockquote alone is not parsed as one.
+[[artifact]]
+path = "README.md"
+role = "readme-summary"
+
+[[artifact]]
+path = "CLAUDE.md"
+role = "readme-summary"
+
+# --- Issue export (gitignored; see the refresh command above).
+[[artifact]]
+path = "data/exports/issues.json"
+role = "issue-export"
