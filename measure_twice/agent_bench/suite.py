@@ -3,7 +3,11 @@
 An agent suite is a directory, not a single JSON document.  ``suite.json`` points to strict task
 manifests; each task manifest in turn points only within its own bundle.  Structural loading walks
 every referenced component without following symlinks or Windows reparse points and verifies the
-fixed visible/hidden pytest layout without executing task code.
+fixed visible/hidden pytest layout without executing task code.  A task's seed and oracle assets
+are *every* regular file in those trees, so a tree holding generated Python bytecode--a
+``__pycache__`` directory or a ``.pyc``/``.pyo`` file--is rejected at load with the offending path
+named, never silently skipped: the hashed file set and any later materialization of the same tree
+must answer which-files-count identically.
 
 The v1 instrument-hash preimage is canonical JSON of this shape::
 
@@ -61,6 +65,11 @@ ALWAYS_PROTECTED_PATHS: tuple[str, ...] = (
     "tests",
 )
 _SEED_FORBIDDEN_NAMES = frozenset({".git", ".gitignore", ".gitattributes", ".gitmodules"})
+# Leavings of a Python run against a bundle tree.  Rejected, never skipped: filtering would
+# stabilize the hash while hiding that the bundle was compiled in place, and would give the
+# loader and any later tree materializer two different answers to which-files-count.
+_GENERATED_BYTECODE_NAMES = frozenset({"__pycache__"})
+_GENERATED_BYTECODE_SUFFIXES: tuple[str, ...] = (".pyc", ".pyo")
 
 
 class AgentSuiteError(AgentInputError):
@@ -540,8 +549,18 @@ def _join_relative(parent: str, child: str) -> str:
     return f"{parent}/{child}" if parent else child
 
 
+def _reject_generated_bytecode(name: str, relative: str, *, label: str) -> None:
+    """Refuse compiled-Python leavings, so a bundle compiled in place can never be hashed."""
+
+    if name in _GENERATED_BYTECODE_NAMES or name.endswith(_GENERATED_BYTECODE_SUFFIXES):
+        raise AgentSuiteError(
+            f"{label} may not contain generated Python bytecode: {relative}; remove every "
+            "__pycache__ directory and .pyc/.pyo file from the bundle, then re-validate"
+        )
+
+
 def _walk_regular_files(root: _ContainedRoot, relative: str, *, label: str) -> _TreeSnapshot:
-    """Capture one identity-bound tree snapshot, rejecting races, links, and special files."""
+    """Capture one identity-bound snapshot, rejecting races, links, special files, and bytecode."""
 
     assets: list[_AssetDescriptor] = []
     directories = {relative}
@@ -571,6 +590,7 @@ def _walk_regular_files(root: _ContainedRoot, relative: str, *, label: str) -> _
                         f"{label} may not contain a symlink, junction, or reparse point: "
                         f"{child_relative}"
                     )
+                _reject_generated_bytecode(entry.name, child_relative, label=label)
                 if entry.is_directory:
                     with _open_contained_handle(
                         directory,

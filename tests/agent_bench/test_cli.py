@@ -139,6 +139,25 @@ def test_non_structure_validate_fails_loud_without_execution(
     assert "--structure-only" in captured.err
 
 
+def test_agent_validate_reports_bundle_bytecode_as_one_actionable_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bundle = tmp_path / "smoke"
+    shutil.copytree(SMOKE, bundle)
+    (bundle / "tasks" / "smoke-add" / "oracle" / "tests" / "__pycache__").mkdir()
+
+    rc = main(["agent", "validate", str(bundle), "--structure-only"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert len(captured.err.splitlines()) == 1
+    assert captured.err.startswith("agent validate: ")
+    assert "generated Python bytecode" in captured.err
+    assert "tasks/smoke-add/oracle/tests/__pycache__" in captured.err
+    assert "re-validate" in captured.err
+
+
 def test_agent_validate_surfaces_contract_failure_without_traceback(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
