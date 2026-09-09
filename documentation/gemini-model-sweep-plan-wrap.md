@@ -1,6 +1,6 @@
 Completion gate: no consistent completion markers found -- running full check (fail-safe default).
 
-Validated 2026-09-09 after plan-review and proposal publication 1.
+Validated 2026-09-09 after plan-review and proposal publication 2.
 
 §1 Schemas and data structures — pass: result/row, binding, request context, and HTTP fields summarized.
 §2 Identifiers — pass: safe aliases, generated run IDs, and profile/suite SHA-256 digests defined.
@@ -27,5 +27,10 @@ None.
 ## Minor
 
 None. Canonical plan entry and same-page declaration updates are included in Step 64.
+
+Recheck after the API correction: all 13 checks remain satisfied. The example request now
+omits unsupported candidateCount; the consumed-field validation and additive-metadata rules
+are explicit. Reviewer dispatch is authorized. Existing prerequisite distinctions and stable
+decision IDs are unchanged; the two-call live smoke still requires credentials and permission.
 
 READY

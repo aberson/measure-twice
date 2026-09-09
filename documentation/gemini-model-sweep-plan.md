@@ -79,7 +79,9 @@ automatic substitution when unavailable. Adding a model later requires an explic
 `https://generativelanguage.googleapis.com/v1beta/models/{requested_model}:generateContent`.
 Validate the model ID as a single safe Gemini model name before URL construction. Send one
 `contents` user message containing the suite prompt verbatim, no instructions or tools added.
-Use `candidateCount: 1`, `maxOutputTokens: 4096`, and `thinkingConfig.thinkingLevel: low`.
+Use `maxOutputTokens: 4096` and `thinkingConfig.thinkingLevel: low`. Omit `candidateCount`:
+Google's current migration guide marks it unsupported for Gemini 3 and later. Validate one
+returned candidate under this text-only request contract.
 Pin these settings and the 120-second transport timeout in the Gemini execution profile so
 resume cannot mix request contracts. Native REST exposes `modelVersion` directly and keeps
 the existing standard-library dependency policy. Google labels generateContent a legacy API
@@ -95,7 +97,7 @@ to use that shared hash owner. The endpoint and single-candidate/text-only reque
 fixed by `request_contract`, never a repository-selected URL.
 
 Request body shape: `{"contents":[{"role":"user","parts":[{"text":"suite prompt"}]}],
-"generationConfig":{"candidateCount":1,"maxOutputTokens":4096,
+"generationConfig":{"maxOutputTokens":4096,
 "thinkingConfig":{"thinkingLevel":"low"}}}`. Response fields used:
 `modelVersion: string`, `candidates: array` with each candidate's `finishReason: string` and
 `content.parts: array` of `{text: string, thought?: boolean}`, and
@@ -115,7 +117,8 @@ requested alias. Join final text parts in order without trimming the stored text
 parts marked `thought`. Empty, safety-blocked, or thought-only responses must not score as
 answers. `MAX_TOKENS` maps to the existing truncation error; a documented safety/recitation
 block maps to no-response. Missing candidate structure without a valid blocking reason and
-unsupported/malformed response fields map to bad-envelope. Classify transport/HTTP errors with
+unsupported content types, unexpected finish reasons, and malformed consumed fields map to
+bad-envelope. Ignore unrelated additive response metadata. Classify transport/HTTP errors with
 the existing taxonomy without persisting exception text or a body that may echo a key.
 No implicit retries: each scheduled attempt consumes one call from the existing budget.
 
@@ -186,7 +189,8 @@ redirect behavior. The live Step 65 is the end-to-end provider smoke before any 
 Build each code step in an isolated git worktree after dependency sync. A fresh developer agent
 implements it, mechanical checks run before six independent reviewer lenses, and only a passing
 review plus full post-merge tests permits DONE. The user authorized unattended implementation;
-the installed Codex review adapter exception is awaiting their explicit answer. Stop neither for
+the user explicitly approved six native fresh-context reviewer agents on 2026-09-09, overriding
+the installed Codex review adapter's dispatch halt while preserving its review gates. Stop neither for
 routine implementation choices nor for absent Gemini credentials during the offline code step.
 
 Provision the key through the operating-system environment-variable interface; do not paste it
