@@ -569,10 +569,86 @@ def _seed_rubric_run(tmp_path: Path, *, judges: list[str] | None = None) -> str:
     return result.run_id
 
 
+@pytest.mark.parametrize("command", ["run", "score"])
+@pytest.mark.parametrize("field", ["roster", "judges"])
+@pytest.mark.parametrize("corruption", ["null", "non-list", "member", "missing", "empty", "unsafe"])
+def test_cli_rejects_malformed_stored_selection_before_calls_or_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    field: str,
+    corruption: str,
+) -> None:
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    run_id = _seed_rubric_run(tmp_path)
+    run_dir = tmp_path / "runs" / run_id
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if corruption == "missing":
+        del manifest[field]
+    else:
+        manifest[field] = {
+            "null": None,
+            "non-list": "sonnet",
+            "member": [manifest[field][0], None],
+            "empty": [],
+            "unsafe": ["../sonnet"],
+        }[corruption]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with (run_dir / "rows.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write('{"run_id":"torn selection tail"')
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    directories_before = {
+        path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_dir()
+    }
+    calls: list[str] = []
+
+    def forbidden_factory() -> object:
+        calls.append("doctor/provider")
+        raise AssertionError("invalid stored selection must fail before doctor/provider calls")
+
+    args = [command, "--out", str(tmp_path)]
+    if command == "run":
+        args += ["--suite", str(run_dir / "suite.json"), "--resume", run_id]
+    else:
+        args += [run_id]
+    rc = main(
+        args,
+        deps=CliDeps(
+            local_transport_factory=forbidden_factory,  # type: ignore[arg-type]
+            claude_runner_factory=forbidden_factory,  # type: ignore[arg-type]
+        ),
+    )
+
+    assert rc == 1
+    output = capsys.readouterr()
+    expected = {
+        "empty": f"{field} must contain at least one model name",
+        "unsafe": f"{field}[0] '../sonnet' contains unsafe characters",
+    }.get(corruption, f"manifest {field} must be a list of model aliases")
+    assert f"{command}: {expected}" in output.err
+    assert "Traceback" not in output.out + output.err
+    assert calls == []
+    assert {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    } == before
+    assert {
+        path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_dir()
+    } == directories_before
+
+
 @pytest.mark.parametrize(
     "scenario",
     [
         "recorded-selection",
+        "recorded-duplicates",
         "unresolved",
         "ambiguous",
         "malformed",
@@ -615,11 +691,14 @@ def test_cli_rubric_contract_from_collection_through_judge_process(
     assert collect_rc == 0
     assert stub.claude_calls == []  # judges were preflighted, never invoked by collection
     run_dir = next((tmp_path / "runs").iterdir())
-    if scenario in {"legacy", "missing-judge-binding"}:
+    if scenario in {"legacy", "missing-judge-binding", "recorded-duplicates"}:
         manifest_path = run_dir / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if scenario == "legacy":
             del manifest["execution_receipt"]
+        elif scenario == "recorded-duplicates":
+            manifest["roster"] *= 2
+            manifest["judges"] *= 2
         else:
             manifest["execution_receipt"] = ExecutionReceipt.create(
                 DEFAULT_EXECUTION_PROFILE,
@@ -666,11 +745,11 @@ def test_cli_rubric_contract_from_collection_through_judge_process(
         config_path.write_text(json.dumps({"execution_profile": profile}), encoding="utf-8")
         args += ["--config", str(config_path)]
     rc = main(args, deps=CliDeps(claude_runner_factory=lambda: process))
-    if scenario == "recorded-selection":
+    if scenario in {"recorded-selection", "recorded-duplicates"}:
         assert rc == 0
         assert judge_models == ["fable"] * 3
         manifest = json.loads((run_dir / "manifest.json").read_text())
-        assert manifest["judges"] == ["fable"]
+        assert manifest["judges"] == ["fable"] * (2 if scenario == "recorded-duplicates" else 1)
         assert [binding["alias"] for binding in manifest["execution_receipt"]["bindings"]] == [
             "general-35b",
             "fable",

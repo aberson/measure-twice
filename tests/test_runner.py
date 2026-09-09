@@ -384,7 +384,10 @@ def test_error_row_records_reason_class(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_resume_skips_exactly_completed_cells(tmp_path: Path, legacy: bool) -> None:
+@pytest.mark.parametrize("duplicate_selections", [False, True])
+def test_resume_skips_exactly_completed_cells(
+    tmp_path: Path, legacy: bool, duplicate_selections: bool
+) -> None:
     suite = _suite(["a", "b", "c", "d"])
     cfg = RunConfig()
     stub1 = StubAdapters()
@@ -402,9 +405,13 @@ def test_resume_skips_exactly_completed_cells(tmp_path: Path, legacy: bool) -> N
     completed = {r["item_id"] for r in _read_jsonl(tmp_path / "runs" / r1.run_id / "rows.jsonl")}
     assert completed == {"a", "b"}
     manifest_path = tmp_path / "runs" / r1.run_id / "manifest.json"
-    if legacy:
+    if legacy or duplicate_selections:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        del manifest["execution_receipt"]
+        if legacy:
+            del manifest["execution_receipt"]
+        if duplicate_selections:
+            manifest["roster"] *= 2
+            manifest["judges"] *= 2
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     manifest_before = manifest_path.read_bytes()
 

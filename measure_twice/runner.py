@@ -310,6 +310,16 @@ def _read_manifest(run_dir: Path) -> Mapping[str, object]:
     return cast("Mapping[str, object]", data)
 
 
+def _read_manifest_selection(manifest: Mapping[str, object], label: str) -> list[str]:
+    """Read safe recorded model aliases, deduplicated in their original order."""
+    raw = manifest.get(label)
+    if not isinstance(raw, list) or not all(isinstance(name, str) for name in raw):
+        raise RunError(f"manifest {label} must be a list of model aliases")
+    names = cast("list[str]", raw)
+    _validate_names(names, label)
+    return list(dict.fromkeys(names))
+
+
 def _write_suite_snapshot(run_dir: Path, suite: Suite) -> None:
     """Snapshot the exact instrument this run measured (enables offline re-scoring — Decision 10).
 
@@ -789,19 +799,15 @@ def run(
             )
         # Dedupe defensively (the manifest roster was deduped at write time — a duplicate model must
         # never re-process a cell, see the fresh branch); samples/budget from the stored manifest.
-        stored_roster = cast("Sequence[object]", manifest["roster"])
-        eff_roster = list(dict.fromkeys(str(m) for m in stored_roster))
+        eff_roster = _read_manifest_selection(manifest, "roster")
         eff_samples = int(cast("int", manifest["samples_per_cell"]))
-        stored_judges = cast("Sequence[object]", manifest["judges"])
-        eff_judges = list(dict.fromkeys(str(j) for j in stored_judges))
+        eff_judges = _read_manifest_selection(manifest, "judges")
         stored_budgets = cast("Mapping[str, object]", manifest["budgets"])
         eff_max_calls = (
             max_calls if max_calls is not None else int(cast("int", stored_budgets["max_calls"]))
         )
         # Fail loud on an invalid (e.g. --budget 0) resume budget BEFORE the torn-line rewrite.
         _validate_sweep_params(eff_roster, eff_samples, eff_max_calls)
-        _validate_names(eff_roster, "roster")
-        _validate_names(eff_judges, "judges")
         bindings = _resolve_bindings(config, eff_roster, label="roster")
         _resolve_bindings(config, eff_judges, label="judges")
         selected_bindings = _execution_bindings(config, suite, eff_roster, eff_judges)
@@ -975,15 +981,8 @@ def load_run_judge_contract(
     if suite.scoring.type != "rubric":
         raise RunError("judge contract requires a rubric suite")
     manifest = _read_manifest(run_dir)
-    selections: dict[str, list[str]] = {}
-    for label in ("roster", "judges"):
-        raw = manifest.get(label)
-        if not isinstance(raw, list) or not all(isinstance(name, str) for name in raw):
-            raise RunError(f"manifest {label} must be a list of model aliases")
-        names = cast("list[str]", raw)
-        _validate_names(names, label)
-        selections[label] = list(dict.fromkeys(names))
-    judges = tuple(selections["judges"])
+    roster = _read_manifest_selection(manifest, "roster")
+    judges = tuple(_read_manifest_selection(manifest, "judges"))
     if not judges:
         raise RunError("rubric judging requires recorded judge models")
     stored = _read_execution_receipt(manifest)
@@ -992,7 +991,7 @@ def load_run_judge_contract(
             "cannot freshly judge legacy-unsealed run without a stored receipt; collect a new "
             "run under the current sealed contract (deterministic offline rescoring is available)"
         )
-    selected = _execution_bindings(config, suite, selections["roster"], judges)
+    selected = _execution_bindings(config, suite, roster, judges)
     _validate_receipt_profile(stored, config, selected)
     return judges, stored
 
