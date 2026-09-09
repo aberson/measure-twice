@@ -8,6 +8,10 @@
 
 **Proposal:** https://claude.ai/code/artifact/d641f0ba-41d3-46ea-898a-be0a9d4d1b66 — operator-facing review surface (`/plan-redline`); canonical P/D decision registry in Appendix § Decision Inventory.
 
+**Gemini addition:** [Gemini model-sweep plan](documentation/gemini-model-sweep-plan.md)
+owns Steps 64-65, after execution/reporting Steps 56-57. It adds one explicitly selected API
+model without changing this plan's five-model calibration roster.
+
 ## 2. Stack
 
 | Layer | Tool | Why |
