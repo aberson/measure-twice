@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 282" font-family="ui-monospace,'Cascadia Code','SF Mono',Consolas,'Roboto Mono',monospace" role="img" aria-label="The model benchmark workflow: author, sweep, inspect, and review evidence before updating a claim.">
+  <defs>
+    <marker id="arrow-light" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3355E0"/></marker>
+    <marker id="return-light" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#C0C9DA"/></marker>
+    <filter id="shadow-light" x="-20%" y="-45%" width="140%" height="190%"><feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="rgba(20,26,40,.16)"/></filter>
+  </defs>
+  <style>
+    .bg{fill:#FFFFFF;stroke:#D4DBE8;stroke-width:1.5}
+    .node rect{fill:#FFFFFF;stroke:#C0C9DA;stroke-width:1.4;filter:url(#shadow-light)}
+    .spine{fill:none;stroke:#3355E0;stroke-width:2.4}
+    .link{fill:none;stroke:#C0C9DA;stroke-width:1.7}
+    .title{fill:#3355E0;font-size:13px;font-weight:600}
+    .sub{fill:#6E778C;font-size:10.5px}
+    .label{fill:#6E778C;font-size:11px;letter-spacing:.12em;font-weight:600}
+    .caption{fill:#6E778C;font-size:10.5px}
+  </style>
+  <rect class="bg" x="6" y="6" width="988" height="270" rx="16"/>
+  <text class="label" x="24" y="34">AUTHOR</text>
+  <g class="node">
+    <rect x="24" y="54" width="200" height="148" rx="10"/>
+    <text class="title" x="38" y="80">mt author / validate</text>
+    <text class="sub" x="38" y="100">prompts + gold answers</text>
+    <path class="link" d="M38,119 H210"/>
+    <text class="title" x="38" y="145">Preregister</text>
+    <text class="sub" x="38" y="165">write the claim sentence</text>
+    <text class="sub" x="38" y="183">before model calls</text>
+  </g>
+  <text class="label" x="274" y="34">SWEEP</text>
+  <g class="node">
+    <rect x="274" y="54" width="200" height="148" rx="10"/>
+    <text class="title" x="288" y="80">mt run</text>
+    <text class="sub" x="288" y="100">items × models × samples</text>
+    <path class="link" d="M288,119 H460"/>
+    <text class="title" x="288" y="145">Save the run</text>
+    <text class="sub" x="288" y="165">manifest + suite snapshot</text>
+    <text class="sub" x="288" y="183">verbatim response rows</text>
+  </g>
+  <text class="label" x="524" y="34">INSPECT</text>
+  <g class="node">
+    <rect x="524" y="54" width="200" height="148" rx="10"/>
+    <text class="title" x="538" y="80">mt score</text>
+    <text class="sub" x="538" y="100">re-score saved responses</text>
+    <path class="link" d="M538,119 H710"/>
+    <text class="title" x="538" y="145">mt report --html</text>
+    <text class="sub" x="538" y="165">scores + scorer reasons</text>
+    <text class="sub" x="538" y="183">every item and sample</text>
+  </g>
+  <text class="label" x="774" y="34">REVIEW EVIDENCE</text>
+  <g class="node">
+    <rect x="774" y="54" width="200" height="148" rx="10"/>
+    <text class="title" x="788" y="80">Review the claim</text>
+    <text class="sub" x="788" y="100">match evidence to scope</text>
+    <path class="link" d="M788,119 H960"/>
+    <text class="title" x="788" y="145">Edit claims.jsonl</text>
+    <text class="sub" x="788" y="165">attach run; assign status</text>
+    <text class="sub" x="788" y="183">explicit operator edit</text>
+  </g>
+  <path class="spine" marker-end="url(#arrow-light)" d="M224,128 H267"/>
+  <path class="spine" marker-end="url(#arrow-light)" d="M474,128 H517"/>
+  <path class="spine" marker-end="url(#arrow-light)" d="M724,128 H767"/>
+  <path class="link" marker-end="url(#return-light)" d="M624,202 V226 Q624,232 618,232 H130 Q124,232 124,226 V207"/>
+  <text class="caption" x="24" y="259">Refine suite → new item hash → a new instrument. Rubric re-scoring makes fresh judge calls.</text>
+</svg>

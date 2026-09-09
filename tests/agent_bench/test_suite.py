@@ -809,3 +809,94 @@ def test_junctioned_asset_directory_is_rejected(tmp_path: Path, relative: str) -
 
     with pytest.raises(AgentSuiteError, match=r"junction|reparse"):
         load_agent_suite(bundle)
+
+
+@pytest.mark.parametrize("tree", ["seed", "oracle"])
+def test_generated_bytecode_in_a_bundle_tree_is_rejected(tmp_path: Path, tree: str) -> None:
+    bundle = _bundle(tmp_path / tree)
+    cache = bundle / "tasks" / "smoke-add" / tree / "tests" / "__pycache__"
+    cache.mkdir()
+    (cache / "test_calculator.cpython-314-pytest-9.1.1.pyc").write_bytes(b"\xcb\r\r\n")
+
+    with pytest.raises(AgentSuiteError, match=rf"{tree} may not contain generated Python bytecode"):
+        load_agent_suite(bundle)
+
+
+def test_empty_bytecode_cache_directory_is_rejected_and_names_the_path(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    (bundle / "tasks" / "smoke-add" / "oracle" / "tests" / "__pycache__").mkdir()
+
+    with pytest.raises(AgentSuiteError) as error:
+        load_agent_suite(bundle)
+
+    message = str(error.value)
+    assert "task smoke-add oracle" in message
+    assert "tasks/smoke-add/oracle/tests/__pycache__" in message
+    assert "remove every __pycache__ directory and .pyc/.pyo file" in message
+    assert "re-validate" in message
+
+
+@pytest.mark.parametrize("name", ["calculator.pyc", "calculator.pyo"])
+def test_stray_compiled_module_outside_a_cache_directory_is_rejected(
+    tmp_path: Path, name: str
+) -> None:
+    bundle = _bundle(tmp_path / name)
+    (bundle / "tasks" / "smoke-add" / "oracle" / "tests" / name).write_bytes(b"\xcb\r\r\n")
+
+    with pytest.raises(AgentSuiteError, match=rf"generated Python bytecode: .*{name}"):
+        load_agent_suite(bundle)
+
+
+def test_dirty_tree_cannot_produce_any_instrument_hash_but_the_clean_golden_holds(
+    tmp_path: Path,
+) -> None:
+    bundle = _bundle(tmp_path)
+    cache = bundle / "tasks" / "smoke-add" / "seed" / "tests" / "__pycache__"
+    cache.mkdir()
+    stray = cache / "test_calculator.cpython-314-pytest-9.1.1.pyc"
+    stray.write_bytes(b"\xcb\r\r\n")
+
+    with pytest.raises(AgentSuiteError, match="generated Python bytecode"):
+        load_agent_suite(bundle)
+
+    stray.unlink()
+    cache.rmdir()
+    assert load_agent_suite(bundle).instrument_hash == INSTRUMENT_HASH
+
+
+def _link_directory(link: Path, target: Path) -> None:
+    """Create a directory reparse point, using the junction path Windows allows unelevated."""
+
+    if os.name == "nt":
+        result = subprocess.run(  # noqa: S603 - fixed Windows system utility and literal operation
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],  # noqa: S607
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"junction creation unavailable: {result.stderr}")
+        return
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+
+def test_reparse_containment_still_outranks_the_bytecode_rule(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _link_directory(bundle / "tasks" / "smoke-add" / "seed" / "__pycache__", outside)
+
+    with pytest.raises(AgentSuiteError, match=r"symlink|junction|reparse"):
+        load_agent_suite(bundle)
+
+
+def test_source_files_named_like_bytecode_are_accepted(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    seed = bundle / "tasks" / "smoke-add" / "seed"
+    (seed / "pycache_helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (seed / "pyc_notes.md").write_text("notes\n", encoding="utf-8")
+
+    assert load_agent_suite(bundle).instrument_hash

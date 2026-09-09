@@ -239,7 +239,7 @@ only run/evidence artifacts; they add no code and contain no confirmation prompt
   `"uv run pytest -q tests/test_model_sweep_execution.py tests/test_adapters.py tests/test_config.py tests/test_runner.py"`
   exits 0 through the production builder
 - **Depends on:** 7, 12 (shipped)
-- **Status:** NOT STARTED
+- **Status:** BLOCKED (2026-08-31)
 
 ### Step 57: Report the seal and build its live qualification path
 
