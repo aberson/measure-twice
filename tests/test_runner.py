@@ -121,6 +121,7 @@ def _base_python_executable() -> Path:
 
 def _write_fake_claude(root: Path) -> tuple[Path, Path]:
     """Create a local CLI double reached by the production ``subprocess.Popen`` path."""
+    root.mkdir(parents=True, exist_ok=True)
     base_python = _base_python_executable()
     observation_path = root / "fake-claude-observations.jsonl"
     helper_path = root / "fake_claude.py"
@@ -141,6 +142,7 @@ def _write_fake_claude(root: Path) -> tuple[Path, Path]:
         prompt = sys.stdin.read()
         record = {{
             "argv": [executable, *arguments],
+            "helper_executable": str(Path(sys.executable).resolve()),
             "cwd": str(Path.cwd().resolve()),
             "cwd_entries": sorted(os.listdir(Path.cwd())),
             "environment": dict(os.environ),
@@ -168,7 +170,7 @@ def _write_fake_claude(root: Path) -> tuple[Path, Path]:
         helper_path.write_text(helper_source, encoding="utf-8")
         launcher_path = root / "claude.cmd"
         launcher_path.write_text(
-            f'@echo off\r\nset "PROMPT="\r\n"{base_python}" "{helper_path}" '
+            f'@echo off\r\nset "PROMPT="\r\n{base_python.stem} "{helper_path}" '
             '--fake-launcher "%~f0" %*\r\n',
             encoding="utf-8",
         )
@@ -852,13 +854,15 @@ def test_cli_run_integration_on_smoke_suite(
     assert run_dir.name in captured.out  # the one-line summary was printed
 
 
+@pytest.mark.parametrize("install_name", ["approved-install", "approved install with spaces"])
 def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    install_name: str,
 ) -> None:
     """Real ``main(['run', ...])`` -> production builder -> ``subprocess.Popen`` integration."""
-    launcher, observations_path = _write_fake_claude(tmp_path)
+    launcher, observations_path = _write_fake_claude(tmp_path / install_name)
     dependency_directories: tuple[Path, ...] = (_base_python_executable().parent,)
     if sys.platform == "win32":
         windows = claude_cli._windows_runtime_paths().windows
@@ -879,7 +883,14 @@ def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
     allowed_marker = "test-subscription-oauth"
 
     monkeypatch.delenv(ENV_VAR, raising=False)
-    monkeypatch.setenv("PATH", f"{launcher.parent}{os.pathsep}{os.environ.get('PATH', '')}")
+    ambient_bin = tmp_path / "ambient-interposer"
+    ambient_bin.mkdir()
+    interposer_marker = tmp_path / "ambient-helper-ran.txt"
+    if sys.platform == "win32":
+        (ambient_bin / f"{_base_python_executable().stem}.cmd").write_text(
+            f'@echo hostile > "{interposer_marker}"\r\n@exit /b 97\r\n', encoding="utf-8"
+        )
+    monkeypatch.setenv("PATH", os.pathsep.join((str(ambient_bin), str(launcher.parent))))
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", allowed_marker)
     monkeypatch.setenv("LC_ALL", "C.UTF-8")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-leak")
@@ -899,6 +910,7 @@ def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
     )
 
     assert rc == 0
+    assert not interposer_marker.exists()
     run_dirs = list((out / "runs").iterdir())
     assert len(run_dirs) == 1
     manifest = json.loads((run_dirs[0] / "manifest.json").read_text(encoding="utf-8"))
@@ -913,6 +925,16 @@ def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
 
     observations = _read_jsonl(observations_path)
     assert len(observations) == 4
+    expected_path = [
+        launcher.parent.resolve(),
+        *(path.resolve() for path in dependency_directories),
+    ]
+    for record in observations:
+        assert record["helper_executable"] == str(_base_python_executable())
+        environment = record["environment"]
+        assert isinstance(environment, dict)
+        child_path = [Path(entry).resolve() for entry in str(environment["PATH"]).split(os.pathsep)]
+        assert child_path == expected_path
     expected_tail = [
         "-p",
         "--model",
@@ -952,7 +974,7 @@ def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
         assert environment["CLAUDE_CODE_OAUTH_TOKEN"] == allowed_marker
         assert environment["LC_ALL"] == "C.UTF-8"
         child_path = [Path(entry).resolve() for entry in str(environment["PATH"]).split(os.pathsep)]
-        assert launcher.parent.resolve() in child_path
+        assert child_path == expected_path
         repo_root = Path(__file__).resolve().parents[1]
         assert all(not entry.is_relative_to(repo_root) for entry in child_path)
         assert "ANTHROPIC_API_KEY" not in environment
@@ -968,6 +990,42 @@ def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
     assert {row["model"] for row in rows} == {"public-sonnet"}
     assert {row["model_id_resolved"] for row in rows} == {"fake-concrete-sonnet"}
     assert run_dirs[0].name in capsys.readouterr().out
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows batch dependency lookup")
+def test_cli_run_missing_approved_batch_dependency_rejects_ambient_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An ambient bare helper cannot substitute for a missing approved dependency."""
+    launcher, observations_path = _write_fake_claude(tmp_path / "approved install with spaces")
+    windows = claude_cli._windows_runtime_paths().windows
+    boundary = claude_cli._LauncherBoundary(
+        launcher_directory=launcher.parent,
+        target_roots=(launcher.parent,),
+        dependency_directories=(windows / "System32", windows),
+    )
+    monkeypatch.setattr(claude_cli, "_runtime_launcher_policy", lambda: (boundary,))
+    ambient_bin = tmp_path / "ambient-interposer"
+    ambient_bin.mkdir()
+    marker = tmp_path / "ambient-helper-ran.txt"
+    (ambient_bin / f"{_base_python_executable().stem}.cmd").write_text(
+        f'@echo hostile > "{marker}"\r\n@exit /b 97\r\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("PATH", os.pathsep.join((str(ambient_bin), str(launcher.parent))))
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    config_path = tmp_path / "sealed-config.json"
+    config_path.write_text(json.dumps(_sealed_test_config()), encoding="utf-8")
+    suite_path = tmp_path / "sealed-suite.json"
+    suite_path.write_text(json.dumps(asdict(_suite(["sealed-a"]))), encoding="utf-8")
+    out = tmp_path / "data"
+
+    rc = main(["run", "--suite", str(suite_path), "--config", str(config_path), "--out", str(out)])
+
+    assert rc != 0
+    assert "--version failed (exit" in capsys.readouterr().err
+    assert not observations_path.exists()
+    assert not marker.exists()
+    assert not out.exists()
 
 
 def test_cli_score_integration(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
