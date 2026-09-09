@@ -11,7 +11,8 @@ top-level ``model`` string is the RESOLVED concrete model id (e.g. a requested `
 resolves to ``"claude-sonnet-4-..."``) — recorded per row for drift detection. Classification reads
 ``is_error``/``subtype`` FIRST (see below); ``result`` and ``model`` are the two text-carrying keys
 the success unwrap needs. A missing/renamed ``result`` -> ``bad_envelope`` (drift surfaces loudly),
-a missing ``model`` -> the row records the requested alias (drift merely undetectable on that row).
+a missing ``model`` -> the row records the shared unresolved-identity sentinel (the requested
+alias is never promoted into provider evidence).
 
 The ``is_error`` guard (production ``subprocess_runner._parse_envelope``,
 ``void_furnace/src/void_furnace/subprocess_runner.py``): an ``is_error: true`` envelope's
@@ -43,16 +44,23 @@ live ``claude`` invocations in the suite.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from types import MappingProxyType
 from typing import Final, cast
 
 from measure_twice.adapters.base import (
@@ -62,11 +70,19 @@ from measure_twice.adapters.base import (
     RC_TIMEOUT,
     RC_TRUNCATED,
     RC_UNREACHABLE,
+    UNRESOLVED_MODEL_ID,
     AdapterError,
     ModelCallResult,
     resolved_model_of,
 )
 from measure_twice.config import RunConfig
+from measure_twice.model_sweep_execution import (
+    CLAUDE_EXECUTABLE,
+    CLAUDE_MODEL_PLACEHOLDER,
+    PROVIDER_CLAUDE,
+    ClaudeContextProfile,
+    ExecutionProfileError,
+)
 
 # claude calls can be slow (cold model, long generations); this is the per-call default. As with
 # the local adapter, RunConfig carries no timeout field in v1 — a caller/runner may override.
@@ -81,6 +97,17 @@ _TREE_KILL_TIMEOUT_S: Final[float] = 10.0
 # length cutoff leaves a partial answer. Matched case-insensitively by substring so the known
 # ``"error_max_turns"`` plus any max-tokens / length variant all map to ``truncated``.
 _TRUNCATION_SUBTYPE_MARKERS: Final[tuple[str, ...]] = ("max_turns", "max_tokens", "length")
+_DOCTOR_TIMEOUT_S: Final[float] = 30.0
+_REQUIRED_CLAUDE_FLAGS: Final[tuple[str, ...]] = (
+    "-p",
+    "--model",
+    "--output-format",
+    "--safe-mode",
+    "--tools",
+    "--disable-slash-commands",
+    "--no-chrome",
+    "--no-session-persistence",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +116,7 @@ class SubprocessResult:
 
     The DI seam returns this (not a raw ``subprocess.CompletedProcess``) so a test stub can build
     one directly without constructing a ``CompletedProcess``. The default runner adapts the real
-    ``subprocess.run`` result into it.
+    ``subprocess.Popen`` result into it.
     """
 
     returncode: int
@@ -97,11 +124,79 @@ class SubprocessResult:
     stderr: str
 
 
-# A runner: given argv, the stdin prompt text, and a timeout (seconds), spawn the process and
-# return a :class:`SubprocessResult`. May raise ``subprocess.TimeoutExpired`` (timeout),
+# A runner receives the final sealed invocation, stdin prompt text, and timeout (seconds), then
+# returns a :class:`SubprocessResult`. It may raise ``subprocess.TimeoutExpired`` (timeout),
 # ``FileNotFoundError`` (binary missing), or other ``OSError``. A *factory* returns one — the DI
-# seam. Default wraps ``subprocess.run``; tests inject a stub factory.
-SubprocessRunner = Callable[[Sequence[str], str, float], SubprocessResult]
+# seam. The default wraps ``subprocess.Popen``; tests may inspect the invocation through a stub.
+class ClaudeSetupError(ValueError):
+    """Claude's executable or supported CLI contract could not be proven before a run."""
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeRuntime:
+    """Resolved executable plus immutable prompt-only context used for one run."""
+
+    executable: str
+    context: ClaudeContextProfile
+    env: Mapping[str, str]
+    probe_env: Mapping[str, str]
+    command_processor: str | None = None
+    cli_version: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeInvocation:
+    """One fully-built subprocess request exposed at the adapter DI seam."""
+
+    argv: tuple[str, ...]
+    cwd: Path
+    env: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _LauncherBoundary:
+    """One code-owned launcher directory and the install roots its target may occupy.
+
+    ``launcher_directory`` is the only directory that may contribute a PATH candidate. A native
+    launcher may be a symlink, so ``target_roots`` separately names where its resolved target may
+    live (for example ``~/.local/share/claude/versions``). ``dependency_directories`` is the
+    minimal approved PATH tail for the selected launch chain; ambient PATH entries never flow into
+    a child merely because they are absolute.
+    """
+
+    launcher_directory: Path
+    target_roots: tuple[Path, ...]
+    dependency_directories: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedLauncher:
+    executable: Path
+    boundary: _LauncherBoundary
+
+
+class _WindowsGuid(ctypes.Structure):
+    _fields_ = [
+        ("data1", ctypes.c_uint32),
+        ("data2", ctypes.c_uint16),
+        ("data3", ctypes.c_uint16),
+        ("data4", ctypes.c_ubyte * 8),
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class _WindowsRuntimePaths:
+    profile: Path
+    roaming_app_data: Path
+    local_app_data: Path
+    program_files: Path
+    program_data: Path
+    windows: Path
+
+
+# The runner receives the final immutable invocation (absolute argv, unique cwd, allowlisted env),
+# stdin prompt, and timeout. Tests inspect the production builder rather than bypassing it.
+SubprocessRunner = Callable[[ClaudeInvocation, str, float], SubprocessResult]
 RunnerFactory = Callable[[], SubprocessRunner]
 
 
@@ -174,14 +269,20 @@ def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
         return
     if sys.platform == "win32":
         try:
+            paths = _windows_runtime_paths()
+            system_directory = paths.windows / "System32"
             subprocess.run(  # noqa: S603
-                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],  # noqa: S607
+                [str(system_directory / "taskkill.exe"), "/T", "/F", "/PID", str(proc.pid)],
                 capture_output=True,
                 check=False,
                 timeout=_TREE_KILL_TIMEOUT_S,
+                cwd=system_directory,
+                env=dict(_windows_system_environment(paths)),
             )
-        except subprocess.TimeoutExpired:
-            pass  # best-effort: never hang the run on a stuck taskkill
+        except (ClaudeSetupError, OSError, subprocess.TimeoutExpired):
+            # Best-effort cleanup must not inherit the checkout cwd, PATH, COMSPEC, or OAuth merely
+            # because the canonical system helper is unavailable. Fall back to the direct child.
+            proc.kill()
     else:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -189,8 +290,10 @@ def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
             proc.kill()  # fall back to a direct child kill
 
 
-def _subprocess_runner(argv: Sequence[str], input_text: str, timeout: float) -> SubprocessResult:
-    """The default runner: run ``argv`` with the prompt on stdin, capturing UTF-8 streams.
+def _subprocess_runner(
+    invocation: ClaudeInvocation, input_text: str, timeout: float
+) -> SubprocessResult:
+    """Run the fully-built sealed invocation with stdin and captured UTF-8 streams.
 
     ``encoding="utf-8"`` is PINNED (never the platform default): Windows' text mode is the locale
     ANSI code page (cp1252), which BOTH raises ``UnicodeEncodeError`` on a non-cp1252 prompt char
@@ -203,10 +306,12 @@ def _subprocess_runner(argv: Sequence[str], input_text: str, timeout: float) -> 
     # POSIX: own process group so a timeout can killpg the whole tree. Windows: no-op here
     # (taskkill /T walks the PID tree directly), so the flag is False.
     proc = subprocess.Popen(  # noqa: S603  # argv is flags + a config alias, not shell.
-        list(argv),
+        list(invocation.argv),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        cwd=invocation.cwd,
+        env=dict(invocation.env),
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -231,6 +336,457 @@ def _default_runner_factory() -> SubprocessRunner:
     return _subprocess_runner
 
 
+def _windows_known_folder(folder_id: str) -> Path:
+    """Resolve a Windows known folder through the OS, never a mutable environment variable."""
+    if sys.platform != "win32":
+        raise ClaudeSetupError("Windows known folders are unavailable on this platform")
+    guid = _WindowsGuid.from_buffer_copy(uuid.UUID(folder_id).bytes_le)
+    raw_path = ctypes.c_void_p()
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    get_known_folder = shell32.SHGetKnownFolderPath
+    get_known_folder.argtypes = [
+        ctypes.POINTER(_WindowsGuid),
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    get_known_folder.restype = ctypes.c_long
+    result = get_known_folder(ctypes.byref(guid), 0, None, ctypes.byref(raw_path))
+    if result != 0 or raw_path.value is None:
+        raise ClaudeSetupError(
+            "Windows known-folder lookup failed for "
+            f"{folder_id} (HRESULT 0x{result & 0xFFFFFFFF:08x})"
+        )
+    try:
+        return Path(ctypes.wstring_at(raw_path.value)).resolve()
+    finally:
+        free = ole32.CoTaskMemFree
+        free.argtypes = [ctypes.c_void_p]
+        free.restype = None
+        free(raw_path)
+
+
+@lru_cache(maxsize=1)
+def _windows_runtime_paths() -> _WindowsRuntimePaths:
+    """The OS-owned account/system roots used by the Windows launcher policy."""
+    return _WindowsRuntimePaths(
+        profile=_windows_known_folder("5E6C858F-0E22-4760-9AFE-EA3317B67173"),
+        roaming_app_data=_windows_known_folder("3EB685DB-65F9-4CF6-A03A-E3EF65729F3D"),
+        local_app_data=_windows_known_folder("F1B32785-6FBA-4FCF-9D55-7B8E7F157091"),
+        program_files=_windows_known_folder("905E63B6-C1BF-494E-B29C-65B732D3D21A"),
+        program_data=_windows_known_folder("62AB5D82-FDC1-4DC3-A9DD-070D1D495D97"),
+        windows=_windows_known_folder("F38BF404-1D43-42F2-9305-67DE0B28FC23"),
+    )
+
+
+def _posix_account_home() -> Path:
+    """Resolve the effective account home without trusting ``HOME`` from the parent process."""
+    import importlib
+    import operator
+
+    pwd = importlib.import_module("pwd")
+    geteuid = cast("Callable[[], int]", vars(os)["geteuid"])
+    getpwuid = cast("Callable[[int], object]", vars(pwd)["getpwuid"])
+    home = cast("str", operator.attrgetter("pw_dir")(getpwuid(geteuid())))
+    return Path(home).resolve()
+
+
+def _runtime_launcher_policy() -> tuple[_LauncherBoundary, ...]:
+    """Return the small code-owned platform installation inventory.
+
+    Threat contract: checkout/config/PATH-search hijacking is rejected. Selection trusts the
+    chosen user/system installation boundary: same-user malware that already replaced files inside
+    one of these roots is outside Step 56 and requires an external signature or trust store.
+    """
+    if sys.platform == "win32":
+        paths = _windows_runtime_paths()
+        system32 = paths.windows / "System32"
+        node = paths.program_files / "nodejs"
+        dependencies = (node, system32, paths.windows)
+        native_bin = paths.profile / ".local" / "bin"
+        native_versions = paths.profile / ".local" / "share" / "claude" / "versions"
+        npm_bin = paths.roaming_app_data / "npm"
+        chocolatey_bin = paths.program_data / "chocolatey" / "bin"
+        return (
+            _LauncherBoundary(native_bin, (native_bin, native_versions), dependencies),
+            _LauncherBoundary(npm_bin, (npm_bin,), dependencies),
+            _LauncherBoundary(node, (node,), dependencies),
+            _LauncherBoundary(
+                chocolatey_bin,
+                (paths.program_data / "chocolatey",),
+                dependencies,
+            ),
+        )
+
+    home = _posix_account_home()
+    system_dependencies = (
+        Path("/usr/local/bin"),
+        Path("/usr/bin"),
+        Path("/bin"),
+        Path("/opt/homebrew/bin"),
+        Path("/home/linuxbrew/.linuxbrew/bin"),
+    )
+    return (
+        _LauncherBoundary(
+            home / ".local" / "bin",
+            (
+                home / ".local" / "bin",
+                home / ".local" / "share" / "claude" / "versions",
+                home / ".local" / "lib" / "node_modules",
+            ),
+            system_dependencies,
+        ),
+        _LauncherBoundary(
+            Path("/usr/local/bin"),
+            (
+                Path("/usr/local/bin"),
+                Path("/usr/local/share/claude/versions"),
+                Path("/usr/local/lib/node_modules"),
+            ),
+            system_dependencies,
+        ),
+        _LauncherBoundary(
+            Path("/usr/bin"),
+            (Path("/usr/bin"), Path("/usr/share/claude/versions"), Path("/usr/lib/node_modules")),
+            system_dependencies,
+        ),
+        _LauncherBoundary(
+            Path("/opt/homebrew/bin"),
+            (Path("/opt/homebrew"),),
+            system_dependencies,
+        ),
+        _LauncherBoundary(
+            Path("/home/linuxbrew/.linuxbrew/bin"),
+            (Path("/home/linuxbrew/.linuxbrew"),),
+            system_dependencies,
+        ),
+    )
+
+
+def _path_key(path: Path) -> str:
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        return os.path.commonpath((_path_key(path), _path_key(root))) == _path_key(root)
+    except ValueError:
+        return False
+
+
+def _approved_path_boundaries(
+    policy: Sequence[_LauncherBoundary],
+) -> tuple[_LauncherBoundary, ...]:
+    """Filter ambient PATH to exact code-owned launcher directories, preserving PATH order."""
+    by_lexical = {
+        _path_key(Path(os.path.abspath(boundary.launcher_directory))): boundary
+        for boundary in policy
+    }
+    approved: list[_LauncherBoundary] = []
+    seen: set[str] = set()
+    for raw_entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not raw_entry:
+            continue
+        clean_entry = os.path.expandvars(raw_entry.strip('"'))
+        candidate = Path(clean_entry)
+        if not candidate.is_absolute():
+            continue
+        lexical = Path(os.path.abspath(candidate))
+        boundary = by_lexical.get(_path_key(lexical))
+        if boundary is None:
+            continue
+        expected_resolved = boundary.launcher_directory.resolve()
+        resolved = candidate.resolve()
+        key = _path_key(resolved)
+        if key != _path_key(expected_resolved) or key in seen:
+            continue
+        seen.add(key)
+        approved.append(boundary)
+    return tuple(approved)
+
+
+def _launcher_names() -> tuple[str, ...]:
+    if sys.platform == "win32":
+        return ("claude.exe", "claude.cmd", "claude.bat", CLAUDE_EXECUTABLE)
+    return (CLAUDE_EXECUTABLE,)
+
+
+def _candidate_is_executable(path: Path) -> bool:
+    return path.is_file() and (sys.platform == "win32" or os.access(path, os.X_OK))
+
+
+def _resolve_executable(
+    context: ClaudeContextProfile,
+    runner_factory: RunnerFactory | None,
+    policy: Sequence[_LauncherBoundary],
+) -> _ResolvedLauncher:
+    """Resolve the literal launcher only through the code-owned runtime policy."""
+    if context.executable != CLAUDE_EXECUTABLE:  # defense in depth behind profile validation
+        raise ClaudeSetupError(f"Claude executable contract requires literal {CLAUDE_EXECUTABLE!r}")
+    approved = _approved_path_boundaries(policy)
+    for boundary in approved:
+        directory = boundary.launcher_directory.resolve()
+        for name in _launcher_names():
+            lexical = Path(os.path.abspath(directory / name))
+            if not _candidate_is_executable(lexical):
+                continue
+            resolved = lexical.resolve()
+            if not _is_within(lexical, boundary.launcher_directory):
+                continue
+            if not any(_is_within(resolved, root.resolve()) for root in boundary.target_roots):
+                continue
+            return _ResolvedLauncher(executable=resolved, boundary=boundary)
+
+    if runner_factory is not None:
+        # A DI runner executes Python test code, not argv[0]. Give it a deterministic virtual path
+        # inside the production inventory so offline tests need no installed CLI; this does not
+        # authorize a real subprocess or bless an arbitrary tmp_path. Real-Popen tests patch the
+        # narrow policy seam and provide an executable candidate that passes the checks above.
+        virtual_boundary = next(
+            (item for item in policy if item.launcher_directory.is_absolute()), None
+        )
+        if virtual_boundary is not None:
+            suffix = ".exe" if sys.platform == "win32" else ""
+            return _ResolvedLauncher(
+                executable=(
+                    virtual_boundary.launcher_directory / f"{CLAUDE_EXECUTABLE}{suffix}"
+                ).resolve(),
+                boundary=virtual_boundary,
+            )
+    raise ClaudeSetupError(
+        f"Claude executable {CLAUDE_EXECUTABLE!r} was not found in an approved runtime install root"
+    )
+
+
+def _unique_existing_directories(paths: Sequence[Path]) -> tuple[Path, ...]:
+    selected: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        resolved = path.resolve()
+        key = _path_key(resolved)
+        if key in seen or not resolved.is_dir():
+            continue
+        seen.add(key)
+        selected.append(resolved)
+    return tuple(selected)
+
+
+def _windows_system_environment(paths: _WindowsRuntimePaths) -> Mapping[str, str]:
+    system32 = (paths.windows / "System32").resolve()
+    command_processor = (system32 / "cmd.exe").resolve()
+    return MappingProxyType(
+        {
+            "COMSPEC": str(command_processor),
+            "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+            "PATH": str(system32),
+            "SYSTEMROOT": str(paths.windows),
+            "WINDIR": str(paths.windows),
+        }
+    )
+
+
+def _trusted_temp_root() -> Path:
+    """Return an OS-owned temp boundary, independent of ambient TEMP/TMPDIR and the checkout."""
+    root = (
+        _windows_runtime_paths().local_app_data / "Temp"
+        if sys.platform == "win32"
+        else Path("/tmp")  # noqa: S108  # fixed OS-owned boundary, never ambient TMPDIR
+    ).resolve()
+    if not root.is_dir():
+        raise ClaudeSetupError(f"trusted temporary-directory root is unavailable: {root}")
+    checkout = Path.cwd().resolve()
+    if _is_within(root, checkout):
+        raise ClaudeSetupError(
+            f"trusted temporary-directory root resolves inside the current checkout: {root}"
+        )
+    return root
+
+
+def _allowlisted_environment(
+    context: ClaudeContextProfile, launcher: _ResolvedLauncher
+) -> Mapping[str, str]:
+    """Build the model environment from allowlisted values plus a minimal launch-chain PATH."""
+    special = {"COMSPEC", "PATH", "PATHEXT", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "WINDIR"}
+    if sys.platform == "win32":
+        ambient = {name.upper(): value for name, value in os.environ.items()}
+        selected = {
+            name: ambient[name.upper()]
+            for name in context.environment_allowlist
+            if name.upper() not in special and name.upper() in ambient
+        }
+    else:
+        selected = {
+            name: os.environ[name]
+            for name in context.environment_allowlist
+            if name not in special and name in os.environ
+        }
+    child_path = _unique_existing_directories(
+        (launcher.boundary.launcher_directory, *launcher.boundary.dependency_directories)
+    )
+    if "PATH" in context.environment_allowlist:
+        selected["PATH"] = os.pathsep.join(str(directory) for directory in child_path)
+    if sys.platform == "win32":
+        paths = _windows_runtime_paths()
+        system_values = _windows_system_environment(paths)
+        for name in special - {"PATH", "TEMP", "TMP", "TMPDIR"}:
+            if name in context.environment_allowlist and name in system_values:
+                selected[name] = system_values[name]
+        if "USERPROFILE" in context.environment_allowlist:
+            selected["USERPROFILE"] = str(paths.profile)
+        if "HOME" in context.environment_allowlist:
+            selected["HOME"] = str(paths.profile)
+        if "APPDATA" in context.environment_allowlist:
+            selected["APPDATA"] = str(paths.roaming_app_data)
+        if "LOCALAPPDATA" in context.environment_allowlist:
+            selected["LOCALAPPDATA"] = str(paths.local_app_data)
+    elif "HOME" in context.environment_allowlist:
+        selected["HOME"] = str(_posix_account_home())
+    temp_root = str(_trusted_temp_root())
+    for name in ("TEMP", "TMP", "TMPDIR"):
+        if name in context.environment_allowlist:
+            selected[name] = temp_root
+    return MappingProxyType(selected)
+
+
+def _credential_free_environment(environment: Mapping[str, str]) -> Mapping[str, str]:
+    """Strip model credentials from compatibility probes; only model calls receive OAuth."""
+    return MappingProxyType(
+        {
+            name: value
+            for name, value in environment.items()
+            if name.upper() != "CLAUDE_CODE_OAUTH_TOKEN"
+        }
+    )
+
+
+def build_claude_runtime(
+    config: RunConfig,
+    *,
+    runner_factory: RunnerFactory | None = None,
+    cli_version: str | None = None,
+) -> ClaudeRuntime:
+    """Resolve executable/env without mutating global cwd or ``os.environ``."""
+    context = config.execution_profile.claude
+    policy = _runtime_launcher_policy()
+    launcher = _resolve_executable(context, runner_factory, policy)
+    environment = _allowlisted_environment(context, launcher)
+    command_processor: str | None = None
+    if sys.platform == "win32" and launcher.executable.suffix.lower() in {".bat", ".cmd"}:
+        if any(character in str(launcher.executable) for character in "%!^&|<>()"):
+            raise ClaudeSetupError(
+                "approved Windows batch launcher path contains unsupported command metacharacters"
+            )
+        command_processor = str(
+            (_windows_runtime_paths().windows / "System32" / "cmd.exe").resolve()
+        )
+    return ClaudeRuntime(
+        executable=str(launcher.executable),
+        context=context,
+        env=environment,
+        probe_env=_credential_free_environment(environment),
+        command_processor=command_processor,
+        cli_version=cli_version,
+    )
+
+
+def build_claude_invocation(
+    runtime: ClaudeRuntime, *, requested_model: str, cwd: Path
+) -> ClaudeInvocation:
+    """Build the exact sealed model-call argv for an already-validated provider binding."""
+    if not cwd.is_absolute():
+        raise ClaudeSetupError(f"Claude invocation cwd must be absolute, got {cwd}")
+    argv_tail = tuple(
+        requested_model if argument == CLAUDE_MODEL_PLACEHOLDER else argument
+        for argument in runtime.context.argv_template
+    )
+    return ClaudeInvocation(
+        argv=_launcher_argv(runtime, argv_tail),
+        cwd=cwd,
+        env=runtime.env,
+    )
+
+
+def _launcher_argv(runtime: ClaudeRuntime, args: Sequence[str]) -> tuple[str, ...]:
+    """Build a direct native argv or an explicit pinned Windows batch launch chain."""
+    direct = (runtime.executable, *args)
+    if runtime.command_processor is None:
+        return direct
+    # ``/d`` disables Command Processor AutoRun; ``/s`` gives the quoted /c command deterministic
+    # handling. Executable provenance and the requested-model token grammar are validated before
+    # this point, and every remaining argument is a frozen code-owned flag/value.
+    # Keep the command and its arguments as separate Popen list elements. Python performs exactly
+    # one Windows command-line encoding pass; pre-composing another encoded string would turn the
+    # frozen empty ``--tools`` value into a literal pair of quote characters through an npm shim.
+    return (runtime.command_processor, "/d", "/s", "/c", *direct)
+
+
+def _probe_invocation(runtime: ClaudeRuntime, args: Sequence[str], cwd: Path) -> ClaudeInvocation:
+    return ClaudeInvocation(
+        argv=_launcher_argv(runtime, args),
+        cwd=cwd,
+        env=runtime.probe_env,
+    )
+
+
+def _help_advertises_flag(help_text: str, flag: str) -> bool:
+    """Match a complete option token, not a substring such as ``-p`` inside ``--print``."""
+    pattern = rf"(?<![\w-]){re.escape(flag)}(?=$|[\s,=/])"
+    return re.search(pattern, help_text) is not None
+
+
+def doctor_claude_runtime(
+    config: RunConfig, *, runner_factory: RunnerFactory | None = None
+) -> ClaudeRuntime:
+    """Fail closed unless the resolved CLI reports a version and every v1 sealing flag.
+
+    Both probes run through the same final subprocess seam, from disposable clean directories and
+    with the exact allowlisted launch environment minus model credentials. They receive empty
+    stdin and do not consume the model-call budget.
+    """
+    runtime = build_claude_runtime(config, runner_factory=runner_factory)
+    factory = runner_factory if runner_factory is not None else _default_runner_factory
+    run = factory()
+
+    def probe(args: Sequence[str]) -> SubprocessResult:
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="measure-twice-claude-doctor-", dir=_trusted_temp_root()
+            ) as temp_cwd:
+                cwd = Path(temp_cwd).resolve()
+                return run(_probe_invocation(runtime, args, cwd), "", _DOCTOR_TIMEOUT_S)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ClaudeSetupError(f"Claude CLI doctor probe {list(args)!r} failed: {exc}") from exc
+
+    version_result = probe(("--version",))
+    if version_result.returncode != 0:
+        raise ClaudeSetupError(f"Claude CLI --version failed (exit {version_result.returncode})")
+    version_lines = [line.strip() for line in version_result.stdout.splitlines() if line.strip()]
+    if not version_lines:
+        raise ClaudeSetupError("Claude CLI --version returned no version text")
+
+    help_result = probe(("--help",))
+    if help_result.returncode != 0:
+        raise ClaudeSetupError(f"Claude CLI --help failed (exit {help_result.returncode})")
+    help_text = f"{help_result.stdout}\n{help_result.stderr}"
+    unsupported = [
+        flag for flag in _REQUIRED_CLAUDE_FLAGS if not _help_advertises_flag(help_text, flag)
+    ]
+    if unsupported:
+        raise ClaudeSetupError(
+            f"Claude CLI does not advertise required prompt-only flag(s): {unsupported!r}"
+        )
+
+    return ClaudeRuntime(
+        executable=runtime.executable,
+        context=runtime.context,
+        env=runtime.env,
+        probe_env=runtime.probe_env,
+        command_processor=runtime.command_processor,
+        cli_version=version_lines[0],
+    )
+
+
 def _is_truncation_subtype(subtype: object) -> bool:
     """True for a max-turns / length-cutoff error subtype (an ``is_error`` partial answer)."""
     if not isinstance(subtype, str):
@@ -247,6 +803,7 @@ def claude_call(
     budget: CallBudget,
     timeout: float | None = None,
     runner_factory: RunnerFactory | None = None,
+    runtime: ClaudeRuntime | None = None,
 ) -> ModelCallResult:
     """Run one ``claude -p`` call and return a :class:`ModelCallResult`.
 
@@ -260,12 +817,33 @@ def claude_call(
         timeout: per-call timeout in seconds; defaults to :data:`DEFAULT_CLAUDE_TIMEOUT_S`.
         runner_factory: the DI seam. ``None`` -> the real ``subprocess`` runner; tests inject a
             stub factory returning canned output.
+        runtime: an already-doctored runtime supplied by the sweep runner. ``None`` doctors the
+            default runtime before budget consumption or any model invocation.
 
-    Never raises on a subprocess/envelope failure — returns a structured ERROR result instead. The
-    only propagating exception is :class:`BudgetExhaustedError` (a run-control signal).
+    Never raises on a model subprocess/envelope failure — returns a structured ERROR result. CLI
+    setup validation (:class:`ClaudeSetupError`) and :class:`BudgetExhaustedError` propagate before
+    the model call so callers fail closed without recording a bogus result.
     """
-    budget.consume()  # count + cap BEFORE any subprocess; raises if the budget is spent.
+    try:
+        binding = config.execution_profile.binding_for(alias)
+    except ExecutionProfileError as exc:
+        raise AdapterError(str(exc)) from exc
+    if binding.provider != PROVIDER_CLAUDE:
+        raise AdapterError(
+            f"model alias {alias!r} is bound to {binding.provider!r}, not {PROVIDER_CLAUDE!r}"
+        )
+    # A direct production caller (notably rubric scoring) does not have the sweep runner's runtime.
+    # Doctor outside the broad per-call error conversion and before budget mutation: unsupported
+    # flags/version must be a fail-closed setup halt, never an ``os_error`` row that scoring can
+    # persist as zero. The runner passes its receipt-bound runtime and takes this fast path.
+    eff_runtime = (
+        runtime
+        if runtime is not None
+        else doctor_claude_runtime(config, runner_factory=runner_factory)
+    )
+    budget.consume()  # count + cap only after setup succeeds, still before the model subprocess.
     start = time.monotonic()
+    resolved = UNRESOLVED_MODEL_ID
     # The ENTIRE post-budget body is wrapped, so the documented "never raises except
     # BudgetExhaustedError — returns a structured ERROR result" contract holds for the WHOLE
     # function, not just the subprocess spawn: json.loads, the is_error/subtype dispatch,
@@ -279,23 +857,42 @@ def claude_call(
         eff_timeout = timeout if timeout is not None else DEFAULT_CLAUDE_TIMEOUT_S
         factory = runner_factory if runner_factory is not None else _default_runner_factory
         run = factory()
-        # Prompt via STDIN (input=), NOT argv: only flags go on the command line.
-        argv = ["claude", "-p", "--model", alias, "--output-format", "json"]
-        result = run(argv, prompt, eff_timeout)
+        # Every call gets its own empty directory; no process-global chdir/env mutation means the
+        # bounded pool remains race-free. Prompt goes on stdin, never argv.
+        with tempfile.TemporaryDirectory(
+            prefix="measure-twice-claude-call-", dir=_trusted_temp_root()
+        ) as temp_cwd:
+            invocation = build_claude_invocation(
+                eff_runtime,
+                requested_model=binding.requested_model,
+                cwd=Path(temp_cwd).resolve(),
+            )
+            result = run(invocation, prompt, eff_timeout)
         elapsed = round(time.monotonic() - start, 3)
-
-        if result.returncode != 0:
-            # The CLI ran but failed (auth, bad flag, internal error) — a tool-level OS error.
-            return ModelCallResult.error(reason_class=RC_OS_ERROR, elapsed_s=elapsed)
 
         try:
             doc = json.loads(result.stdout)
         except (json.JSONDecodeError, ValueError):
+            if result.returncode != 0:
+                return ModelCallResult.error(
+                    reason_class=RC_OS_ERROR, resolved_model=resolved, elapsed_s=elapsed
+                )
             return ModelCallResult.error(reason_class=RC_NON_JSON_BODY, elapsed_s=elapsed)
         if not isinstance(doc, dict):
+            if result.returncode != 0:
+                return ModelCallResult.error(
+                    reason_class=RC_OS_ERROR, resolved_model=resolved, elapsed_s=elapsed
+                )
             return ModelCallResult.error(reason_class=RC_BAD_ENVELOPE, elapsed_s=elapsed)
         envelope = cast("dict[str, object]", doc)
-        resolved = resolved_model_of(envelope, requested=alias)
+        resolved = resolved_model_of(envelope, requested=binding.requested_model)
+
+        if result.returncode != 0:
+            # Parse only enough of a failed process's JSON object to retain observed provider
+            # identity. Its payload is never eligible for success/no-response classification.
+            return ModelCallResult.error(
+                reason_class=RC_OS_ERROR, resolved_model=resolved, elapsed_s=elapsed
+            )
 
         # is_error guard BEFORE trusting `result` (production _parse_envelope): an is_error
         # envelope's `result` is an ERROR MESSAGE, not model text, and can co-occur with exit code
@@ -313,7 +910,9 @@ def claude_call(
         text_raw = envelope.get("result")
         if not isinstance(text_raw, str):
             # Missing/renamed ``result`` on a non-error envelope -> it carries no usable text.
-            return ModelCallResult.error(reason_class=RC_BAD_ENVELOPE, elapsed_s=elapsed)
+            return ModelCallResult.error(
+                reason_class=RC_BAD_ENVELOPE, resolved_model=resolved, elapsed_s=elapsed
+            )
 
         if not text_raw.strip():
             return ModelCallResult.no_response_result(resolved_model=resolved, elapsed_s=elapsed)
@@ -322,23 +921,31 @@ def claude_call(
         )
     except subprocess.TimeoutExpired:
         return ModelCallResult.error(
-            reason_class=RC_TIMEOUT, elapsed_s=round(time.monotonic() - start, 3)
+            reason_class=RC_TIMEOUT,
+            resolved_model=resolved,
+            elapsed_s=round(time.monotonic() - start, 3),
         )
     except FileNotFoundError:
         # ``claude`` is not on PATH: the Claude tier is unreachable (switchboard-consistent).
         return ModelCallResult.error(
-            reason_class=RC_UNREACHABLE, elapsed_s=round(time.monotonic() - start, 3)
+            reason_class=RC_UNREACHABLE,
+            resolved_model=resolved,
+            elapsed_s=round(time.monotonic() - start, 3),
         )
     except OSError:
         return ModelCallResult.error(
-            reason_class=RC_OS_ERROR, elapsed_s=round(time.monotonic() - start, 3)
+            reason_class=RC_OS_ERROR,
+            resolved_model=resolved,
+            elapsed_s=round(time.monotonic() - start, 3),
         )
     except Exception:
         # Any OTHER unclassified failure anywhere in the post-budget body (a non-OSError transport
         # error, a runner_factory bug, a post-processing fault in resolved_model_of / success()) ->
         # a structured os_error result, never a raised exception (see the block comment above).
         return ModelCallResult.error(
-            reason_class=RC_OS_ERROR, elapsed_s=round(time.monotonic() - start, 3)
+            reason_class=RC_OS_ERROR,
+            resolved_model=resolved,
+            elapsed_s=round(time.monotonic() - start, 3),
         )
 
 
@@ -349,6 +956,7 @@ def claude_call_batch(
     budget: CallBudget,
     timeout: float | None = None,
     runner_factory: RunnerFactory | None = None,
+    runtime: ClaudeRuntime | None = None,
 ) -> list[ModelCallResult | BudgetExhaustedError]:
     """Run N claude calls through a bounded pool (``config.claude_pool`` workers), IN INPUT ORDER.
 
@@ -359,6 +967,11 @@ def claude_call_batch(
     the runner (Step 4) loses no work and can resume from exactly the unspent slots. The list is in
     input order; each entry is a ``ModelCallResult`` OR a ``BudgetExhaustedError`` marker.
     """
+    eff_runtime = (
+        runtime
+        if runtime is not None
+        else doctor_claude_runtime(config, runner_factory=runner_factory)
+    )
     with ThreadPoolExecutor(max_workers=config.claude_pool) as executor:
         futures = [
             executor.submit(
@@ -369,6 +982,7 @@ def claude_call_batch(
                 budget=budget,
                 timeout=timeout,
                 runner_factory=runner_factory,
+                runtime=eff_runtime,
             )
             for r in requests
         ]

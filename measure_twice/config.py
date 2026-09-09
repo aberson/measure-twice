@@ -52,6 +52,12 @@ from switchboard.config import (  # type: ignore[import-untyped]
     MIN_MAX_TOKENS,
 )
 
+from measure_twice.model_sweep_execution import (
+    DEFAULT_EXECUTION_PROFILE,
+    ExecutionProfileError,
+    ModelSweepExecutionProfile,
+)
+
 # --- Built-in defaults (plan.md Appendix § Default run config) ---------------------------
 DEFAULT_ROSTER: list[str] = ["general-35b", "coder-30b", "haiku", "sonnet", "opus"]
 DEFAULT_LOCAL_BASE_URL = "http://localhost:8080/v1"
@@ -137,6 +143,7 @@ class RunConfig:
     samples_per_cell: int = DEFAULT_SAMPLES_PER_CELL
     judges: list[str] = field(default_factory=lambda: list(DEFAULT_JUDGES))
     max_calls: int = DEFAULT_MAX_CALLS
+    execution_profile: ModelSweepExecutionProfile = DEFAULT_EXECUTION_PROFILE
     config_source: str = "defaults"
 
     def __post_init__(self) -> None:
@@ -148,6 +155,13 @@ class RunConfig:
         _validate_int_at_least(self.samples_per_cell, "samples_per_cell", 1)
         _validate_name_list(self.judges, "judges")
         _validate_int_at_least(self.max_calls, "max_calls", 1)
+        if not isinstance(self.execution_profile, ModelSweepExecutionProfile):
+            raise ConfigError("execution_profile must be a validated execution profile object")
+        try:
+            self.execution_profile.bindings_for(self.roster)
+            self.execution_profile.bindings_for(self.judges)
+        except ExecutionProfileError as exc:
+            raise ConfigError(str(exc)) from exc
         if not isinstance(self.config_source, str) or not self.config_source:
             raise ConfigError(
                 f"config_source must be a non-empty string, got {self.config_source!r}"
@@ -168,8 +182,17 @@ class RunConfig:
                 f"unknown config key(s): {sorted(unknown)}; "
                 f"allowed: {sorted(ALLOWED_CONFIG_FIELDS)}"
             )
-        # Values are object-typed at the boundary; __post_init__ does the real validation.
-        return cls(config_source=config_source, **cast("Mapping[str, Any]", data))
+        # The nested execution profile is its own strict schema. Parse it before dataclass
+        # construction so no unvalidated mapping can masquerade as the immutable profile type.
+        values = dict(data)
+        raw_profile = values.get("execution_profile")
+        if raw_profile is not None:
+            try:
+                values["execution_profile"] = ModelSweepExecutionProfile.from_mapping(raw_profile)
+            except ExecutionProfileError as exc:
+                raise ConfigError(str(exc)) from exc
+        # Remaining values are object-typed at the boundary; __post_init__ does real validation.
+        return cls(config_source=config_source, **cast("Mapping[str, Any]", values))
 
 
 # The single source of truth for "which top-level keys a config file may contain": the

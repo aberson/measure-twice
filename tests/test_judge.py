@@ -24,8 +24,10 @@ from pathlib import Path
 import pytest
 
 from measure_twice.adapters.base import RC_OS_ERROR, ModelCallResult
+from measure_twice.adapters.claude_cli import CallBudget, ClaudeInvocation, SubprocessResult
 from measure_twice.cli import CliDeps, main
 from measure_twice.config import ENV_VAR, RunConfig
+from measure_twice.model_sweep_execution import CLAUDE_ARGV_TEMPLATE
 from measure_twice.runner import load_run_suite, run, score_run_batch
 from measure_twice.scoring import PARSE_FAIL_MARKER
 from measure_twice.scoring.deterministic import ScoringError
@@ -36,6 +38,7 @@ from measure_twice.scoring.judge import (
     JudgeParseFailError,
     _judge_one_cell,
     build_judge_prompt,
+    default_judge_caller,
     judge_run,
     make_rubric_run_scorer,
     parse_judge_score,
@@ -90,6 +93,90 @@ def _content_caller(good_marker: str, *, high: str, low: str) -> JudgeCaller:
 
 def _cell(response: str, *, item_id: str = "i1", rubric: str = "grade 0-10") -> JudgeCell:
     return JudgeCell(item_id=item_id, prompt="explain X", rubric=rubric, response=response)
+
+
+def test_default_judge_caller_doctor_failure_is_atomic_scoring_error() -> None:
+    """The production scoring caller fails before a prompt call or budget/store mutation."""
+    budget = CallBudget(3)
+    invocations: list[tuple[tuple[str, ...], str]] = []
+
+    def runner(invocation: ClaudeInvocation, input_text: str, timeout: float) -> SubprocessResult:
+        invocations.append((invocation.argv[1:], input_text))
+        if invocation.argv[1:] == ("--version",):
+            return SubprocessResult(0, "test-claude 1.0", "")
+        if invocation.argv[1:] == ("--help",):
+            return SubprocessResult(0, "-p --model --output-format", "")
+        raise AssertionError("judge prompt must not run after a failed doctor")
+
+    caller = default_judge_caller(RunConfig(), budget, runner_factory=lambda: runner)
+
+    with pytest.raises(ScoringError, match="Claude CLI judge preflight failed"):
+        caller("must-not-run", "sonnet")
+
+    assert invocations == [(("--version",), ""), (("--help",), "")]
+    assert budget.used == 0
+
+
+def test_default_judge_caller_reuses_one_doctored_runtime() -> None:
+    """Rubric samples reuse one version/flag proof and the exact resolved executable."""
+    budget = CallBudget(3)
+    invocations: list[tuple[tuple[str, ...], str, str]] = []
+
+    def runner(invocation: ClaudeInvocation, input_text: str, timeout: float) -> SubprocessResult:
+        invocations.append((invocation.argv[1:], input_text, invocation.argv[0]))
+        if invocation.argv[1:] == ("--version",):
+            return SubprocessResult(0, "test-claude 1.0", "")
+        if invocation.argv[1:] == ("--help",):
+            return SubprocessResult(0, " ".join(CLAUDE_ARGV_TEMPLATE), "")
+        return SubprocessResult(
+            0,
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "SCORE: 8",
+                    "model": "claude-sonnet-concrete",
+                }
+            ),
+            "",
+        )
+
+    caller = default_judge_caller(RunConfig(), budget, runner_factory=lambda: runner)
+
+    assert caller("judge-a", "sonnet").ok
+    assert caller("judge-b", "sonnet").ok
+
+    assert [args for args, _stdin, _exe in invocations].count(("--version",)) == 1
+    assert [args for args, _stdin, _exe in invocations].count(("--help",)) == 1
+    assert [stdin for args, stdin, _exe in invocations if args[0] == "-p"] == [
+        "judge-a",
+        "judge-b",
+    ]
+    assert len({executable for _args, _stdin, executable in invocations}) == 1
+    assert budget.used == 2
+
+
+def test_default_judge_caller_prevalidates_entire_claude_capability_before_first_call() -> None:
+    budget = CallBudget(10)
+    factory_calls: list[str] = []
+
+    def forbidden_factory() -> object:
+        factory_calls.append("created")
+        return lambda *_args: SubprocessResult(0, "", "")
+
+    config = RunConfig(judges=["sonnet", "general-35b"])
+    caller = default_judge_caller(
+        config,
+        budget,
+        runner_factory=forbidden_factory,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ScoringError, match=r"general-35b.*local-openai.*inject a JudgeCaller"):
+        caller("first-sonnet-sample-must-not-run", "sonnet")
+
+    assert factory_calls == []
+    assert budget.used == 0
 
 
 # --- SCORE parse (judge-core §5.6 robust-extract) ------------------------------------------------
@@ -532,6 +619,94 @@ def test_cli_mt_score_judges_rubric_run_offline(
     rows = [json.loads(line) for line in (run_dir / "rows.jsonl").read_text().splitlines()]
     assert rows[0]["scorer"] == RUBRIC_SCORER
     assert rows[0]["score"] == pytest.approx(0.9)
+
+
+def test_cli_mt_score_doctor_failure_is_clean_and_store_is_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Real rubric dispatch converts doctor failure to rc=1 before any score rewrite."""
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    run_id = _seed_rubric_run(tmp_path)
+    rows_path = tmp_path / "runs" / run_id / "rows.jsonl"
+    before = rows_path.read_bytes()
+    invocations: list[tuple[str, ...]] = []
+
+    def runner(invocation: ClaudeInvocation, input_text: str, timeout: float) -> SubprocessResult:
+        invocations.append(invocation.argv[1:])
+        if invocation.argv[1:] == ("--version",):
+            return SubprocessResult(0, "test-claude 1.0", "")
+        if invocation.argv[1:] == ("--help",):
+            return SubprocessResult(0, "-p --model --output-format", "")
+        raise AssertionError("judge prompt must not run after a failed doctor")
+
+    rc = main(
+        ["score", run_id, "--out", str(tmp_path)],
+        deps=CliDeps(claude_runner_factory=lambda: runner),
+    )
+
+    assert rc == 1
+    assert "Claude CLI judge preflight failed" in capsys.readouterr().err
+    assert invocations == [("--version",), ("--help",)]
+    assert rows_path.read_bytes() == before
+
+
+def test_cli_mt_score_local_bound_default_judge_fails_cleanly_before_any_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    run_id = _seed_rubric_run(tmp_path)
+    run_dir = tmp_path / "runs" / run_id
+    before = {
+        name: (run_dir / name).read_bytes()
+        for name in ("rows.jsonl", "manifest.json", "suite.json")
+    }
+    before_entries = {path.name for path in run_dir.iterdir()}
+    config_path = tmp_path / "local-judge-config.json"
+    config_path.write_text(json.dumps({"judges": ["general-35b"]}), encoding="utf-8")
+    factory_calls: list[str] = []
+
+    def forbidden_factory() -> object:
+        factory_calls.append("created")
+        return lambda *_args: SubprocessResult(0, "", "")
+
+    rc = main(
+        ["score", run_id, "--out", str(tmp_path), "--config", str(config_path)],
+        deps=CliDeps(claude_runner_factory=forbidden_factory),  # type: ignore[arg-type]
+    )
+
+    assert rc == 1
+    error = capsys.readouterr().err
+    assert "general-35b" in error and "local-openai" in error
+    assert factory_calls == []
+    assert {name: (run_dir / name).read_bytes() for name in before} == before
+    assert {path.name for path in run_dir.iterdir()} == before_entries
+    assert not (run_dir / "rows.jsonl.tmp").exists()
+
+
+def test_cli_mt_score_local_bound_injected_judge_caller_still_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    run_id = _seed_rubric_run(tmp_path)
+    config_path = tmp_path / "local-judge-config.json"
+    config_path.write_text(json.dumps({"judges": ["general-35b"]}), encoding="utf-8")
+    caller = _scripted_caller({"general-35b": [_ok("SCORE: 7"), _ok("SCORE: 8"), _ok("SCORE: 9")]})
+
+    rc = main(
+        ["score", run_id, "--out", str(tmp_path), "--config", str(config_path)],
+        deps=CliDeps(judge_caller=caller),
+    )
+
+    assert rc == 0
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "runs" / run_id / "rows.jsonl").read_text().splitlines()
+    ]
+    assert rows[0]["score"] == pytest.approx(0.8)
 
 
 def test_rubric_run_scorer_skips_no_response_rows(tmp_path: Path) -> None:

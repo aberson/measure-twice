@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import json
 
-from measure_twice.adapters.claude_cli import RunnerFactory, SubprocessResult
+from measure_twice.adapters.claude_cli import ClaudeInvocation, RunnerFactory, SubprocessResult
 from measure_twice.adapters.local import TransportFactory
+from measure_twice.model_sweep_execution import CLAUDE_ARGV_TEMPLATE
 
 
 def _iid(prompt: str) -> str:
@@ -83,7 +84,13 @@ class StubAdapters:
 
     def claude_factory(self) -> RunnerFactory:
         def factory() -> object:
-            def runner(argv: object, input_text: str, timeout: float) -> SubprocessResult:
+            def runner(
+                invocation: ClaudeInvocation, input_text: str, timeout: float
+            ) -> SubprocessResult:
+                if invocation.argv[-1] == "--version":
+                    return SubprocessResult(0, "test-claude 1.0", "")
+                if invocation.argv[-1] == "--help":
+                    return SubprocessResult(0, " ".join(CLAUDE_ARGV_TEMPLATE), "")
                 self.claude_calls.append(input_text)
                 out = self.claude_behavior(input_text)
                 if isinstance(out, BaseException):

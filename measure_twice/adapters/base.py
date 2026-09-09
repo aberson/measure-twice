@@ -74,6 +74,7 @@ __all__ = [
     "RC_TRUNCATED",
     "RC_UNREACHABLE",
     "REASON_CLASSES",
+    "UNRESOLVED_MODEL_ID",
     "AdapterError",
     "ModelCallResult",
     "resolved_model_of",
@@ -108,6 +109,11 @@ REASON_CLASSES: Final[frozenset[str]] = frozenset(
 # a content filter.
 NO_RESPONSE: Final[str] = f"{chr(0xFDD0)}MEASURE_TWICE_NO_RESPONSE{chr(0xFDD0)}"
 
+# Provider identity is evidence, not an alias inference. Both adapters use this exact sentinel
+# when a response/error carries no concrete provider-returned model id; requested aliases are
+# recorded separately in the execution receipt and never stand in for resolved identity.
+UNRESOLVED_MODEL_ID: Final[str] = "UNRESOLVED_PROVIDER_IDENTITY"
+
 
 class AdapterError(ValueError):
     """Raised on programmer misuse of a :class:`ModelCallResult` constructor.
@@ -135,8 +141,9 @@ class ModelCallResult:
 
     ``resolved_model`` is the CONCRETE model id the call resolved to (drift detection: a requested
     alias like ``"sonnet"`` may resolve to ``"claude-sonnet-4-..."``, or a local alias may echo a
-    swapped GGUF id). It is ``""`` when the call never reached a model (a transport error before
-    any response). ``elapsed_s`` is wall-clock seconds for the call.
+    swapped GGUF id). It is :data:`UNRESOLVED_MODEL_ID` when no concrete provider identity was
+    observed, including transport failures before any response. ``elapsed_s`` is wall-clock seconds
+    for the call.
     """
 
     response_raw: str
@@ -183,7 +190,11 @@ class ModelCallResult:
 
     @classmethod
     def error(
-        cls, *, reason_class: str, elapsed_s: float, resolved_model: str = ""
+        cls,
+        *,
+        reason_class: str,
+        elapsed_s: float,
+        resolved_model: str = UNRESOLVED_MODEL_ID,
     ) -> ModelCallResult:
         """A failed call with a switchboard ``reason_class`` (validated in __post_init__)."""
         return cls(
@@ -201,8 +212,10 @@ def resolved_model_of(payload: dict[str, object], requested: str) -> str:
     responses echo the served model at top-level ``model`` (llama-swap reports the actually-loaded
     GGUF there, so a swap away from the requested alias is visible), and the claude
     ``--output-format json`` envelope reports the resolved concrete model at top-level ``model``
-    too. Falls back to the requested alias when the field is absent/non-string, so the row always
-    carries a model id; drift is simply undetectable on that row.
+    too. ``requested`` is retained in the signature for caller compatibility and to make the
+    evidence boundary explicit, but it is never returned: absent provider evidence is recorded as
+    :data:`UNRESOLVED_MODEL_ID`.
     """
+    del requested
     model = payload.get("model")
-    return model if isinstance(model, str) and model else requested
+    return model if isinstance(model, str) and model.strip() else UNRESOLVED_MODEL_ID

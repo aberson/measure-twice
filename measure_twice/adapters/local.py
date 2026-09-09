@@ -181,16 +181,17 @@ def local_chat(
     if not isinstance(payload_raw, dict):
         return ModelCallResult.error(reason_class=RC_BAD_ENVELOPE, elapsed_s=elapsed)
     payload = cast("dict[str, object]", payload_raw)
+    resolved = resolved_model_of(payload, requested=model)
 
     msg = _message_of(payload)
     if msg is None:
-        return ModelCallResult.error(reason_class=RC_BAD_ENVELOPE, elapsed_s=elapsed)
+        return ModelCallResult.error(
+            reason_class=RC_BAD_ENVELOPE, resolved_model=resolved, elapsed_s=elapsed
+        )
 
     # Read the answer from message.content; IGNORE reasoning_content (switchboard gotcha).
     content_raw = msg.get("content")
     content = content_raw if isinstance(content_raw, str) else ""
-    resolved = resolved_model_of(payload, requested=model)
-
     # Empty/whitespace content -> no-response (a reasoning-only truncation). This is checked
     # BEFORE finish_reason: an empty answer is force-scored 0, never recorded as a defer, even
     # when it was empty *because* the reasoning ran out of tokens (finish_reason=length).

@@ -53,8 +53,16 @@ from dataclasses import dataclass, replace
 from typing import Final
 
 from measure_twice.adapters.base import ModelCallResult
-from measure_twice.adapters.claude_cli import CallBudget, RunnerFactory, claude_call
+from measure_twice.adapters.claude_cli import (
+    CallBudget,
+    ClaudeRuntime,
+    ClaudeSetupError,
+    RunnerFactory,
+    claude_call,
+    doctor_claude_runtime,
+)
 from measure_twice.config import RunConfig
+from measure_twice.model_sweep_execution import PROVIDER_CLAUDE, ExecutionProfileError
 from measure_twice.runner import NO_RESPONSE_SCORER, RunRow, RunScorer
 from measure_twice.scoring.deterministic import PARSE_FAIL_MARKER, ScoringError
 from measure_twice.suite import Item
@@ -440,13 +448,47 @@ def default_judge_caller(
     """The production judge-caller: one Claude call per sample via ``claude_call`` (plan §4).
 
     Closes over the run ``config`` + ``budget`` (each judge sample counts against the budget, to cap
-    subscription spend) and returns a :class:`JudgeCaller` the rubric pass calls per sample.
+    subscription spend) and returns a :class:`JudgeCaller` the rubric pass calls per sample. The
+    first call doctors and caches one runtime; a setup failure becomes :class:`ScoringError`, the
+    fail-loud family handled by ``mt score``, before the budget or run store is mutated.
     ``runner_factory`` is the same subprocess DI seam ``claude_call`` takes — production leaves it
-    ``None`` (real subprocess); a live-path test could inject a stub subprocess factory, though the
-    rubric tests inject a stub :class:`JudgeCaller` directly and never reach this.
+    ``None`` (real subprocess); tests may inject a stub without bypassing the doctor or final
+    invocation builder.
     """
 
+    runtime: ClaudeRuntime | None = None
+    configured_aliases = frozenset(config.judges)
+    capability_error: str | None = None
+    for configured_alias in config.judges:
+        try:
+            binding = config.execution_profile.binding_for(configured_alias)
+        except ExecutionProfileError as exc:  # defensive behind RunConfig validation
+            capability_error = f"default Claude judge cannot bind {configured_alias!r}: {exc}"
+            break
+        if binding.provider != PROVIDER_CLAUDE:
+            capability_error = (
+                f"default Claude judge does not support alias {configured_alias!r} bound to "
+                f"provider {binding.provider!r}; inject a JudgeCaller that supports that provider"
+            )
+            break
+
     def _call(judge_prompt: str, judge_alias: str) -> ModelCallResult:
+        nonlocal runtime
+        # Validate the whole configured judge roster on the first scoring call. This is lazy only
+        # so the error lands inside score_run_batch's existing ScoringError boundary; the complete
+        # prevalidation happened at construction, before any doctor/model/budget/store mutation.
+        if capability_error is not None:
+            raise ScoringError(capability_error)
+        if judge_alias not in configured_aliases:
+            raise ScoringError(
+                f"default Claude judge received unconfigured alias {judge_alias!r}; "
+                f"configured judges are {sorted(configured_aliases)!r}"
+            )
+        if runtime is None:
+            try:
+                runtime = doctor_claude_runtime(config, runner_factory=runner_factory)
+            except ClaudeSetupError as exc:
+                raise ScoringError(f"Claude CLI judge preflight failed: {exc}") from exc
         return claude_call(
             judge_prompt,
             alias=judge_alias,
@@ -454,6 +496,7 @@ def default_judge_caller(
             budget=budget,
             timeout=timeout,
             runner_factory=runner_factory,
+            runtime=runtime,
         )
 
     return _call
