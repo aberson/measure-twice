@@ -1097,6 +1097,46 @@ def test_subprocess_runner_timeout_kills_and_raises(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows taskkill chain")
+def test_windows_timeout_taskkill_failure_still_terminates_direct_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A nonzero taskkill exit must not leave the real timed-out child running."""
+    processes: list[subprocess.Popen[str]] = []
+    failed_taskkill_pids: list[str] = []
+
+    def record_cleanup(proc: subprocess.Popen[str]) -> None:
+        processes.append(proc)
+        _kill_process_tree(proc)
+
+    def failed_taskkill(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert processes[0].poll() is None
+        failed_taskkill_pids.append(argv[-1])
+        return subprocess.CompletedProcess(argv, 5, "", "injected taskkill failure")
+
+    monkeypatch.setattr(claude_cli, "_kill_process_tree", record_cleanup)
+    monkeypatch.setattr(claude_cli, "_TREE_KILL_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(subprocess, "run", failed_taskkill)
+    invocation = ClaudeInvocation(
+        argv=(sys.executable, "-c", "import time; time.sleep(30)"),
+        cwd=tmp_path,
+        env=os.environ,
+    )
+
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            _subprocess_runner(invocation, "", 1.0)
+        assert len(processes) == 1
+        assert failed_taskkill_pids == [str(processes[0].pid)]
+        assert processes[0].poll() is not None
+    finally:
+        # Also reap the child when this regression runs against broken production code.
+        for proc in processes:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate(timeout=5.0)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows taskkill chain")
 def test_windows_timeout_cleanup_pins_system_taskkill_cwd_and_credential_free_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

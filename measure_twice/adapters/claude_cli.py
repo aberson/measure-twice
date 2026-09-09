@@ -222,12 +222,13 @@ class CallBudget:
 
 
 def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
-    """Kill ``proc`` AND its descendants (claude may spawn tool grandchildren on timeout).
+    """Attempt to kill ``proc`` and its descendants on timeout.
 
     ``subprocess``'s own kill targets only the direct child, so a grandchild leaks — verified on
     Windows (``feedback_subprocess_tree_kill_windows``). Windows walks the PID tree via
     ``taskkill /T``; POSIX signals the whole process group (the child was made a group leader via
-    ``start_new_session``). Best-effort: swallow the races where the tree already exited.
+    ``start_new_session``). If tree cleanup fails, fall back to killing the direct child;
+    descendant termination is best-effort.
     """
     if proc.poll() is not None:
         return
@@ -235,7 +236,7 @@ def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
         try:
             paths = _windows_runtime_paths()
             system_directory = paths.windows / "System32"
-            subprocess.run(  # noqa: S603
+            result = subprocess.run(  # noqa: S603
                 [str(system_directory / "taskkill.exe"), "/T", "/F", "/PID", str(proc.pid)],
                 capture_output=True,
                 check=False,
@@ -243,9 +244,10 @@ def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
                 cwd=system_directory,
                 env=dict(_windows_system_environment(paths)),
             )
-        except (ClaudeSetupError, OSError, subprocess.TimeoutExpired):
+            result.check_returncode()
+        except (ClaudeSetupError, OSError, subprocess.SubprocessError):
             # Best-effort cleanup must not inherit the checkout cwd, PATH, COMSPEC, or OAuth merely
-            # because the canonical system helper is unavailable. Fall back to the direct child.
+            # because the canonical system helper failed. Fall back to the direct child.
             proc.kill()
     else:
         try:
@@ -265,7 +267,7 @@ def _subprocess_runner(
     silently mojibake-corrupts non-ASCII UTF-8 stdout (em-dash, curly quotes, café) that Claude's
     prose uses constantly, poisoning the exact benchmark text we measure. ``errors="replace"``
     keeps a rare malformed byte from crashing the run (valid UTF-8 round-trips byte-faithfully).
-    On timeout the whole process TREE is killed (see :func:`_kill_process_tree`).
+    On timeout attempt tree cleanup, with a direct-child fallback (see :func:`_kill_process_tree`).
     """
     # POSIX: own process group so a timeout can killpg the whole tree. Windows: no-op here
     # (taskkill /T walks the PID tree directly), so the flag is False.

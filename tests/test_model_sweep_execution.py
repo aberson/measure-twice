@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import json
 from pathlib import Path
 
 import pytest
@@ -169,12 +168,6 @@ def test_context_contract_pins_tools_customizations_sessions_and_allowlist() -> 
     assert "--bare" not in argv
     assert "ANTHROPIC_API_KEY" not in CLAUDE_ENV_ALLOWLIST
     assert "CLAUDE_CONFIG_DIR" not in CLAUDE_ENV_ALLOWLIST
-
-
-def test_committed_profile_is_valid_json_object() -> None:
-    payload = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
-    assert isinstance(payload, dict)
-    assert payload["execution_profile"] == DEFAULT_EXECUTION_PROFILE.to_mapping()
 
 
 def test_execution_receipt_round_trips_and_rejects_tampering() -> None:

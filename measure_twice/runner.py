@@ -281,7 +281,7 @@ def _write_manifest(
     preregister: str | None,
     execution_receipt: ExecutionReceipt,
 ) -> None:
-    """Write ``manifest.json`` with EXACTLY the plan §3 keys (written once, at run start)."""
+    """Write the plan §3 manifest keys plus the execution receipt once, at run start."""
     manifest: dict[str, object] = {
         "run_id": run_id,
         "suite": suite.suite,
@@ -705,7 +705,7 @@ def _pending_cells(
     samples: int,
     done_keys: set[tuple[str, str, int]],
 ) -> list[_Cell]:
-    """The cells for ``model`` that have no terminal row yet (item x sample, in suite order)."""
+    """The cells for ``binding`` that have no terminal row yet (item x sample, in suite order)."""
     return [
         _Cell(binding.alias, binding, item, k)
         for item in suite.items
