@@ -15,8 +15,8 @@ schema_version = 1
 approved_roots = ["."]
 
 # --- Canonical plans (authoritative).
-# measure-twice partitions step ids across FOUR plan documents (1-17 / 18-24 /
-# 25-55 / 56-63). All four must be declared, or same-page treats every step id
+# measure-twice partitions step ids across FIVE plan documents (1-17 / 18-24 /
+# 25-55 / 56-63 / 64-65). All five must be declared, or same-page treats every step id
 # defined outside plan.md as an unknown reference.
 [[artifact]]
 path = "plan.md"
@@ -32,6 +32,10 @@ role = "canonical-plan"
 
 [[artifact]]
 path = "documentation/first-measurement-validity-and-luna-routing-plan.md"
+role = "canonical-plan"
+
+[[artifact]]
+path = "documentation/gemini-model-sweep-plan.md"
 role = "canonical-plan"
 
 # --- Secondary summaries: the side that goes stale when the plans move on.
