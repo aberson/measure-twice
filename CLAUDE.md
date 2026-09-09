@@ -79,15 +79,34 @@ Gate evidence at wrap: native suite from the repo root **462 passed, 110 skipped
 
 > **The WSL containment gate is not reliably green: 9/10 (`0,0,0,1,0,0,0,0,0,0`) at wrap time,** run post-`6706fb6` on 2026-08-24. The single red landed on run 4, whose output was not captured; runs 7-10 were captured but all passed, so the failing case is **still unidentified**. This is the *sixth* appearance of one shape in this branch — a test asserting on a quantity it does not control (see [[test-asserts-uncontrolled-quantity]]); issue #58 item 3 already names a known red-when-healthy race in `test_linux_scope_absence_interval_restarts_when_the_path_reappears` as a candidate. **Never call this gate green off one run.** Run it 6–8× and report the pass *rate*; retrying until green hides exactly the defect you need to see. Step 27 builds more canaries on this substrate — identify and fix the remaining flake before adding to it.
 
-**Next: canonical `plan.md` Steps 13–17** — 13 calibration sweep (observation run), 14 discriminative calibration + dataset iteration, 15 capability profiling, 16 first ledger measurements (observation run), 17 methodology rollup + README. Steps 13 and 16 are operator observation runs needing the local endpoint up. `measure_twice/analyze/` (calibrate, profile, agreement) does not exist yet — Steps 14–15 create it.
+**Current work: Step 56 remains BLOCKED** (2026-09-09, #62) in
+`documentation/first-measurement-validity-and-luna-routing-plan.md`. Candidate `7f6a1df` is
+committed and pushed on `build-step-56-20260831053108`; it is preserved in
+`../worktree_build-step-56-20260831053108` (19 changed files). **Keep this worktree.**
+The configured five review rounds ended with three distinct gaps: unsupported judge providers
+accepted during collection, known identity drift ignored on failed judge samples, and a cached-path
+weakness in one Windows isolation test. Six independent reviews and offline reproductions are
+saved locally; the candidate has not merged. The next action is to resolve that bounded repair
+scope before advancing.
 
-Coding-agent Steps 27–55 are also unblocked and may proceed in parallel: that plan states it does not require the pending Steps 13–24, which is why 25–26 were built ahead of them. **Step 27 (#29) is the next one there.**
+**Then Step 57** adds receipt/identity reporting and the qualification wrapper. Step 58 performs
+three real Claude canaries before canonical Step 13 calibration. Canonical Steps 13-17 remain
+pending; Steps 13 and 16 require the local endpoint. `measure_twice/analyze/` does not yet exist.
+The authorized continuation after Step 57 is Gemini Step 64; its separate two-call live smoke
+(Step 65) needs locally provisioned credentials and call permission. Gemini is planned, not built.
 
-**A fourth plan exists and is the most recent work:** `documentation/first-measurement-validity-and-luna-routing-plan.md`, Steps 56–63 (issues #61–#68 under umbrella #60). **Step 56 is BLOCKED** (2026-08-31, #62) — "Seal and fail-close Instrument A execution". Its in-progress work is preserved *uncommitted* in the worktree at `../worktree_build-step-56-20260831053108` (14 files, incl. `measure_twice/model_sweep_execution.py`, `profiles/model-sweep-execution-v1.json`, `tests/test_model_sweep_execution.py`). **That worktree is not junk — do not remove or clean it until Step 56 resumes.**
+Coding-agent Step 27 (#29) remains blocked on coordinator Steps 62 and 63: the reviewed
+zombie-aware containment repair and an eight-run WSL qualification. Those are independent of
+the current Instrument A/Gemini work.
 
-So there are **four** plan documents partitioning step ids (1–17 / 18–24 / 25–55 / 56–63); `plan.md` is canonical for the Instrument A spine but is *not* the whole picture. `same-page.toml` declares all four, because any status tool that sees only `plan.md` treats every step above 17 as an unknown reference.
+There are **five** plan documents partitioning step ids 1-17 / 18-24 / 25-55 / 56-63 / 64-65.
+`plan.md` is the canonical entry; `same-page.toml` declares all five, including
+`documentation/gemini-model-sweep-plan.md`. The first-measurement coordinator governs the
+qualification dependencies above.
 
-**Current gate numbers: 489 passed / 111 skipped** at the #69 fix (the "462 passed, 110 skipped" above is the Steps 25–26 wrap record, kept as history). Prior anchors: 480/111 at `d416aa5`, 478/111 at `9d949e9`.
+**Gate evidence:** shipped code remains at 489 passed / 111 skipped (the #69 fix). The unmerged
+Step 56 candidate has 607 passed / 113 skipped, plus clean Ruff lint/format, strict mypy and build;
+its review gate is still NEEDS-WORK. Historical Steps 25-26 numbers above remain unchanged.
 
 > **Bundle bytecode is a load-time rejection, not a silent hash change (#69, fixed).** The loader refuses a bundle whose `seed/` or `oracle/` tree holds a `__pycache__` directory or a `.pyc`/`.pyo` file, naming the path. `__pycache__/` and `*.pyc` are gitignored (`.pyo` is not), so plain `git status` cannot see the common case — use `git status --porcelain --ignored -- suites`. The rule covers that one artifact class only; other generated files are still hashed silently.
 

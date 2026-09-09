@@ -1,8 +1,8 @@
 # First-Measurement Validity Gates and Luna Routing
 
-**Status:** SYNCED (2026-08-30) — 0/8 steps complete; umbrella #60 and Step 56-63 issues
-#62/#63/#64/#65/#66/#67/#61/#68 backfilled; cross-plan links verified; ready for the filtered
-first code span after the ownership-separated working-tree checkpoint passes
+**Status:** BLOCKED (2026-09-09) — 0/8 steps complete; umbrella #60 and Step 56-63 issues
+#62/#63/#64/#65/#66/#67/#61/#68 backfilled; cross-plan links verified. Step 56 is preserved
+unmerged after its review cap; the remaining defects are recorded below.
 
 **Repo-sync phase identifier:** `first-measurement-validity-and-luna-routing` (must be passed
 explicitly; it cannot be inferred from this filename)
@@ -239,7 +239,16 @@ only run/evidence artifacts; they add no code and contain no confirmation prompt
   `"uv run pytest -q tests/test_model_sweep_execution.py tests/test_adapters.py tests/test_config.py tests/test_runner.py"`
   exits 0 through the production builder
 - **Depends on:** 7, 12 (shipped)
-- **Status:** BLOCKED (2026-08-31)
+- **Status:** BLOCKED (2026-09-09)
+
+The recovery candidate `7f6a1df` is committed and pushed on
+`build-step-56-20260831053108`, but remains unmerged after the configured five review rounds.
+The complete native suite passes (607 passed, 113 explicit platform skips), as do Ruff lint/format,
+strict mypy, and package build. The aggregate of six independent reviews is NEEDS-WORK: collection accepts
+judge providers that the default CLI cannot score; rubric scoring ignores concrete identity drift
+on non-success judge samples; and one Windows environment-isolation test can reuse a warm path
+cache. Offline production-path probes reproduced all three problems. Preserve the candidate and
+review evidence; resolve these before Step 57 or Gemini Step 64. No live qualification ran.
 
 ### Step 57: Report the seal and build its live qualification path
 
