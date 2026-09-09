@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 244" font-family="ui-monospace,'Cascadia Code','SF Mono',Consolas,'Roboto Mono',monospace" role="img" aria-label="The claim ledger connects quote-hashed sources and run evidence to an audited Markdown map.">
+  <defs>
+    <marker id="arrow-dark" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6E9BFF"/></marker>
+    <marker id="return-dark" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#384153"/></marker>
+    <filter id="shadow-dark" x="-20%" y="-45%" width="140%" height="190%"><feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="rgba(0,0,0,.5)"/></filter>
+  </defs>
+  <style>
+    .bg{fill:#161C26;stroke:#29313F;stroke-width:1.5}
+    .node rect{fill:#161C26;stroke:#384153;stroke-width:1.4;filter:url(#shadow-dark)}
+    .spine{fill:none;stroke:#6E9BFF;stroke-width:2.4}
+    .link{fill:none;stroke:#384153;stroke-width:1.7}
+    .title{fill:#6E9BFF;font-size:13px;font-weight:600}
+    .sub{fill:#7C8598;font-size:10.5px}
+    .label{fill:#7C8598;font-size:11px;letter-spacing:.12em;font-weight:600}
+    .caption{fill:#7C8598;font-size:10.5px}
+  </style>
+  <rect class="bg" x="6" y="6" width="988" height="232" rx="16"/>
+  <text class="label" x="24" y="34">SOURCE + EVIDENCE</text>
+  <g class="node">
+    <rect x="24" y="54" width="200" height="148" rx="10"/>
+    <text class="title" x="38" y="80">Routing statement</text>
+    <text class="sub" x="38" y="100">quote + source location</text>
+    <path class="link" d="M38,119 H210"/>
+    <text class="title" x="38" y="145">Supporting runs</text>
+    <text class="sub" x="38" y="165">evidence IDs when present</text>
+    <text class="sub" x="38" y="183">preregistered scope</text>
+  </g>
+  <text class="label" x="274" y="34">CLAIM RECORD</text>
+  <g class="node">
+    <rect x="274" y="54" width="200" height="148" rx="10"/>
+    <text class="title" x="288" y="80">claims.jsonl</text>
+    <text class="sub" x="288" y="100">statement + quote hash</text>
+    <path class="link" d="M288,119 H460"/>
+    <text class="title" x="288" y="145">Evidence status</text>
+    <text class="sub" x="288" y="165">MEASURED / PARTIAL</text>
+    <text class="sub" x="288" y="183">ASSERTED / STALE</text>
+  </g>
+  <text class="label" x="524" y="34">CHECK FRESHNESS</text>
+  <g class="node">
+    <rect x="524" y="54" width="200" height="148" rx="10"/>
+    <text class="title" x="538" y="80">mt claims audit</text>
+    <text class="sub" x="538" y="100">re-read the cited quote</text>
+    <path class="link" d="M538,119 H710"/>
+    <text class="title" x="538" y="145">Changed or missing?</text>
+    <text class="sub" x="538" y="165">mark STALE; exit nonzero</text>
+    <text class="sub" x="538" y="183">no automatic promotion</text>
+  </g>
+  <text class="label" x="774" y="34">READ THE MAP</text>
+  <g class="node">
+    <rect x="774" y="54" width="200" height="148" rx="10"/>
+    <text class="title" x="788" y="80">mt claims render</text>
+    <text class="sub" x="788" y="100">Markdown grouped by status</text>
+    <path class="link" d="M788,119 H960"/>
+    <text class="title" x="788" y="145">Evidence map</text>
+    <text class="sub" x="788" y="165">update generated section</text>
+    <text class="sub" x="788" y="183">docs/tier-benchmark-map.md</text>
+  </g>
+  <path class="spine" marker-end="url(#arrow-dark)" d="M224,128 H267"/>
+  <path class="spine" marker-end="url(#arrow-dark)" d="M474,128 H517"/>
+  <path class="spine" marker-end="url(#arrow-dark)" d="M724,128 H767"/>
+  <text class="caption" x="24" y="227">The operator assigns evidence status. The audit checks source freshness, not whether a run proves a claim.</text>
+</svg>
