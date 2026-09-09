@@ -60,22 +60,16 @@ from pathlib import Path
 from typing import Final, cast
 
 from measure_twice.adapters._claude_runtime import (
-    ClaudeSetupError as ClaudeSetupError,
-)
-from measure_twice.adapters._claude_runtime import (
+    ClaudeSetupError,
     _allowlisted_environment,
     _credential_free_environment,
+    _LauncherBoundary,
+    _posix_account_home,
     _resolve_executable,
     _runtime_launcher_policy,
     _trusted_temp_root,
     _windows_runtime_paths,
     _windows_system_environment,
-)
-from measure_twice.adapters._claude_runtime import (
-    _LauncherBoundary as _LauncherBoundary,
-)
-from measure_twice.adapters._claude_runtime import (
-    _posix_account_home as _posix_account_home,
 )
 from measure_twice.adapters.base import (
     RC_BAD_ENVELOPE,
@@ -96,6 +90,26 @@ from measure_twice.model_sweep_execution import (
     ClaudeContextProfile,
     ExecutionProfileError,
 )
+
+__all__ = [
+    "DEFAULT_CLAUDE_TIMEOUT_S",
+    "BudgetExhaustedError",
+    "CallBudget",
+    "ClaudeInvocation",
+    "ClaudeRequest",
+    "ClaudeRuntime",
+    "ClaudeSetupError",
+    "RunnerFactory",
+    "SubprocessResult",
+    "SubprocessRunner",
+    "_LauncherBoundary",
+    "_posix_account_home",
+    "build_claude_invocation",
+    "build_claude_runtime",
+    "claude_call",
+    "claude_call_batch",
+    "doctor_claude_runtime",
+]
 
 # claude calls can be slow (cold model, long generations); this is the per-call default. As with
 # the local adapter, RunConfig carries no timeout field in v1 — a caller/runner may override.

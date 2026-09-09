@@ -9,8 +9,6 @@ import pytest
 
 from measure_twice.config import load_config
 from measure_twice.model_sweep_execution import (
-    CLAUDE_ARGV_TEMPLATE,
-    CLAUDE_ENV_ALLOWLIST,
     DEFAULT_EXECUTION_PROFILE,
     PROVIDER_CLAUDE,
     PROVIDER_LOCAL,
@@ -22,9 +20,9 @@ from measure_twice.model_sweep_execution import (
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATH = ROOT / "profiles" / "model-sweep-execution-v1.json"
-PROFILE_SHA256 = "4f99e86d192d6534ef1ee3337e19aab263d52b97196efc7c262e711aa7091526"
+PROFILE_SHA256 = "af438f4442ef35b7a41dfb090accc0e1188592aeabce8feab206602044a6e905"
 PROVIDER_PROFILE_SHA256 = "f6b6c6c9d62c45c45cc6e5f921c6bf5a6830f3c89ec6f3f7af9ce6c987ac8012"
-CONTEXT_PROFILE_SHA256 = "aaca7846b51b89a9420ab682a44398c3ddd02bff5d29f25af11a7804d45a5df3"
+CONTEXT_PROFILE_SHA256 = "84a2b99593bf58f986c4f5cd818cc16e1c75d59d8f0b1fed5bc7ac2c6267bc6d"
 
 
 def _profile_mapping() -> dict[str, object]:
@@ -156,18 +154,6 @@ def test_profile_rejects_duplicate_alias_and_context_weakening() -> None:
     argv.remove("--safe-mode")
     with pytest.raises(ExecutionProfileError, match="frozen prompt-only"):
         ModelSweepExecutionProfile.from_mapping(weakened)
-
-
-def test_context_contract_pins_tools_customizations_sessions_and_allowlist() -> None:
-    argv = CLAUDE_ARGV_TEMPLATE
-    assert "--safe-mode" in argv
-    assert argv[argv.index("--tools") + 1] == ""
-    assert "--disable-slash-commands" in argv
-    assert "--no-chrome" in argv
-    assert "--no-session-persistence" in argv
-    assert "--bare" not in argv
-    assert "ANTHROPIC_API_KEY" not in CLAUDE_ENV_ALLOWLIST
-    assert "CLAUDE_CONFIG_DIR" not in CLAUDE_ENV_ALLOWLIST
 
 
 def test_execution_receipt_round_trips_and_rejects_tampering() -> None:

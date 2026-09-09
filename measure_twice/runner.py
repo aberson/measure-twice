@@ -89,6 +89,7 @@ __all__ = [
     "ScoreResult",
     "Scorer",
     "collect_only_scorer",
+    "load_run_judge_contract",
     "load_run_suite",
     "run",
     "score_run",
@@ -653,6 +654,16 @@ def _doctor_execution(
     return receipt, runtime
 
 
+def _execution_bindings(
+    config: RunConfig, suite: Suite, roster: Sequence[str], judges: Sequence[str]
+) -> tuple[ModelBinding, ...]:
+    """Select the collection roster and, only for rubric suites, its future judges."""
+    aliases = list(roster)
+    if suite.scoring.type == "rubric":
+        aliases.extend(judges)
+    return _resolve_bindings(config, list(dict.fromkeys(aliases)), label="execution")
+
+
 def _read_execution_receipt(manifest: Mapping[str, object]) -> ExecutionReceipt | None:
     """Read the additive receipt; a missing key identifies a readable legacy manifest."""
     if "execution_receipt" not in manifest:
@@ -682,7 +693,8 @@ def _validate_receipt_profile(
         raise RunError(f"cannot validate stored execution receipt: {exc}") from exc
     if stored != expected:
         raise RunError(
-            "cannot resume: execution profile/provider bindings differ from the stored receipt"
+            "execution profile/provider bindings differ from the stored receipt; "
+            "collect a new run under the current sealed contract"
         )
 
 
@@ -775,6 +787,7 @@ def run(
         _validate_names(eff_judges, "judges")
         bindings = _resolve_bindings(config, eff_roster, label="roster")
         _resolve_bindings(config, eff_judges, label="judges")
+        selected_bindings = _execution_bindings(config, suite, eff_roster, eff_judges)
         existing_rows, torn = _read_rows(run_dir)
         done_keys = {row.cell_key for row in existing_rows}
         stored_receipt = _read_execution_receipt(manifest)
@@ -785,11 +798,11 @@ def run(
                 "and sealed execution contracts"
             )
         if stored_receipt is not None:
-            _validate_receipt_profile(stored_receipt, config, bindings)
+            _validate_receipt_profile(stored_receipt, config, selected_bindings)
             if pending_claude:
                 current_receipt, claude_runtime = _doctor_execution(
                     config,
-                    bindings,
+                    selected_bindings,
                     runner_factory=claude_runner_factory,
                 )
                 if current_receipt != stored_receipt:
@@ -805,7 +818,7 @@ def run(
         # double-write the same (model,item,sample) cell (BLOCK 3).
         eff_roster = list(dict.fromkeys(roster if roster is not None else config.roster))
         eff_samples = samples_per_cell if samples_per_cell is not None else config.samples_per_cell
-        eff_judges = list(judges) if judges is not None else list(config.judges)
+        eff_judges = list(dict.fromkeys(judges if judges is not None else config.judges))
         eff_max_calls = max_calls if max_calls is not None else config.max_calls
         # ALL validity checks BEFORE any filesystem mutation (BLOCK 1): invalid budget/roster/
         # samples or a malformed --models/--judges name must fail loud without minting a run dir.
@@ -816,7 +829,7 @@ def run(
         _resolve_bindings(config, eff_judges, label="judges")
         execution_receipt, claude_runtime = _doctor_execution(
             config,
-            bindings,
+            _execution_bindings(config, suite, eff_roster, eff_judges),
             runner_factory=claude_runner_factory,
         )
         # All validation, provider binding, executable resolution, and CLI doctoring is complete
@@ -933,6 +946,41 @@ def load_run_suite(run_id: str, out_dir: str | Path) -> Suite:
     hash mismatch all raise :class:`RunError`.
     """
     return _open_run(run_id, out_dir)[1]
+
+
+def load_run_judge_contract(
+    run_id: str, out_dir: str | Path, config: RunConfig
+) -> tuple[tuple[str, ...], ExecutionReceipt]:
+    """Read recorded rubric judges and validate their sealed profile before fresh judging.
+
+    Historical runs remain readable and deterministically rescorable. Fresh judge calls require
+    a receipt covering the recorded collection roster AND judges; a new config cannot rebind them.
+    Runtime evidence is checked by the judge caller immediately before invoking its first sample.
+    """
+    run_dir, suite = _open_run(run_id, out_dir)
+    if suite.scoring.type != "rubric":
+        raise RunError("judge contract requires a rubric suite")
+    manifest = _read_manifest(run_dir)
+    selections: dict[str, list[str]] = {}
+    for label in ("roster", "judges"):
+        raw = manifest.get(label)
+        if not isinstance(raw, list) or not all(isinstance(name, str) for name in raw):
+            raise RunError(f"manifest {label} must be a list of model aliases")
+        names = cast("list[str]", raw)
+        _validate_names(names, label)
+        selections[label] = list(dict.fromkeys(names))
+    judges = tuple(selections["judges"])
+    if not judges:
+        raise RunError("rubric judging requires recorded judge models")
+    stored = _read_execution_receipt(manifest)
+    if stored is None:
+        raise RunError(
+            "cannot freshly judge legacy-unsealed run without a stored receipt; collect a new "
+            "run under the current sealed contract (deterministic offline rescoring is available)"
+        )
+    selected = _execution_bindings(config, suite, selections["roster"], judges)
+    _validate_receipt_profile(stored, config, selected)
+    return judges, stored
 
 
 def score_run(

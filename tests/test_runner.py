@@ -483,6 +483,15 @@ def test_pending_legacy_claude_resume_rejects_before_torn_tail_mutation(
     assert not (run_dir / "rows.jsonl.tmp").exists()
     assert resume_stub.claude_calls == []
 
+    # Fresh Claude execution is forbidden, but deterministic scoring of the stored bytes works.
+    score_rc = main(["score", first.run_id, "--out", str(tmp_path)])
+    assert score_rc == 0
+    rescored = _read_jsonl(rows_path)
+    assert len(rescored) == 1
+    assert rescored[0]["response_raw"] == "cl-answer"
+    assert rescored[0]["scorer"] == "verdict"
+    assert "execution_receipt" not in json.loads(manifest_path.read_text(encoding="utf-8"))
+
 
 def test_valid_unterminated_final_row_is_repaired_before_resume_append(tmp_path: Path) -> None:
     suite = _suite(["a", "b", "c"])
@@ -896,6 +905,24 @@ def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-leak")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "must-not-leak"))
     monkeypatch.setenv("MEASURE_TWICE_SECRET", "must-not-leak")
+    network_overrides = (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NODE_EXTRA_CA_CERTS",
+        "NODE_TLS_REJECT_UNAUTHORIZED",
+        "NODE_OPTIONS",
+        "CLAUDE_CODE_CERT_STORE",
+        "CLAUDE_CODE_CLIENT_CERT",
+        "CLAUDE_CODE_CLIENT_KEY",
+        "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+        "ANTHROPIC_BASE_URL",
+    )
+    for name in network_overrides:
+        monkeypatch.setenv(name, "hostile-initial-value")
 
     rc = main(
         [
@@ -906,6 +933,8 @@ def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
             str(config_path),
             "--out",
             str(out),
+            "--budget",
+            "1",
         ]
     )
 
@@ -923,8 +952,27 @@ def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
     assert receipt.claude_cli.version == "fake-claude 9.8.7"
     assert receipt.to_mapping()["receipt_sha256"] == manifest["execution_receipt"]["receipt_sha256"]
 
+    for name in network_overrides:
+        monkeypatch.setenv(name.lower(), "hostile-resumed-value")
+    resume_rc = main(
+        [
+            "run",
+            "--suite",
+            str(suite_path),
+            "--config",
+            str(config_path),
+            "--out",
+            str(out),
+            "--resume",
+            run_dirs[0].name,
+            "--budget",
+            "1",
+        ]
+    )
+    assert resume_rc == 0
+
     observations = _read_jsonl(observations_path)
-    assert len(observations) == 4
+    assert len(observations) == 6
     expected_path = [
         launcher.parent.resolve(),
         *(path.resolve() for path in dependency_directories),
@@ -933,6 +981,7 @@ def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
         assert record["helper_executable"] == str(_base_python_executable())
         environment = record["environment"]
         assert isinstance(environment, dict)
+        assert not {name.upper() for name in environment}.intersection(network_overrides)
         child_path = [Path(entry).resolve() for entry in str(environment["PATH"]).split(os.pathsep)]
         assert child_path == expected_path
     expected_tail = [
@@ -1096,8 +1145,14 @@ def test_unbound_alias_fails_before_run_dir_or_adapter_creation(tmp_path: Path) 
     assert stub.claude_calls == []
 
 
-def test_claude_doctor_rejects_unsupported_seal_before_run_dir(tmp_path: Path) -> None:
-    suite = _suite(["a"])
+@pytest.mark.parametrize(
+    ("scoring_type", "roster"),
+    [("verdict", ["haiku"]), ("rubric", ["general-35b"])],
+)
+def test_claude_doctor_rejects_unsupported_seal_before_run_dir(
+    tmp_path: Path, scoring_type: str, roster: list[str]
+) -> None:
+    suite = _suite(["a"], scoring_type=scoring_type)
     invocations: list[tuple[str, ...]] = []
 
     def factory():
@@ -1118,7 +1173,8 @@ def test_claude_doctor_rejects_unsupported_seal_before_run_dir(tmp_path: Path) -
             suite=suite,
             config=RunConfig(),
             out_dir=tmp_path,
-            roster=["haiku"],
+            roster=roster,
+            local_transport_factory=StubAdapters().local_factory(),
             claude_runner_factory=factory,
         )
 

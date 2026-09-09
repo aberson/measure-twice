@@ -19,15 +19,21 @@ Covers the Step-6 done-when and the ported void_furnace invariants:
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
+from conftest import StubAdapters, _claude_stdout
 
 from measure_twice.adapters.base import RC_OS_ERROR, ModelCallResult
 from measure_twice.adapters.claude_cli import CallBudget, ClaudeInvocation, SubprocessResult
 from measure_twice.cli import CliDeps, main
 from measure_twice.config import ENV_VAR, RunConfig
-from measure_twice.model_sweep_execution import CLAUDE_ARGV_TEMPLATE
+from measure_twice.model_sweep_execution import (
+    CLAUDE_ARGV_TEMPLATE,
+    DEFAULT_EXECUTION_PROFILE,
+    ExecutionReceipt,
+)
 from measure_twice.runner import load_run_suite, run, score_run_batch
 from measure_twice.scoring import PARSE_FAIL_MARKER
 from measure_twice.scoring.deterministic import ScoringError
@@ -557,16 +563,140 @@ def _erroring_local_factory():  # type: ignore[no-untyped-def]
     return factory  # type: ignore[return-value]
 
 
-def _seed_rubric_run(tmp_path: Path) -> str:
+def _seed_rubric_run(tmp_path: Path, *, judges: list[str] | None = None) -> str:
     """Sweep the rubric suite with a fixed local response (collect-only) and return the run id."""
     result = run(
         suite=_rubric_suite(),
         config=RunConfig(),
         out_dir=tmp_path,
         roster=["general-35b"],
+        judges=judges,
         local_transport_factory=_fixed_local_factory("a thorough recursion explanation"),
+        claude_runner_factory=StubAdapters().claude_factory(),
     )
     return result.run_id
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "recorded-selection",
+        "unresolved",
+        "identity-drift",
+        "profile-drift",
+        "provider-drift",
+        "runtime-drift",
+        "legacy",
+        "missing-judge-binding",
+    ],
+)
+def test_cli_rubric_contract_from_collection_through_judge_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    scenario: str,
+) -> None:
+    """Only process/transport boundaries are injected; CLI resolves and scores real run bytes."""
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    suite_path = tmp_path / "rubric.json"
+    suite_path.write_text(json.dumps(asdict(_rubric_suite())), encoding="utf-8")
+    stub = StubAdapters()
+    collect_rc = main(
+        [
+            "run",
+            "--suite",
+            str(suite_path),
+            "--models",
+            "general-35b",
+            "--judges",
+            "fable",
+            "--out",
+            str(tmp_path),
+        ],
+        deps=CliDeps(
+            local_transport_factory=stub.local_factory(),
+            claude_runner_factory=stub.claude_factory(),
+        ),
+    )
+    assert collect_rc == 0
+    assert stub.claude_calls == []  # judges were preflighted, never invoked by collection
+    run_dir = next((tmp_path / "runs").iterdir())
+    if scenario in {"legacy", "missing-judge-binding"}:
+        manifest_path = run_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if scenario == "legacy":
+            del manifest["execution_receipt"]
+        else:
+            manifest["execution_receipt"] = ExecutionReceipt.create(
+                DEFAULT_EXECUTION_PROFILE,
+                DEFAULT_EXECUTION_PROFILE.bindings_for(["general-35b"]),
+                claude_executable=None,
+                claude_version=None,
+            ).to_mapping()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in run_dir.iterdir()}
+    judge_models: list[str] = []
+    probes: list[str] = []
+
+    def process(invocation: ClaudeInvocation, input_text: str, timeout: float) -> SubprocessResult:
+        if invocation.argv[-1] == "--version":
+            probes.append("version")
+            version = "changed-claude 2.0" if scenario == "runtime-drift" else "test-claude 1.0"
+            return SubprocessResult(0, version, "")
+        if invocation.argv[-1] == "--help":
+            probes.append("help")
+            return SubprocessResult(0, " ".join(CLAUDE_ARGV_TEMPLATE), "")
+        judge_models.append(invocation.argv[invocation.argv.index("--model") + 1])
+        assert "MODEL RESPONSE TO GRADE:" in input_text
+        identity = "concrete-fable"
+        if scenario == "identity-drift" and len(judge_models) == 2:
+            identity = "different-concrete-fable"
+        payload = json.loads(_claude_stdout("SCORE: 9", model=identity))
+        if scenario == "unresolved":
+            del payload["model"]
+        return SubprocessResult(0, json.dumps(payload), "")
+
+    args = ["score", run_dir.name, "--out", str(tmp_path)]
+    if scenario in {"profile-drift", "provider-drift"}:
+        profile = DEFAULT_EXECUTION_PROFILE.to_mapping()
+        binding = next(model for model in profile["models"] if model["alias"] == "fable")
+        if scenario == "profile-drift":
+            binding["requested_model"] = "sonnet"
+        else:
+            binding["provider"] = "local-openai"
+        config_path = tmp_path / "drift.json"
+        config_path.write_text(json.dumps({"execution_profile": profile}), encoding="utf-8")
+        args += ["--config", str(config_path)]
+    rc = main(args, deps=CliDeps(claude_runner_factory=lambda: process))
+    if scenario == "recorded-selection":
+        assert rc == 0
+        assert judge_models == ["fable"] * 3
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        assert manifest["judges"] == ["fable"]
+        assert [binding["alias"] for binding in manifest["execution_receipt"]["bindings"]] == [
+            "general-35b",
+            "fable",
+        ]
+        assert (run_dir / "manifest.json").read_bytes() == before["manifest.json"]
+        row = json.loads((run_dir / "rows.jsonl").read_text())
+        assert row["score"] == pytest.approx(0.9)
+    else:
+        assert rc == 1
+        error = capsys.readouterr().err
+        expected = {
+            "unresolved": "unresolved",
+            "identity-drift": "identity changed",
+            "profile-drift": "stored receipt",
+            "provider-drift": "stored receipt",
+            "runtime-drift": "stored sealed contract",
+            "legacy": "legacy-unsealed",
+            "missing-judge-binding": "stored execution receipt",
+        }
+        assert expected[scenario] in error
+        assert {path.name: path.read_bytes() for path in run_dir.iterdir()} == before
+        assert len(judge_models) == {"unresolved": 1, "identity-drift": 2}.get(scenario, 0)
+        if scenario in {"profile-drift", "provider-drift", "legacy", "missing-judge-binding"}:
+            assert probes == []
 
 
 def test_score_run_batch_applies_rubric_scores(tmp_path: Path) -> None:
@@ -658,7 +788,7 @@ def test_cli_mt_score_local_bound_default_judge_fails_cleanly_before_any_mutatio
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.delenv(ENV_VAR, raising=False)
-    run_id = _seed_rubric_run(tmp_path)
+    run_id = _seed_rubric_run(tmp_path, judges=["general-35b"])
     run_dir = tmp_path / "runs" / run_id
     before = {
         name: (run_dir / name).read_bytes()
@@ -691,7 +821,7 @@ def test_cli_mt_score_local_bound_injected_judge_caller_still_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv(ENV_VAR, raising=False)
-    run_id = _seed_rubric_run(tmp_path)
+    run_id = _seed_rubric_run(tmp_path, judges=["general-35b"])
     config_path = tmp_path / "local-judge-config.json"
     config_path.write_text(json.dumps({"judges": ["general-35b"]}), encoding="utf-8")
     caller = _scripted_caller({"general-35b": [_ok("SCORE: 7"), _ok("SCORE: 8"), _ok("SCORE: 9")]})
@@ -719,6 +849,7 @@ def test_rubric_run_scorer_skips_no_response_rows(tmp_path: Path) -> None:
         out_dir=tmp_path,
         roster=["general-35b"],
         local_transport_factory=_fixed_local_factory("   "),  # whitespace -> no-response
+        claude_runner_factory=StubAdapters().claude_factory(),
     )
     run_id = result.run_id
     called = {"n": 0}
@@ -749,6 +880,7 @@ def test_rubric_run_scorer_skips_error_rows(tmp_path: Path) -> None:
         out_dir=tmp_path,
         roster=["general-35b"],
         local_transport_factory=_erroring_local_factory(),
+        claude_runner_factory=StubAdapters().claude_factory(),
     )
     run_id = result.run_id
     run_dir = tmp_path / "runs" / run_id

@@ -69,24 +69,18 @@ CLAUDE_ARGV_TEMPLATE: Final[tuple[str, ...]] = (
 )
 
 # Ambient variables are denied by default. These names are the minimal cross-platform process,
-# locale, TLS/proxy, temporary-directory, user/keychain, and subscription-OAuth inputs the native
-# CLI may need. Customization/provider-selection variables are intentionally absent.
+# locale, temporary-directory, user/keychain, and subscription-OAuth inputs the native CLI may
+# need. Ambient proxy/CA overrides and customization/provider-selection variables are absent.
 CLAUDE_ENV_ALLOWLIST: Final[tuple[str, ...]] = (
-    "ALL_PROXY",
     "APPDATA",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "COMSPEC",
     "HOME",
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
     "LANG",
     "LC_ALL",
     "LOCALAPPDATA",
-    "NO_PROXY",
     "PATH",
     "PATHEXT",
-    "SSL_CERT_DIR",
-    "SSL_CERT_FILE",
     "SYSTEMROOT",
     "TEMP",
     "TMP",
@@ -384,7 +378,11 @@ class ClaudeRuntimeEvidence:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionReceipt:
-    """Additive manifest evidence binding static profile bytes to runtime CLI identity."""
+    """Bind selected providers to a preflighted runtime, without claiming they all executed.
+
+    Rubric runs select both collection models and judges; verdict/exact runs select only their
+    collection roster. Actual provider-returned identities remain response evidence.
+    """
 
     schema_version: int
     profile_id: str

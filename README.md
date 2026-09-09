@@ -232,9 +232,28 @@ Configuration resolves from the first supplied or existing source: `--config`, t
 A supplied but missing or invalid file fails instead of falling back. The resolved source is
 recorded in the run manifest.
 
-Claude tiers use the authenticated `claude` CLI. Other roster names go through the local
-OpenAI-compatible endpoint. The default roster is configurable, not a claim that every model is
-installed. See [config.py](measure_twice/config.py) for the accepted fields.
+Every roster and judge alias requires an explicit provider and requested-model binding in the
+execution profile. Claude bindings use the authenticated `claude` CLI; `local-openai` bindings use
+the local endpoint. Unknown names fail before run creation. The committed
+[execution profile](profiles/model-sweep-execution-v1.json) includes the default aliases and
+`fable`; extend its `execution_profile.models` list to add a model. See
+[config.py](measure_twice/config.py) for the accepted fields.
+
+Claude calls run from empty temporary directories under the frozen prompt-only environment.
+Ambient proxy and CA overrides (including HTTP(S)_PROXY and NODE_EXTRA_CA_CERTS) are excluded;
+this sealed profile does not support configuring custom proxy or CA values through the shell.
+The manifest receipt pins the selected bindings, profile hashes and preflighted CLI path/version.
+
+Rubric collection also preflights and records its selected judges, even for a local-only model
+roster, without calling those judges. `mt score` uses the manifest's judges: `mt run --judges fable`
+continues to use Fable under the default Sonnet score-time configuration. The execution profile
+must still match, and runtime drift or unresolved/changing judge identity aborts before row writes.
+Budget settings may change. Legacy runs and earlier receipts remain readable and deterministically
+rescorable offline, but fresh rubric judging requires the current seal and recorded judge bindings;
+collect a new run when that evidence is absent. Resuming sealed collection also requires the
+stored receipt to match; receipts with the earlier proxy-permitting context hash cannot append
+under this profile. Step 57 adds receipt-aware reports and the qualification wrapper; Step 58
+owns the live qualification run.
 
 </details>
 

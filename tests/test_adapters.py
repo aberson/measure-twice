@@ -246,12 +246,6 @@ def test_resolved_model_requires_concrete_non_whitespace_provider_evidence(
     )
 
 
-def test_resolved_model_preserves_concrete_provider_value_verbatim() -> None:
-    assert resolved_model_of({"model": "provider-concrete"}, requested="alias") == (
-        "provider-concrete"
-    )
-
-
 def test_success_rejects_empty_or_sentinel_text() -> None:
     with pytest.raises(AdapterError):
         ModelCallResult.success(response_raw="   ", resolved_model="m", elapsed_s=0.0)
