@@ -5,21 +5,16 @@ Invokes ``claude -p --model <alias> --output-format json`` and unwraps the JSON 
 ``feedback_subprocess_large_arg_stdin_windows``; a benchmark prompt plus a large item easily
 clears that), so ``argv`` carries only flags and the prompt goes through ``input=``.
 
-Envelope contract (``claude -p --output-format json``; pinned by ``tests/test_adapters.py`` so CLI
-flag drift is caught — plan §9 risk row): a top-level ``result`` string is the assistant text and a
-top-level ``model`` string is the RESOLVED concrete model id (e.g. a requested ``"sonnet"`` alias
-resolves to ``"claude-sonnet-4-..."``) — recorded per row for drift detection. Classification reads
-``is_error``/``subtype`` FIRST (see below); ``result`` and ``model`` are the two text-carrying keys
-the success unwrap needs. A missing/renamed ``result`` -> ``bad_envelope`` (drift surfaces loudly),
-a missing ``model`` -> the row records the shared unresolved-identity sentinel (the requested
-alias is never promoted into provider evidence).
+Envelope contract: SDKResultMessage success carries top-level ``result`` text; both success and
+error results carry ``modelUsage``, a model-name-to-usage-object map. The sole nonblank key is
+provider identity; absent, malformed, or multiple identities remain explicitly unresolved.
+https://code.claude.com/docs/en/agent-sdk/typescript#sdkresultmessage
 
-The ``is_error`` guard (production ``subprocess_runner._parse_envelope``,
-``void_furnace/src/void_furnace/subprocess_runner.py``): an ``is_error: true`` envelope's
-``result`` field carries an ERROR MESSAGE, not model text, and can co-occur with **exit code 0** —
-so ``is_error`` is checked BEFORE ``result`` is ever trusted, else a CLI error message would be
-scored as a real model answer (silent ledger corruption). ``subtype`` names the failure kind: a
-max-turns / length cutoff (e.g. ``"error_max_turns"``) is a truncated partial answer.
+Identity extraction precedes outcome classification so observed evidence survives errors,
+truncation, malformed text, and no-response. Nonzero exit and ``is_error`` are checked BEFORE
+trusting ``result`` as an answer. Error subtypes normally carry ``errors`` instead of ``result``;
+even if an error includes a result string, it must never be scored as a model answer.
+A max-turns / length cutoff (e.g. ``"error_max_turns"``) is classified as truncation.
 
 Failure -> switchboard reason_class (imported via :mod:`base`, plan §8 D6):
   * ``claude`` not on PATH (``FileNotFoundError``)      -> ``unreachable`` (the tier is unreachable)
@@ -81,7 +76,6 @@ from measure_twice.adapters.base import (
     UNRESOLVED_MODEL_ID,
     AdapterError,
     ModelCallResult,
-    resolved_model_of,
 )
 from measure_twice.config import RunConfig
 from measure_twice.model_sweep_execution import (
@@ -453,6 +447,22 @@ def _is_truncation_subtype(subtype: object) -> bool:
     return any(marker in low for marker in _TRUNCATION_SUBTYPE_MARKERS)
 
 
+def _resolved_claude_model(payload: dict[str, object]) -> str:
+    """Retain the sole observed modelUsage key; ambiguous or malformed evidence is unresolved.
+
+    SDKResultMessage carries a model-name-to-usage-object map, including on errors:
+    https://code.claude.com/docs/en/agent-sdk/typescript#sdkresultmessage
+    Usage metadata is opaque here: it cannot pick an identity or invalidate an observed key.
+    """
+    usage = payload.get("modelUsage")
+    if payload.get("type") != "result" or not isinstance(usage, dict) or len(usage) != 1:
+        return UNRESOLVED_MODEL_ID
+    model, metadata = next(iter(usage.items()))
+    if not isinstance(model, str) or not model.strip() or not isinstance(metadata, dict):
+        return UNRESOLVED_MODEL_ID
+    return model
+
+
 def claude_call(
     prompt: str,
     *,
@@ -505,7 +515,7 @@ def claude_call(
     # The ENTIRE post-budget body is wrapped, so the documented "never raises except
     # BudgetExhaustedError — returns a structured ERROR result" contract holds for the WHOLE
     # function, not just the subprocess spawn: json.loads, the is_error/subtype dispatch,
-    # resolved_model_of, and ModelCallResult.success() (which itself raises AdapterError on
+    # _resolved_claude_model, and ModelCallResult.success() (which itself raises AdapterError on
     # sentinel/empty text) are all inside. A fault ANYWHERE here would otherwise propagate out of
     # claude_call_batch and discard a pool wave's already-succeeded, budget-CONSUMED sibling
     # results (silent data loss — the runner appends a wave's rows only after the batch returns).
@@ -543,7 +553,7 @@ def claude_call(
                 )
             return ModelCallResult.error(reason_class=RC_BAD_ENVELOPE, elapsed_s=elapsed)
         envelope = cast("dict[str, object]", doc)
-        resolved = resolved_model_of(envelope, requested=binding.requested_model)
+        resolved = _resolved_claude_model(envelope)
 
         if result.returncode != 0:
             # Parse only enough of a failed process's JSON object to retain observed provider
@@ -598,8 +608,8 @@ def claude_call(
         )
     except Exception:
         # Any OTHER unclassified failure anywhere in the post-budget body (a non-OSError transport
-        # error, a runner_factory bug, a post-processing fault in resolved_model_of / success()) ->
-        # a structured os_error result, never a raised exception (see the block comment above).
+        # error, a runner_factory bug, or a post-processing fault) -> a structured os_error result,
+        # never a raised exception (see the block comment above).
         return ModelCallResult.error(
             reason_class=RC_OS_ERROR,
             resolved_model=resolved,

@@ -39,13 +39,43 @@ def _openai_body(content: str, *, model: str = "local-x", finish_reason: str = "
 
 
 def _claude_stdout(result_text: str, *, model: str = "claude-x") -> str:
+    """SDKResultMessage success; identity is the ModelUsage map key.
+
+    https://code.claude.com/docs/en/agent-sdk/typescript#sdkresultmessage
+    https://code.claude.com/docs/en/agent-sdk/typescript#modelusage
+    """
     return json.dumps(
         {
             "type": "result",
             "subtype": "success",
             "is_error": False,
             "result": result_text,
-            "model": model,
+            "uuid": "00000000-0000-4000-8000-000000000001",
+            "session_id": "00000000-0000-4000-8000-000000000002",
+            "duration_ms": 4200,
+            "duration_api_ms": 3800,
+            "num_turns": 1,
+            "stop_reason": "end_turn",
+            "total_cost_usd": 0.0123,
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 40,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+            "modelUsage": {
+                model: {
+                    "inputTokens": 120,
+                    "outputTokens": 40,
+                    "cacheCreationInputTokens": 0,
+                    "cacheReadInputTokens": 0,
+                    "webSearchRequests": 0,
+                    "costUSD": 0.0123,
+                    "contextWindow": 200000,
+                    "maxOutputTokens": 8192,
+                }
+            },
+            "permission_denials": [],
         }
     )
 

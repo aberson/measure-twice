@@ -28,7 +28,12 @@ from dataclasses import asdict
 from pathlib import Path
 
 import pytest
-from conftest import StubAdapters, _iid  # shared offline stub scaffolding (tests/conftest.py)
+from conftest import (
+    StubAdapters,
+    _claude_stdout,
+    _iid,
+    _openai_body,
+)  # shared offline stub scaffolding (tests/conftest.py)
 
 from measure_twice.adapters import claude_cli
 from measure_twice.adapters.base import RC_OS_ERROR, RC_UNREACHABLE
@@ -40,6 +45,7 @@ from measure_twice.model_sweep_execution import (
     CLAUDE_ENV_ALLOWLIST,
     DEFAULT_EXECUTION_PROFILE,
     PROVIDER_CLAUDE,
+    PROVIDER_LOCAL,
     ExecutionReceipt,
     ModelSweepExecutionProfile,
 )
@@ -156,13 +162,7 @@ def _write_fake_claude(root: Path) -> tuple[Path, Path]:
         if arguments == ["--help"]:
             print(" ".join({list(CLAUDE_ARGV_TEMPLATE)!r}))
             raise SystemExit(0)
-        print(json.dumps({{
-            "type": "result",
-            "subtype": "success",
-            "is_error": False,
-            "result": "pass",
-            "model": "fake-concrete-sonnet",
-        }}))
+        print({_claude_stdout("pass", model="fake-concrete-sonnet")!r})
         """
     ).lstrip()
 
@@ -190,7 +190,7 @@ def _sealed_test_config() -> dict[str, object]:
         {
             "alias": "public-sonnet",
             "provider": PROVIDER_CLAUDE,
-            "requested_model": "sonnet",
+            "requested_model": "claude-sonnet-4-5-20250929",
         }
     )
     return {
@@ -202,6 +202,48 @@ def _sealed_test_config() -> dict[str, object]:
 
 
 # --- Full sweep --------------------------------------------------------------------------
+
+
+def test_local_dispatch_preserves_distinct_public_requested_and_observed_models(
+    tmp_path: Path,
+) -> None:
+    profile = DEFAULT_EXECUTION_PROFILE.to_mapping()
+    profile["models"].append(
+        {
+            "alias": "public-local",
+            "provider": PROVIDER_LOCAL,
+            "requested_model": "registry.example/org/model:tag",
+        }
+    )
+    config = RunConfig(execution_profile=ModelSweepExecutionProfile.from_mapping(profile))
+    requests: list[dict[str, object]] = []
+
+    def transport(url: str, data: bytes, timeout: float) -> str:
+        requests.append(json.loads(data))
+        return _openai_body("pass", model="served-model-Q4_K_M")
+
+    result = run(
+        suite=_suite(["a"]),
+        config=config,
+        out_dir=tmp_path,
+        roster=["public-local"],
+        local_transport_factory=lambda: transport,
+    )
+    assert [request["model"] for request in requests] == ["registry.example/org/model:tag"]
+    run_dir = tmp_path / "runs" / result.run_id
+    (row,) = _read_jsonl(run_dir / "rows.jsonl")
+    assert row["model"] == "public-local"
+    assert row["model_id_resolved"] == "served-model-Q4_K_M"
+    receipt = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))[
+        "execution_receipt"
+    ]
+    assert receipt["bindings"] == [
+        {
+            "alias": "public-local",
+            "provider": PROVIDER_LOCAL,
+            "requested_model": "registry.example/org/model:tag",
+        }
+    ]
 
 
 def test_full_sweep_writes_manifest_and_all_rows(tmp_path: Path) -> None:
@@ -341,7 +383,8 @@ def test_error_row_records_reason_class(tmp_path: Path) -> None:
 # --- Resume: exactly the incomplete cells ------------------------------------------------
 
 
-def test_resume_skips_exactly_completed_cells(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy", [False, True])
+def test_resume_skips_exactly_completed_cells(tmp_path: Path, legacy: bool) -> None:
     suite = _suite(["a", "b", "c", "d"])
     cfg = RunConfig()
     stub1 = StubAdapters()
@@ -358,6 +401,12 @@ def test_resume_skips_exactly_completed_cells(tmp_path: Path) -> None:
     assert [_iid(p) for p in stub1.local_calls] == ["a", "b"]
     completed = {r["item_id"] for r in _read_jsonl(tmp_path / "runs" / r1.run_id / "rows.jsonl")}
     assert completed == {"a", "b"}
+    manifest_path = tmp_path / "runs" / r1.run_id / "manifest.json"
+    if legacy:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        del manifest["execution_receipt"]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    manifest_before = manifest_path.read_bytes()
 
     stub2 = StubAdapters()
     r2 = run(
@@ -376,6 +425,7 @@ def test_resume_skips_exactly_completed_cells(tmp_path: Path) -> None:
     final = {r["item_id"] for r in _read_jsonl(tmp_path / "runs" / r1.run_id / "rows.jsonl")}
     assert final == {"a", "b", "c", "d"}
     assert r2.cells_completed == 4
+    assert manifest_path.read_bytes() == manifest_before
 
 
 def test_resume_suite_hash_mismatch_fails_loud(tmp_path: Path) -> None:
@@ -442,8 +492,23 @@ def test_torn_trailing_line_tolerated_on_resume(tmp_path: Path) -> None:
     assert [_iid(p) for p in stub2.local_calls] == ["c", "d"]
 
 
-def test_pending_legacy_claude_resume_rejects_before_torn_tail_mutation(
+@pytest.mark.parametrize(
+    ("alias", "provider", "requested_model"),
+    [
+        ("haiku", PROVIDER_CLAUDE, "haiku"),
+        ("haiku", PROVIDER_LOCAL, "haiku"),
+        ("sonnet", PROVIDER_LOCAL, "sonnet"),
+        ("opus", PROVIDER_LOCAL, "opus"),
+        ("fable", PROVIDER_LOCAL, "fable"),
+        ("general-35b", PROVIDER_LOCAL, "different-local-model"),
+        ("general-35b", PROVIDER_CLAUDE, "sonnet"),
+    ],
+)
+def test_pending_legacy_resume_rejects_rebinding_before_any_mutation(
     tmp_path: Path,
+    alias: str,
+    provider: str,
+    requested_model: str,
 ) -> None:
     suite = _suite(["a", "b"])
     first_stub = StubAdapters()
@@ -451,9 +516,10 @@ def test_pending_legacy_claude_resume_rejects_before_torn_tail_mutation(
         suite=suite,
         config=RunConfig(claude_pool=2),
         out_dir=tmp_path,
-        roster=["haiku"],
+        roster=[alias],
         max_calls=1,
         claude_runner_factory=first_stub.claude_factory(),
+        local_transport_factory=first_stub.local_factory(),
     )
     assert first.aborted
     run_dir = tmp_path / "runs" / first.run_id
@@ -466,29 +532,47 @@ def test_pending_legacy_claude_resume_rejects_before_torn_tail_mutation(
     rows_path = run_dir / "rows.jsonl"
     with rows_path.open("a", encoding="utf-8") as handle:
         handle.write('{"run_id":"torn legacy claude tail"')
-    before = rows_path.read_bytes()
-    resume_stub = StubAdapters()
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    profile = DEFAULT_EXECUTION_PROFILE.to_mapping()
+    for binding in profile["models"]:
+        if binding["alias"] == alias:
+            binding["provider"] = provider
+            binding["requested_model"] = requested_model
+    config = RunConfig(execution_profile=ModelSweepExecutionProfile.from_mapping(profile))
+    calls: list[str] = []
 
-    with pytest.raises(RunError, match=r"legacy-unsealed.*pending Claude"):
+    def forbidden_factory():
+        calls.append("factory")
+        raise AssertionError("Legacy validation must precede doctor and provider calls")
+
+    with pytest.raises(RunError, match=r"legacy-unsealed"):
         run(
             suite=suite,
-            config=RunConfig(claude_pool=2),
+            config=config,
             out_dir=tmp_path,
             resume=first.run_id,
             max_calls=10,
-            claude_runner_factory=resume_stub.claude_factory(),
+            claude_runner_factory=forbidden_factory,
+            local_transport_factory=forbidden_factory,
         )
 
-    assert rows_path.read_bytes() == before
-    assert not (run_dir / "rows.jsonl.tmp").exists()
-    assert resume_stub.claude_calls == []
+    assert {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    } == before
+    assert calls == []
 
     # Fresh Claude execution is forbidden, but deterministic scoring of the stored bytes works.
     score_rc = main(["score", first.run_id, "--out", str(tmp_path)])
     assert score_rc == 0
     rescored = _read_jsonl(rows_path)
     assert len(rescored) == 1
-    assert rescored[0]["response_raw"] == "cl-answer"
+    assert rescored[0]["response_raw"] == ("loc-answer" if alias == "general-35b" else "cl-answer")
     assert rescored[0]["scorer"] == "verdict"
     assert "execution_receipt" not in json.loads(manifest_path.read_text(encoding="utf-8"))
 
@@ -946,7 +1030,7 @@ def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
     receipt = ExecutionReceipt.from_mapping(manifest["execution_receipt"])
     assert [
         (binding.alias, binding.provider, binding.requested_model) for binding in receipt.bindings
-    ] == [("public-sonnet", PROVIDER_CLAUDE, "sonnet")]
+    ] == [("public-sonnet", PROVIDER_CLAUDE, "claude-sonnet-4-5-20250929")]
     assert receipt.claude_cli is not None
     assert receipt.claude_cli.executable == str(launcher)
     assert receipt.claude_cli.version == "fake-claude 9.8.7"
@@ -987,7 +1071,7 @@ def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
     expected_tail = [
         "-p",
         "--model",
-        "sonnet",
+        "claude-sonnet-4-5-20250929",
         "--output-format",
         "json",
         "--safe-mode",
@@ -1224,7 +1308,7 @@ def test_claude_worker_exception_persists_sibling_success(tmp_path: Path) -> Non
 
 
 # BLOCK A (iter 3) — a fault in the POST-PROCESSING tail of claude_call (past the subprocess:
-# resolved_model_of / success()) must also become a structured error row, not propagate and discard
+# identity extraction / success()) must become a structured error row, not propagate and discard
 # a sibling's budget-consumed success. Discriminates the whole-function try from the spawn-only try.
 
 
@@ -1233,17 +1317,17 @@ def test_claude_post_processing_fault_persists_sibling_success(
 ) -> None:
     suite = _suite(["a", "b"])
     cfg = RunConfig(claude_pool=2)  # both cells in one concurrent wave
-    # Echo the item id into the envelope's `result` field so the patched resolved_model_of can fault
+    # Echo the item id into `result` so the patched identity extractor can fault
     # exactly one worker in the POST-subprocess tail (proving the try wraps the whole body).
     stub = StubAdapters(claude=lambda prompt: _iid(prompt))
-    real_resolve = claude_cli.resolved_model_of
+    real_resolve = claude_cli._resolved_claude_model
 
-    def faulty_resolve(envelope: dict[str, object], requested: str) -> str:
+    def faulty_resolve(envelope: dict[str, object]) -> str:
         if envelope.get("result") == "b":
             raise RuntimeError("post-processing boom (past the subprocess)")
-        return real_resolve(envelope, requested)
+        return real_resolve(envelope)
 
-    monkeypatch.setattr(claude_cli, "resolved_model_of", faulty_resolve)
+    monkeypatch.setattr(claude_cli, "_resolved_claude_model", faulty_resolve)
     result = run(
         suite=suite,
         config=cfg,

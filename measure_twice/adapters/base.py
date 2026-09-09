@@ -206,15 +206,11 @@ class ModelCallResult:
 
 
 def resolved_model_of(payload: dict[str, object], requested: str) -> str:
-    """The concrete model id a call resolved to, from a top-level ``model`` field (drift detection).
+    """Read an OpenAI-compatible response's top-level served ``model`` identity.
 
-    ONE source of truth for both adapters (they share the same shape here): OpenAI-compatible chat
-    responses echo the served model at top-level ``model`` (llama-swap reports the actually-loaded
-    GGUF there, so a swap away from the requested alias is visible), and the claude
-    ``--output-format json`` envelope reports the resolved concrete model at top-level ``model``
-    too. ``requested`` is retained in the signature for caller compatibility and to make the
-    evidence boundary explicit, but it is never returned: absent provider evidence is recorded as
-    :data:`UNRESOLVED_MODEL_ID`.
+    ``requested`` remains for caller compatibility but is never substituted for absent evidence.
+    Claude's different wire format is parsed by its own adapter; both use
+    :data:`UNRESOLVED_MODEL_ID` when no concrete provider identity was observed.
     """
     del requested
     model = payload.get("model")

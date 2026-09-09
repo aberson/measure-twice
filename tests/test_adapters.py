@@ -25,6 +25,7 @@ import urllib.error
 from pathlib import Path
 
 import pytest
+from conftest import _claude_stdout
 
 from measure_twice.adapters import claude_cli
 from measure_twice.adapters.base import (
@@ -116,32 +117,16 @@ def _claude_envelope(
     subtype: str = "success",
     is_error: bool | None = None,
 ) -> str:
-    """A realistic ``claude -p --output-format json`` envelope (guide-confirmed key set).
-
-    ``is_error`` defaults to ``subtype != "success"`` (the real CLI coupling) but can be forced
-    independently to exercise the ``is_error`` guard against a specific ``subtype``.
-    """
-    err = (subtype != "success") if is_error is None else is_error
-    return json.dumps(
-        {
-            "type": "result",
-            "subtype": subtype,
-            "is_error": err,
-            "duration_ms": 4200,
-            "duration_api_ms": 3800,
-            "num_turns": 1,
-            "result": result_text,
-            "session_id": "sess-abc-123",
-            "total_cost_usd": 0.0123,
-            "model": model,
-            "modelUsage": {
-                "input_tokens": 120,
-                "output_tokens": 40,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-            },
-        }
-    )
+    """Build the documented result shape; allow deliberate malformed text/error overrides."""
+    envelope = json.loads(_claude_stdout("", model=model))
+    envelope["subtype"] = subtype
+    envelope["is_error"] = (subtype != "success") if is_error is None else is_error
+    if subtype != "success":
+        del envelope["result"]
+        envelope["errors"] = [result_text]
+    else:
+        envelope["result"] = result_text
+    return json.dumps(envelope)
 
 
 def _doctor_probe_result(invocation: ClaudeInvocation) -> SubprocessResult | None:
@@ -759,7 +744,7 @@ def test_claude_nonzero_exit_json_preserves_observed_provider_identity() -> None
     factory = _static_runner(
         SubprocessResult(
             2,
-            json.dumps({"type": "result", "is_error": True, "model": "claude-concrete"}),
+            _claude_envelope("failure", model="claude-concrete", subtype="error_during_execution"),
             "must-not-be-propagated",
         )
     )
@@ -816,7 +801,9 @@ def test_claude_non_json_stdout() -> None:
 
 
 def test_claude_bad_envelope_missing_result_key() -> None:
-    factory = _static_runner(SubprocessResult(0, json.dumps({"type": "result", "model": "m"}), ""))
+    payload = json.loads(_claude_stdout("answer", model="m"))
+    del payload["result"]
+    factory = _static_runner(SubprocessResult(0, json.dumps(payload), ""))
     res = claude_call(
         "q", alias="haiku", config=RunConfig(), budget=CallBudget(5), runner_factory=factory
     )
@@ -873,16 +860,15 @@ def test_claude_null_result_non_error_preserves_resolved_model_on_bad_envelope()
     assert res.resolved_model == "claude-sonnet-4-5-20260101"
 
 
-def test_claude_is_error_with_message_is_os_error() -> None:
-    """BLOCK 2: an is_error envelope's `result` is an ERROR MESSAGE (co-occurring with exit 0);
-    it must classify as an error, NEVER be scored as a real model answer (silent ledger corruption).
-    """
+@pytest.mark.parametrize("subtype", ["success", "error_during_execution"])
+def test_claude_is_error_with_message_is_os_error(subtype: str) -> None:
+    """is_error dominates both a success-arm result string and error-arm errors, even at exit 0."""
     factory = _static_runner(
         SubprocessResult(
             0,  # exit code 0 despite is_error: true — the exact production footgun
             _claude_envelope(
                 "Error: the Bash tool requires permission that was denied",
-                subtype="error_during_execution",
+                subtype=subtype,
                 is_error=True,
             ),
             "",
@@ -936,21 +922,12 @@ def test_claude_whitespace_result_is_no_response() -> None:
 # --- Claude adapter: envelope CONTRACT test (pins the JSON shape; plan §9 drift risk) -----
 
 
-def test_claude_envelope_contract_pins_json_shape() -> None:
-    """Pin the exact ``--output-format json`` shape the unwrap depends on: ``result`` (text) and
-    ``model`` (resolved id). If a CLI update renames the text key, DRIFT GUARD 1 fails loudly."""
-    envelope = {
-        "type": "result",
-        "subtype": "success",
-        "is_error": False,
-        "duration_ms": 4200,
-        "num_turns": 1,
-        "result": "the assistant answer",
-        "session_id": "sess-1",
-        "total_cost_usd": 0.01,
-        "model": "claude-opus-4-8-20260101",
-        "modelUsage": {"input_tokens": 5, "output_tokens": 3},
-    }
+@pytest.mark.parametrize("usage_metadata", [None, {"future_metadata": "opaque"}])
+def test_claude_envelope_contract_pins_json_shape(usage_metadata: object) -> None:
+    """Exercise the documented result text and modelUsage through the actual adapter."""
+    envelope = json.loads(_claude_stdout("the assistant answer", model="claude-opus-4-8-20260101"))
+    if usage_metadata is not None:
+        envelope["modelUsage"]["claude-opus-4-8-20260101"] = usage_metadata
     res = claude_call(
         "q",
         alias="opus",
@@ -960,7 +937,7 @@ def test_claude_envelope_contract_pins_json_shape() -> None:
     )
     assert res.ok
     assert res.response_raw == "the assistant answer"  # from top-level `result`
-    assert res.resolved_model == "claude-opus-4-8-20260101"  # from top-level `model`
+    assert res.resolved_model == "claude-opus-4-8-20260101"  # from the sole modelUsage key
 
     # DRIFT GUARD 1: a renamed/removed `result` key surfaces as bad_envelope, not a silent pass.
     broken = {k: v for k, v in envelope.items() if k != "result"}
@@ -972,9 +949,10 @@ def test_claude_envelope_contract_pins_json_shape() -> None:
         runner_factory=_static_runner(SubprocessResult(0, json.dumps(broken), "")),
     )
     assert res2.reason_class == RC_BAD_ENVELOPE
+    assert res2.resolved_model == "claude-opus-4-8-20260101"
 
-    # DRIFT GUARD 2: a missing `model` is unresolved evidence, never the requested alias.
-    no_model = {k: v for k, v in envelope.items() if k != "model"}
+    # DRIFT GUARD 2: missing `modelUsage` is unresolved evidence, never the requested alias.
+    no_model = {k: v for k, v in envelope.items() if k != "modelUsage"}
     res3 = claude_call(
         "q",
         alias="opus",
@@ -984,6 +962,50 @@ def test_claude_envelope_contract_pins_json_shape() -> None:
     )
     assert res3.ok
     assert res3.resolved_model == UNRESOLVED_MODEL_ID
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        None,
+        [],
+        "model",
+        {},
+        {"": {}},
+        {" \t": {}},
+        {"claude-observed": None},
+        {"claude-observed": []},
+        {"claude-observed": "usage"},
+        {"claude-observed": {}, "sonnet": {"inputTokens": 999999}},
+    ],
+)
+def test_claude_invalid_or_ambiguous_model_usage_is_unresolved(evidence: object) -> None:
+    envelope = json.loads(_claude_stdout("answer"))
+    envelope["modelUsage"] = evidence
+    # An unsupported top-level field must never rescue invalid or ambiguous provider evidence.
+    envelope["model"] = "invented-top-level-model"
+    result = claude_call(
+        "q",
+        alias="sonnet",
+        config=RunConfig(),
+        budget=CallBudget(1),
+        runner_factory=_static_runner(SubprocessResult(0, json.dumps(envelope), "")),
+    )
+    assert result.ok
+    assert result.resolved_model == UNRESOLVED_MODEL_ID
+
+
+def test_claude_non_result_object_does_not_supply_identity() -> None:
+    envelope = json.loads(_claude_stdout("answer", model="observed"))
+    envelope["type"] = "system"
+    result = claude_call(
+        "q",
+        alias="sonnet",
+        config=RunConfig(),
+        budget=CallBudget(1),
+        runner_factory=_static_runner(SubprocessResult(0, json.dumps(envelope), "")),
+    )
+    assert result.resolved_model == UNRESOLVED_MODEL_ID
 
 
 # --- Claude adapter: bounded pool ---------------------------------------------------------

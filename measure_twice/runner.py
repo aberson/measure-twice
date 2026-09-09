@@ -69,7 +69,6 @@ from measure_twice.adapters.claude_cli import (
 from measure_twice.adapters.local import TransportFactory, local_chat
 from measure_twice.config import ConfigError, RunConfig, _validate_name_list
 from measure_twice.model_sweep_execution import (
-    DEFAULT_EXECUTION_PROFILE,
     PROVIDER_CLAUDE,
     PROVIDER_LOCAL,
     ExecutionProfileError,
@@ -96,14 +95,10 @@ __all__ = [
     "score_run_batch",
 ]
 
-# Compatibility export for callers/tests that enumerate the historical Claude alias set. It is
-# derived from the validated default profile and is deliberately NOT consulted by dispatch; only
-# each selected binding's explicit ``provider`` field authorizes an adapter.
-CLAUDE_ALIASES: Final[frozenset[str]] = frozenset(
-    binding.alias
-    for binding in DEFAULT_EXECUTION_PROFILE.models
-    if binding.provider == PROVIDER_CLAUDE
-)
+# Frozen pre-receipt routing contract: these aliases used Claude, all others used local with
+# requested model equal to alias. Only legacy resume consults this history; fresh dispatch uses
+# explicit profile bindings. Never derive historical provenance from a configurable profile.
+CLAUDE_ALIASES: Final[frozenset[str]] = frozenset({"haiku", "sonnet", "opus", "fable"})
 
 # The reserved scorer name a no-response cell carries. It is set ONLY by the runner's force-0 branch
 # (never by an injected scorer), so ``mt score`` re-identifies a force-0 row by this name and leaves
@@ -711,6 +706,28 @@ def _has_pending_claude(
     )
 
 
+def _validate_legacy_resume(
+    bindings: Sequence[ModelBinding],
+    suite: Suite,
+    samples: int,
+    done_keys: set[tuple[str, str, int]],
+) -> None:
+    """Prove pending cells retain their historical provider/requested-model contract."""
+    for binding in bindings:
+        if not _pending_cells(binding, suite, samples, done_keys):
+            continue
+        if binding.alias in CLAUDE_ALIASES:
+            raise RunError(
+                "cannot resume legacy-unsealed run: pending Claude cells would mix unsealed "
+                "and sealed execution contracts"
+            )
+        if binding.provider != PROVIDER_LOCAL or binding.requested_model != binding.alias:
+            raise RunError(
+                "cannot resume legacy-unsealed run: pending local cells require their historical "
+                f"provider and requested model for alias {binding.alias!r}"
+            )
+
+
 def _pending_cells(
     binding: ModelBinding,
     suite: Suite,
@@ -792,12 +809,9 @@ def run(
         done_keys = {row.cell_key for row in existing_rows}
         stored_receipt = _read_execution_receipt(manifest)
         pending_claude = _has_pending_claude(bindings, suite, eff_samples, done_keys)
-        if stored_receipt is None and pending_claude:
-            raise RunError(
-                "cannot resume legacy-unsealed run: pending Claude cells would mix unsealed "
-                "and sealed execution contracts"
-            )
-        if stored_receipt is not None:
+        if stored_receipt is None:
+            _validate_legacy_resume(bindings, suite, eff_samples, done_keys)
+        else:
             _validate_receipt_profile(stored_receipt, config, selected_bindings)
             if pending_claude:
                 current_receipt, claude_runtime = _doctor_execution(

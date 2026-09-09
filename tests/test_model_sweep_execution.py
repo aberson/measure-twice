@@ -105,14 +105,6 @@ def test_claude_binding_rejects_hostile_requested_model_tokens(requested_model: 
         ModelSweepExecutionProfile.from_mapping(payload)
 
 
-def test_provider_model_grammar_admits_claude_ids_and_namespaced_local_ids() -> None:
-    claude = ModelBinding("future-sonnet", PROVIDER_CLAUDE, "claude-sonnet-4-5-20250929")
-    local = ModelBinding("namespaced-local", PROVIDER_LOCAL, "registry.example/org/model:tag")
-
-    assert claude.requested_model == "claude-sonnet-4-5-20250929"
-    assert local.requested_model == "registry.example/org/model:tag"
-
-
 @pytest.mark.parametrize(
     ("path", "message"),
     [

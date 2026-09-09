@@ -252,7 +252,10 @@ Budget settings may change. Legacy runs and earlier receipts remain readable and
 rescorable offline, but fresh rubric judging requires the current seal and recorded judge bindings;
 collect a new run when that evidence is absent. Resuming sealed collection also requires the
 stored receipt to match; receipts with the earlier proxy-permitting context hash cannot append
-under this profile. Step 57 adds receipt-aware reports and the qualification wrapper; Step 58
+under this profile. Receipt-less resume rejects pending historical Claude aliases
+(`haiku`, `sonnet`, `opus`, `fable`) even if rebound locally. Other pending legacy aliases must
+retain local routing with the requested model equal to the public alias.
+Step 57 adds receipt-aware reports and the qualification wrapper; Step 58
 owns the live qualification run.
 
 </details>

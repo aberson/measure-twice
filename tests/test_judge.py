@@ -136,15 +136,7 @@ def test_default_judge_caller_reuses_one_doctored_runtime() -> None:
             return SubprocessResult(0, " ".join(CLAUDE_ARGV_TEMPLATE), "")
         return SubprocessResult(
             0,
-            json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "success",
-                    "is_error": False,
-                    "result": "SCORE: 8",
-                    "model": "claude-sonnet-concrete",
-                }
-            ),
+            _claude_stdout("SCORE: 8", model="claude-sonnet-concrete"),
             "",
         )
 
@@ -582,6 +574,8 @@ def _seed_rubric_run(tmp_path: Path, *, judges: list[str] | None = None) -> str:
     [
         "recorded-selection",
         "unresolved",
+        "ambiguous",
+        "malformed",
         "identity-drift",
         "profile-drift",
         "provider-drift",
@@ -653,7 +647,11 @@ def test_cli_rubric_contract_from_collection_through_judge_process(
             identity = "different-concrete-fable"
         payload = json.loads(_claude_stdout("SCORE: 9", model=identity))
         if scenario == "unresolved":
-            del payload["model"]
+            del payload["modelUsage"]
+        elif scenario == "ambiguous":
+            payload["modelUsage"]["fable"] = {"inputTokens": 999999}
+        elif scenario == "malformed":
+            payload["modelUsage"][identity] = None
         return SubprocessResult(0, json.dumps(payload), "")
 
     args = ["score", run_dir.name, "--out", str(tmp_path)]
@@ -685,6 +683,8 @@ def test_cli_rubric_contract_from_collection_through_judge_process(
         error = capsys.readouterr().err
         expected = {
             "unresolved": "unresolved",
+            "ambiguous": "unresolved",
+            "malformed": "unresolved",
             "identity-drift": "identity changed",
             "profile-drift": "stored receipt",
             "provider-drift": "stored receipt",
@@ -694,7 +694,12 @@ def test_cli_rubric_contract_from_collection_through_judge_process(
         }
         assert expected[scenario] in error
         assert {path.name: path.read_bytes() for path in run_dir.iterdir()} == before
-        assert len(judge_models) == {"unresolved": 1, "identity-drift": 2}.get(scenario, 0)
+        assert len(judge_models) == {
+            "unresolved": 1,
+            "ambiguous": 1,
+            "malformed": 1,
+            "identity-drift": 2,
+        }.get(scenario, 0)
         if scenario in {"profile-drift", "provider-drift", "legacy", "missing-judge-binding"}:
             assert probes == []
 
