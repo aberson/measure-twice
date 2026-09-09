@@ -47,3 +47,13 @@ operator output is data only; no conditional step; code review uses deep lenses 
 app-server prerequisite; external credential provisioning remains a live-verification gate.
 
 Auto-applied 5 fixes. Plan is ready for plan-redline, plan-wrap, and repo-sync.
+
+## API contract recheck (2026-09-09)
+
+Re-ran the applicable contract, compatibility, scope and step checks after a primary-source
+recheck. Fixed D2 and the request example to omit unsupported candidateCount, per the
+[current Gemini migration guide](https://ai.google.dev/gemini-api/docs/generate-content/latest-model).
+Clarified that unrelated additive response metadata is ignored while invalid consumed fields
+and unsupported text-contract outcomes fail closed. Recorded the user's explicit approval of
+native isolated reviewers; separate live-call permission remains pending. No new scope or
+unresolved code decision. Step 57 producer validation remains required before implementation.
