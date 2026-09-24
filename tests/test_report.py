@@ -31,6 +31,7 @@ from measure_twice.adapters.base import UNRESOLVED_MODEL_ID, ModelCallResult
 from measure_twice.adapters.claude_cli import SubprocessResult
 from measure_twice.cli import CliDeps, _local_endpoint_unreachable, main
 from measure_twice.config import ENV_VAR, RunConfig
+from measure_twice.model_sweep_execution import canonical_sha256
 from measure_twice.report import (
     LEGACY_UNSEALED,
     NOT_ROUTING_ELIGIBLE,
@@ -498,6 +499,26 @@ def test_report_surfaces_execution_receipt_and_identity(tmp_path: Path) -> None:
         "Execution receipt",
     ):
         assert token in md
+
+
+def test_markdown_escapes_malicious_claude_runtime_metadata(tmp_path: Path) -> None:
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
+    manifest_path = tmp_path / "runs" / result.run_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    receipt = manifest["execution_receipt"]
+    receipt["claude_cli"]["executable"] = "claude`<img src=x onerror=alert(1)>"
+    receipt["claude_cli"]["version"] = "v`<script>alert(1)</script>"
+    receipt["receipt_sha256"] = canonical_sha256(
+        {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    markdown = render_run_report(build_run_report(result.run_id, tmp_path))
+    cli_line = next(line for line in markdown.splitlines() if line.startswith("- **Claude CLI:**"))
+    assert "<img" not in cli_line and "<script>" not in cli_line
+    assert "&lt;img src=x onerror=alert(1)&gt;" in cli_line
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in cli_line
+    assert "``claude`" in cli_line and "`` (version ``v`" in cli_line
 
 
 def test_report_legacy_run_marked_unsealed_without_changing_scores(tmp_path: Path) -> None:

@@ -32,6 +32,7 @@ path-traversal-guarded exactly as ``mt score`` is. Every run-store fault the run
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from html import escape as html_escape
@@ -463,6 +464,16 @@ def _md_cell(value: str) -> str:
     )
 
 
+def _md_code(value: str) -> str:
+    """Render untrusted receipt text as one escaped inline code span."""
+    safe = html_escape(value, quote=True).replace("\r", " ").replace("\n", " ")
+    longest = max((len(run) for run in re.findall(r"`+", safe)), default=0)
+    fence = "`" * (longest + 1)
+    if safe.startswith("`") or safe.endswith("`"):
+        safe = f" {safe} "
+    return f"{fence}{safe}{fence}"
+
+
 def _execution_lines(report: RunReport) -> list[str]:
     """The execution-receipt + per-alias identity section (plan §6.3/§6.4); scores untouched."""
     lines = ["## Execution receipt & identity", ""]
@@ -478,7 +489,8 @@ def _execution_lines(report: RunReport) -> list[str]:
         cli = (
             "(no Claude bindings)"
             if evidence.claude_executable is None
-            else f"`{evidence.claude_executable}` (version `{evidence.claude_version}`)"
+            else f"{_md_code(evidence.claude_executable)} "
+            f"(version {_md_code(evidence.claude_version or '')})"
         )
         lines += [
             f"- **Seal:** `{evidence.sealing_mode}` — profile `{evidence.profile_id}`",

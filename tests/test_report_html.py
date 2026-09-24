@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
+from html import unescape as html_unescape
 from pathlib import Path
 
 import pytest
@@ -530,3 +533,78 @@ def test_html_mixed_identity_set_is_visible_and_negative(tmp_path: Path) -> None
     assert arm["eligibility"] == NOT_ROUTING_ELIGIBLE
     assert "<th>Resolved identity</th><th>Stored identity</th>" in html
     assert "esc(resolved)" in html
+
+
+def test_browser_renders_receipt_and_identity_for_all_seal_states(tmp_path: Path) -> None:
+    """Exercise the page script and inspect populated DOM, rather than its JSON island."""
+    candidates = [
+        Path("C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"),
+        Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
+        Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+        *(
+            Path(found)
+            for name in ("msedge", "chromium", "google-chrome", "chrome")
+            if (found := shutil.which(name))
+        ),
+    ]
+    browser = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if browser is None:
+        pytest.skip("no headless Chromium-family browser installed")
+
+    probe = """<script>
+    var probe = document.createElement('pre');
+    probe.id = 'mt-dom-probe';
+    probe.textContent = JSON.stringify({
+      receipt: document.getElementById('exec').textContent,
+      identity: document.getElementById('identtbl').textContent
+    });
+    document.body.appendChild(probe);
+    </script>"""
+    for state in ("sealed", "unresolved", "legacy"):
+        case_dir = tmp_path / state
+        case_dir.mkdir()
+        answer = (
+            (lambda prompt: _unresolved_stdout(_ANSWERS[_iid(prompt)]))
+            if state == "unresolved"
+            else (lambda prompt: _ANSWERS[_iid(prompt)])
+        )
+        result = _sweep(_taxonomy_suite(), out_dir=case_dir, answer=answer)
+        if state == "legacy":
+            _strip_execution_receipt(case_dir, result.run_id)
+        report = build_transparency_report(result.run_id, case_dir)
+        page = case_dir / "report.html"
+        rendered = render_transparency_report(report)
+        page.write_text(rendered.replace("</body>", probe + "</body>"), encoding="utf-8")
+        completed = subprocess.run(  # noqa: S603 -- selected installed browser, local file only
+            [
+                str(browser),
+                "--headless=new",
+                "--disable-gpu",
+                "--no-first-run",
+                "--disable-extensions",
+                f"--user-data-dir={case_dir / 'browser-profile'}",
+                "--dump-dom",
+                page.as_uri(),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert completed.returncode == 0, completed.stderr
+        match = re.search(r'<pre id="mt-dom-probe">(.*?)</pre>', completed.stdout, re.S)
+        assert match is not None, completed.stdout[-1000:]
+        visible = json.loads(html_unescape(match.group(1)))
+        if state == "legacy":
+            assert LEGACY_UNSEALED in visible["receipt"]
+            assert "claude-x" in visible["identity"]
+            assert "UNVERIFIED_LEGACY" in visible["identity"]
+        else:
+            assert report.execution is not None
+            assert report.execution.receipt_sha256 in visible["receipt"]
+            if state == "unresolved":
+                assert UNRESOLVED_MODEL_ID in visible["identity"]
+                assert NOT_ROUTING_ELIGIBLE in visible["identity"]
+            else:
+                assert "claude-x" in visible["identity"]
+                assert "PRELIMINARY_SEAL_IDENTITY_OK" in visible["identity"]
