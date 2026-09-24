@@ -6,6 +6,7 @@ data/agent-workspaces/
 data/agent-reports/
 data/agent-confirmations/
 data/exports/
+data/qualification/
 __pycache__/
 *.pyc
 .venv/

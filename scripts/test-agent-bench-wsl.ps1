@@ -9,7 +9,8 @@ Set-StrictMode -Version Latest
 function Get-GitManifestBytes {
     param(
         [Parameter(Mandatory = $true)][string]$GitExecutable,
-        [Parameter(Mandatory = $true)][string]$Root
+        [Parameter(Mandatory = $true)][string]$Root,
+        [switch]$ExcludeFindings
     )
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -18,6 +19,9 @@ function Get-GitManifestBytes {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $arguments = @("-C", $Root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    if ($ExcludeFindings) {
+        $arguments += @("--", ".", ":(exclude)data/qualification/**", ":(exclude)docs/agent-benchmark/containment-soak-step63.md")
+    }
     if ($null -ne $startInfo.PSObject.Properties["ArgumentList"]) {
         foreach ($argument in $arguments) {
             [void]$startInfo.ArgumentList.Add($argument)
@@ -26,6 +30,9 @@ function Get-GitManifestBytes {
     else {
         $quotedRoot = $Root.Replace('"', '\"')
         $startInfo.Arguments = "-C `"$quotedRoot`" ls-files -z --cached --others --exclude-standard"
+        if ($ExcludeFindings) {
+            $startInfo.Arguments += " -- . :(exclude)data/qualification/** :(exclude)docs/agent-benchmark/containment-soak-step63.md"
+        }
     }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
@@ -82,7 +89,7 @@ $runnerFile = Join-Path ([System.IO.Path]::GetTempPath()) "measure-twice-$([guid
 try {
     [System.IO.File]::WriteAllBytes(
         $projectManifest,
-        (Get-GitManifestBytes -GitExecutable $gitCommand.Source -Root $projectRoot)
+        (Get-GitManifestBytes -GitExecutable $gitCommand.Source -Root $projectRoot -ExcludeFindings)
     )
     [System.IO.File]::WriteAllBytes(
         $switchboardManifest,
@@ -120,14 +127,17 @@ if find "$stage" -name .git -o -name .venv | grep -q .; then
     exit 2
 fi
 
-tree_hash=$(
-    cd "$stage/measure-twice"
+tree_hash_for() (
+    cd "$1"
     while IFS= read -r -d '' relative; do
         printf '%s\0' "$relative"
         sha256sum -- "$relative" | cut -d ' ' -f 1
     done < <(find . -type f -printf '%P\0' | LC_ALL=C sort -z) | sha256sum | cut -d ' ' -f 1
 )
+tree_hash=$(tree_hash_for "$stage/measure-twice")
+switchboard_hash=$(tree_hash_for "$stage/switchboard")
 printf 'staged-tree-sha256: %s\n' "$tree_hash"
+printf 'staged-switchboard-sha256: %s\n' "$switchboard_hash"
 printf 'staged-root: %s (WSL ext4 temporary; removed on exit)\n' "$stage"
 
 command -v uv >/dev/null || {
@@ -157,10 +167,23 @@ set +e
 uv run pytest -q -m linux_isolation --junitxml="$junit_report"
 pytest_status=$?
 set -e
+skipped=unknown
+if [ -f "$junit_report" ]; then
+    if parsed_skips=$(junit_skip_count "$junit_report"); then
+        case "$parsed_skips" in
+            ''|*[!0-9]*) ;;
+            *) skipped=$parsed_skips ;;
+        esac
+    fi
+fi
+printf 'selected-skips: %s\n' "$skipped"
 if [ "$pytest_status" -ne 0 ]; then
     exit "$pytest_status"
 fi
-skipped=$(junit_skip_count "$junit_report")
+if [ "$skipped" = unknown ]; then
+    printf 'Linux isolation JUnit skip count is unavailable\n' >&2
+    exit 2
+fi
 if [ "$skipped" -ne 0 ]; then
     printf 'Linux isolation gate selected %s skipped test(s); skips are forbidden\n' "$skipped" >&2
     exit 3

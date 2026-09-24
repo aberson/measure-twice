@@ -1179,6 +1179,29 @@ def _pid_state(pid: int) -> str | None:
     return fields[0]
 
 
+def _pid_exit_record(pid: int) -> tuple[int, str] | None:
+    """Read one owner identity/state record, failing closed on unreadable or malformed proc data."""
+
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise ProcessExecutionError("could not read Linux resource guard outer owner stat") from exc
+    closing = raw.rfind(")")
+    if closing < 0:
+        raise ProcessExecutionError("Linux resource guard outer owner stat is malformed")
+    fields = raw[closing + 2 :].split()
+    try:
+        state = fields[0]
+        starttime = int(fields[19])
+    except (IndexError, ValueError) as exc:
+        raise ProcessExecutionError("Linux resource guard outer owner stat is malformed") from exc
+    if len(state) != 1:
+        raise ProcessExecutionError("Linux resource guard outer owner state is malformed")
+    return starttime, state
+
+
 def _pid_namespace_chain(pid: int) -> tuple[int, ...] | None:
     """Return host-visible PID-namespace IDs, preserving the process identity boundary."""
 
@@ -2087,12 +2110,28 @@ class _LinuxResourceGuardState:
             )
         return namespace_owner
 
-    def outer_owner_exited(self) -> bool:
+    def outer_owner_exited(self, *, allow_zombie: bool = False) -> bool:
+        """Has the exact captured outer owner terminated (record gone, or a killed zombie)?
+
+        The immutable start token (``/proc/<pid>/stat`` field 19) alone cannot separate a
+        SIGKILLed-but-unreaped zombie -- which has terminated and executes nothing, so it is
+        contained -- from a process that is still running, which is an escape: both keep a record
+        whose token is unchanged. The monitor probes before cleanup has attempted a kill, so it
+        must never accept a zombie. Only cleanup's bounded post-kill settlement opts in to ``Z``;
+        every live state (``R``/``S``/``D``/``T``/...) still fails closed.
+        """
+
         identity = self.outer_owner_identity
         if identity is None:
             raise ProcessExecutionError("Linux resource guard outer owner was not captured")
         pid, starttime = identity
-        return _pid_starttime(pid) != starttime
+        record = _pid_exit_record(pid)
+        if record is None or record[0] != starttime:
+            # The exact process is gone: the record vanished, or a reused PID has a new token.
+            return True
+        # The token and state came from one proc record, so the state belongs to this owner.
+        state = record[1]
+        return allow_zombie and state == "Z"
 
     def _verify_expected_scope_identity(self) -> None:
         try:
@@ -2233,7 +2272,7 @@ class _LinuxResourceGuardState:
         # which hold no lock, opt in.
         if wait_for_owner:
             owner_deadline = time.monotonic() + _REAP_TIMEOUT_S
-            while not self.outer_owner_exited():
+            while not self.outer_owner_exited(allow_zombie=True):
                 if time.monotonic() >= owner_deadline:
                     return False
                 time.sleep(_POLL_INTERVAL_S)
@@ -2507,6 +2546,34 @@ def _reap_failed_start(proc: subprocess.Popen[bytes]) -> BaseException | None:
     return error
 
 
+def _record_control_failure_unless_collected(
+    error: BaseException,
+    guard: _LinuxResourceGuardState,
+    errors: list[BaseException],
+    *,
+    unreleased_startup: bool = False,
+) -> bool:
+    """Keep cleanup moving if the collection proof itself fails.
+
+    A proof can read a vanished or replaced cgroup and raise while already handling the original
+    control error. Record both errors and let the caller finish reaping and descriptor teardown.
+    """
+
+    if not isinstance(error, ProcessExecutionError):
+        errors.append(error)
+        return False
+    try:
+        collected = (
+            unreleased_startup and guard.control_missing_during_unreleased_startup(error)
+        ) or guard.control_missing_after_collection(error, wait_for_owner=True)
+    except BaseException as proof_error:
+        errors.extend((proof_error, error))
+        return False
+    if not collected:
+        errors.append(error)
+    return collected
+
+
 def _cleanup_failed_linux_start(
     proc: subprocess.Popen[bytes],
     runtime: _RunningProcess | None,
@@ -2521,14 +2588,7 @@ def _cleanup_failed_linux_start(
         try:
             guard.kill_if_populated()
         except BaseException as exc:
-            if not (
-                isinstance(exc, ProcessExecutionError)
-                and (
-                    guard.control_missing_during_unreleased_startup(exc)
-                    or guard.control_missing_after_collection(exc, wait_for_owner=True)
-                )
-            ):
-                errors.append(exc)
+            _record_control_failure_unless_collected(exc, guard, errors, unreleased_startup=True)
     reap_error = _reap_failed_start(proc)
     if reap_error is not None:
         errors.append(reap_error)
@@ -2542,14 +2602,7 @@ def _cleanup_failed_linux_start(
             if trusted_guard and not guard.collected:
                 guard.wait_until_empty()
         except BaseException as exc:
-            if not (
-                isinstance(exc, ProcessExecutionError)
-                and (
-                    guard.control_missing_during_unreleased_startup(exc)
-                    or guard.control_missing_after_collection(exc, wait_for_owner=True)
-                )
-            ):
-                errors.append(exc)
+            _record_control_failure_unless_collected(exc, guard, errors, unreleased_startup=True)
         finally:
             guard.close()
             if runtime is not None:
@@ -3118,13 +3171,7 @@ def _cleanup_process(runtime: _RunningProcess, *, abnormal: bool) -> None:
                 # pinned cgroup.events control proves there is something left to terminate.
                 runtime.resource_guard.kill_if_populated()
             except BaseException as exc:
-                if not (
-                    isinstance(exc, ProcessExecutionError)
-                    and runtime.resource_guard.control_missing_after_collection(
-                        exc, wait_for_owner=True
-                    )
-                ):
-                    errors.append(exc)
+                _record_control_failure_unless_collected(exc, runtime.resource_guard, errors)
         try:
             _kill_tree(runtime.proc, runtime.process_group_id, runtime.job, tracked)
         except BaseException as exc:
@@ -3185,15 +3232,11 @@ def _cleanup_process(runtime: _RunningProcess, *, abnormal: bool) -> None:
                 guard.wait_until_empty()
             guard_empty = True
         except BaseException as exc:
-            collected = isinstance(
-                exc, ProcessExecutionError
-            ) and guard.control_missing_after_collection(exc, wait_for_owner=True)
+            collected = _record_control_failure_unless_collected(exc, guard, errors)
             if collected:
                 # This exact branch proves the namespace-init owner and named scope disappeared.
                 # Collection implies cgroup emptiness, so terminal retained-FD validation is safe.
                 guard_empty = True
-            else:
-                errors.append(exc)
         finally:
             guard.close()
             runtime.resource_guard = None
