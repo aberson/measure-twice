@@ -602,6 +602,28 @@ def test_markdown_shows_concrete_and_unresolved_identities_in_same_arm(tmp_path:
     assert "| Resolved identity | Stored identity |" in render_run_report(report)
 
 
+def test_report_keeps_distinct_resolved_identity_per_alias(tmp_path: Path) -> None:
+    aliases = ("haiku", "sonnet", "opus")
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=list(aliases))
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["model_id_resolved"] = f"claude-{row['model']}-report"
+    rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    report = build_run_report(result.run_id, tmp_path)
+    assert {model.model: model.resolved_identities for model in report.models} == {
+        alias: (f"claude-{alias}-report",) for alias in aliases
+    }
+    markdown = render_run_report(report)
+    for alias in aliases:
+        assert f"| {alias} | claude-cli | {alias} | claude-{alias}-report |" in markdown
+    assert {
+        row["model"]: row["resolved_identities"]
+        for row in map(json.loads, run_report_jsonl(report).splitlines())
+    } == {alias: [f"claude-{alias}-report"] for alias in aliases}
+
+
 def test_legacy_requested_alias_fallback_is_explicitly_unverified(tmp_path: Path) -> None:
     result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
     _strip_execution_receipt(tmp_path, result.run_id)

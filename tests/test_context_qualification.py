@@ -25,6 +25,7 @@ def _fake_command(tmp_path: Path) -> Path:
         """import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -32,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / 'unused'))
 sys.path.insert(0, TESTS_PATH)
 from conftest import StubAdapters
 from test_report import _unresolved_claude_stdout
+from measure_twice.adapters.claude_cli import SubprocessResult
 from measure_twice.config import load_config
 from measure_twice.runner import run
 from measure_twice.scoring import make_deterministic_scorer
@@ -71,11 +73,30 @@ def answer(prompt):
     if mode == 'unresolved':
         return _unresolved_claude_stdout(token)
     return token
+base_factory = StubAdapters(claude=answer).claude_factory()
+def distinct_identity_factory():
+    base = base_factory()
+    def runner(invocation, prompt, timeout):
+        result = base(invocation, prompt, timeout)
+        if not result.stdout.startswith('{'):
+            return result
+        envelope = json.loads(result.stdout)
+        usage = envelope.get('modelUsage')
+        if not isinstance(usage, dict) or len(usage) != 1:
+            return result
+        argv = invocation.argv
+        command = ' '.join(argv) if isinstance(argv, tuple) else argv
+        match = re.search(r'--model"?[ ]+"?(haiku|sonnet|opus)(?=[" ]|$)', command)
+        assert match is not None, command
+        identity = 'claude-' + match.group(1) + '-fixture'
+        envelope['modelUsage'] = {identity: next(iter(usage.values()))}
+        return SubprocessResult(result.returncode, json.dumps(envelope), result.stderr)
+    return runner
 result = run(
     suite=suite, config=load_config(args.config), out_dir=out,
     roster=args.models.split(','), samples_per_cell=args.samples,
     scorer=make_deterministic_scorer(suite.scoring),
-    claude_runner_factory=StubAdapters(claude=answer).claude_factory(),
+    claude_runner_factory=distinct_identity_factory,
     preregister=args.preregister,
 )
 if mode == 'incomplete':
@@ -179,6 +200,9 @@ def test_qualification_fake_live_and_verify_only_rechecks_hashes(tmp_path: Path)
     assert len(index["arms"]) == 3
     assert all(arm["terminal_cells"] == 1 for arm in index["arms"])
     assert sum(arm["terminal_cells"] for arm in index["arms"]) == 3
+    assert {arm["model"]: arm["resolved_identities"] for arm in index["arms"]} == {
+        alias: [f"claude-{alias}-fixture"] for alias in ("haiku", "sonnet", "opus")
+    }
     assert not list(tmp_path.glob(".mt-context-canary-*"))
     verify = _verify(tmp_path)
     assert verify.returncode == 0, verify.stdout + verify.stderr
