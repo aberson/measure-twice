@@ -239,16 +239,21 @@ def _require_positive_int(value: object, *, label: str) -> int:
 
 def _require_finite_positive_number(value: object, *, label: str) -> float:
     # Seconds — accept int OR float; reject bool, non-finite (nan/inf), and non-positive values.
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value <= 0
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ExecutionProfileError(
             f"{label} must be a finite positive number of seconds, got {value!r}"
         )
-    return float(value)
+    try:
+        seconds = float(value)
+    except OverflowError as exc:
+        raise ExecutionProfileError(
+            f"{label} must be a finite positive number of seconds, got {value!r}"
+        ) from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ExecutionProfileError(
+            f"{label} must be a finite positive number of seconds, got {value!r}"
+        )
+    return seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,7 +422,9 @@ class GeminiContextProfile:
             request_contract=cast("str", clean["request_contract"]),
             max_output_tokens=raw_tokens,
             thinking_level=cast("str", clean["thinking_level"]),
-            timeout_s=float(raw_timeout),
+            timeout_s=_require_finite_positive_number(
+                raw_timeout, label="execution profile.gemini.timeout_s"
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:

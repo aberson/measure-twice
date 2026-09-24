@@ -73,6 +73,7 @@ def test_gemini_context_present_iff_gemini_binding() -> None:
         ({"thinking_level": "extreme"}, "thinking_level must be one of"),
         ({"thinking_level": []}, "thinking_level must be one of"),
         ({"timeout_s": 0}, "timeout_s must be a finite positive"),
+        ({"timeout_s": 10**400}, "timeout_s must be a finite positive"),
         ({"timeout_s": "soon"}, "timeout_s must be a number"),
     ],
 )

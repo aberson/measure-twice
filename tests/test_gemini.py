@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import sys
 import threading
 import urllib.error
 from collections.abc import Callable
@@ -218,6 +219,14 @@ def test_missing_candidate_structure_without_block_is_bad_envelope() -> None:
     assert _call(_resp(None)).reason_class == RC_BAD_ENVELOPE
 
 
+@pytest.mark.parametrize(
+    "candidate", [{"finishReason": "STOP"}, {"finishReason": "STOP", "content": {}}]
+)
+def test_missing_answer_structure_is_bad_envelope(candidate: dict[str, object]) -> None:
+    result = _call(_resp([candidate]))
+    assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
+
+
 def test_multiple_candidates_violate_single_candidate_contract() -> None:
     result = _call(_resp([_cand(), _cand()]))
     assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
@@ -231,9 +240,21 @@ def test_json_non_object_body_is_bad_envelope() -> None:
     assert _call("[1, 2, 3]").reason_class == RC_BAD_ENVELOPE
 
 
+def test_json_body_beyond_parser_depth_is_bad_envelope() -> None:
+    depth = sys.getrecursionlimit() + 100
+    result = _call("[" * depth + "0" + "]" * depth)
+    assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
+
+
 def test_absent_model_version_resolves_unresolved() -> None:
     result = _call(_resp([_cand("STOP", [{"text": "ok"}])], model="   "))
     assert result.ok and result.resolved_model == UNRESOLVED_MODEL_ID
+
+
+def test_malformed_model_version_is_bad_envelope() -> None:
+    body = _resp([_cand("STOP", [{"text": "pass"}])], modelVersion=7)
+    result = _call(body)
+    assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
 
 
 @pytest.mark.parametrize(

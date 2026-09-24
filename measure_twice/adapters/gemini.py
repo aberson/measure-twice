@@ -252,15 +252,15 @@ def _extract_answer(content: object) -> tuple[bool, str]:
     under this text-only contract MUST carry string ``text``; a part that is not a dict, a non-bool
     ``thought``, or a non-thought part without ``text`` (an unsupported content type such as a
     function call or inline data) is malformed -> the caller maps it to ``bad_envelope`` (plan §6
-    D4). Absent ``content`` / ``parts`` yields an empty answer (caller maps that to no-response).
+    D4). Missing ``content`` or ``parts`` is also a malformed candidate structure.
     """
     if content is None:
-        return (True, "")
+        return (False, "")
     if not isinstance(content, dict):
         return (False, "")
     parts = content.get("parts")
     if parts is None:
-        return (True, "")
+        return (False, "")
     if not isinstance(parts, list):
         return (False, "")
     pieces: list[str] = []
@@ -285,12 +285,18 @@ def _classify_body(raw_body: str, elapsed: float) -> ModelCallResult:
         payload_raw = json.loads(raw_body)
     except (json.JSONDecodeError, ValueError):
         return ModelCallResult.error(reason_class=RC_NON_JSON_BODY, elapsed_s=elapsed)
+    except RecursionError:
+        return ModelCallResult.error(reason_class=RC_BAD_ENVELOPE, elapsed_s=elapsed)
     if not isinstance(payload_raw, dict):
         return ModelCallResult.error(reason_class=RC_BAD_ENVELOPE, elapsed_s=elapsed)
     payload = cast("Mapping[str, object]", payload_raw)
     # Provider identity is read (and retained) BEFORE outcome classification, so a truncated,
     # blocked, empty, or malformed response still records the observed modelVersion (plan §6 D4).
     resolved = _resolved_model(payload)
+    if "modelVersion" in payload and not isinstance(payload["modelVersion"], str):
+        return ModelCallResult.error(
+            reason_class=RC_BAD_ENVELOPE, resolved_model=resolved, elapsed_s=elapsed
+        )
 
     candidates = payload.get("candidates")
     block = _block_reason(payload)
