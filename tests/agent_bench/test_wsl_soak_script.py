@@ -515,60 +515,50 @@ def test_verify_rejects_pytest_config_drift_and_edited_rate(tmp_path: Path) -> N
 
 
 def test_git_manifest_ignores_growing_qualification_evidence(tmp_path: Path) -> None:
-    """Use the launcher's real git manifest command to exclude growing evidence."""
+    """Real soak producer and verifier ignore evidence growing inside their source tree."""
 
     repo = tmp_path / "manifest-repo"
-    repo.mkdir()
+    script = repo / "scripts" / "soak-agent-bench-wsl.ps1"
+    script.parent.mkdir(parents=True)
+    shutil.copyfile(_SOAK_SCRIPT, script)
+    (repo / "source.txt").write_text("reviewed source\n", encoding="utf-8")
     git = shutil.which("git")
     assert git is not None
-    subprocess.run(  # noqa: S603 - resolved git running against an isolated test repo
+    subprocess.run(  # noqa: S603 - isolated fixture repo
         [git, "init", "-q", str(repo)], check=True, capture_output=True
     )
-    shutil.copyfile(_REPO_ROOT / ".gitignore", repo / ".gitignore")
-    (repo / "source.txt").write_text("reviewed source\n", encoding="utf-8")
-    subprocess.run(  # noqa: S603 - resolved git running against an isolated test repo
-        [git, "-C", str(repo), "add", ".gitignore", "source.txt"],
+    subprocess.run(  # noqa: S603 - isolated fixture repo
+        [git, "-C", str(repo), "add", "scripts", "source.txt"],
         check=True,
         capture_output=True,
     )
 
-    def manifest_paths() -> list[str]:
-        raw = subprocess.check_output(  # noqa: S603 - exact launcher manifest command
-            [
-                git,
-                "-C",
-                str(repo),
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "--",
-                ".",
-                ":(exclude)data/qualification/**",
-                ":(exclude)docs/agent-benchmark/containment-soak-step63.md",
-            ]
-        )
-        return [part.decode("utf-8") for part in raw.split(b"\0") if part]
-
-    before = manifest_paths()
     evidence = repo / "data" / "qualification" / "agent-bench-containment-step63"
-    evidence.mkdir(parents=True)
-    (evidence / "evidence-header.txt").write_text("preregistered\n", encoding="utf-8")
-    (evidence / "run-01.log").write_text("first\n", encoding="utf-8")
-    after_first = manifest_paths()
-    (evidence / "run-02.log").write_text("second\n", encoding="utf-8")
+    completed, _ = _run_soak(
+        tmp_path,
+        plan=[f"{_HASH_A}|0", f"{_HASH_A}|0"],
+        repetitions=2,
+        out=evidence,
+        soak_script=script,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "containment_gate_rate=2/2" in completed.stdout
+
     finding = repo / "docs" / "agent-benchmark" / "containment-soak-step63.md"
     finding.parent.mkdir(parents=True)
     finding.write_text("post-soak note\n", encoding="utf-8")
-    subprocess.run(  # noqa: S603 - force-stage artifacts to test tracked exclusions
-        [git, "-C", str(repo), "add", "-f", str(evidence / "run-01.log"), str(finding)],
-        check=True,
-        capture_output=True,
+    subprocess.run(  # noqa: S603 - stage a finding written after the soak
+        [git, "-C", str(repo), "add", str(finding)], check=True, capture_output=True
     )
-    after_second = manifest_paths()
-    assert before == after_first == after_second
-    assert all("qualification" not in path for path in after_second)
+    verified, _ = _run_soak(
+        tmp_path,
+        plan=[f"{_HASH_A}|0", f"{_HASH_A}|0"],
+        repetitions=2,
+        out=evidence,
+        verify_only=True,
+        soak_script=script,
+    )
+    assert verified.returncode == 0, verified.stderr
 
 
 def test_soak_script_is_ascii_only() -> None:
