@@ -1,6 +1,6 @@
 # Gemini Model-Sweep Adapter
 
-**Status:** REVIEWED (2026-09-09); build after Steps 56 and 57 pass.
+**Status:** Step 64 DONE (2026-09-24); Step 65 NOT RUN, pending credentials and separate live-call authorization.
 
 **Repo-sync phase:** `gemini-model-sweep` (explicit; Steps 64-65).
 
@@ -146,7 +146,7 @@ infer success from fixtures. No full benchmark is part of this smoke authorizati
 - **Produces:** adapter, profile, smoke command, offline protocol and production-entry integration tests, consumer disposition, and setup/run/report documentation.
 - **Done when:** real `main` entry points drive Gemini fixture responses through production config, adapter, runner, scoring and all report formats; API key data appears nowhere in durable output; missing/blank keys and unknown providers fail before mutation; HTTP/timeout/malformed/blocked/empty/thought-only cases produce truthful terminal outcomes; budgets and resume never recall completed cells; changed Gemini settings reject resume without writes; old profiles retain hashes and old runs remain readable; full pytest, Ruff lint/format checks, strict mypy, and package build pass; separate independent code review passes.
 - **Depends on:** 56 and 57 (must be DONE before implementation).
-- **Status:** NOT STARTED
+- **Status:** DONE (2026-09-24). Merged after six independent review lenses. The final branch and post-merge master passed full Windows pytest, Ruff lint/format, strict mypy, and `uv build`. Offline tests exercise production `mt run`, `mt smoke --gemini`, rubric judging, all report formats including rendered HTML, malformed responses, credential redaction, budget/resume, and legacy compatibility. No Gemini API call was made.
 
 ### Step 65: Live-smoke the Gemini adapter
 
@@ -157,7 +157,7 @@ infer success from fixtures. No full benchmark is part of this smoke authorizati
 - **Produces:** local run/report artifacts and a recorded verification outcome; no code changes.
 - **Done when:** `uv run mt smoke --gemini --config profiles/model-sweep-gemini-v1.json` exits zero with exactly two terminal cells, no parse/error/no-response failures, and concrete Gemini provider identity; its HTML report opens and retains both raw responses. This is pipeline verification only.
 - **Depends on:** 64 (#71), API key provisioned locally, and permission for two Gemini calls.
-- **Status:** NOT STARTED; no key present in process/user environments at discovery.
+- **Status:** NOT RUN; requires a locally provisioned key and separate permission for two real calls. Offline fixture success is not a live verification result.
 
 ## 8. Risks and Open Questions
 

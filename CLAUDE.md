@@ -110,10 +110,12 @@ absence of arbitrary old conversation leakage without a separate seeded-history 
 
 Next on Instrument A is Step 58's three live Claude canaries before canonical Step 13 calibration.
 Canonical Steps 13-17 remain pending; Steps 13 and 16 require the local endpoint.
-`measure_twice/analyze/` does not yet exist. Gemini Step 64 is now ready for its authorized
-offline build; its separate two-call live smoke (Step 65) still needs locally provisioned
-credentials and call permission. Gemini Step 64 is under offline construction in an isolated
-worktree; it is not yet merged.
+`measure_twice/analyze/` does not yet exist. Gemini Step 64's offline API provider, hashed
+request profile, `mt run`/`mt smoke --gemini` paths, reports, and offline tests are DONE on master
+(2026-09-24). Six independent review lenses and full post-merge pytest, Ruff lint/format, strict
+mypy, and package build passed. Its separate two-call live smoke (Step 65) is NOT RUN; it still
+needs locally provisioned credentials and separate call permission. Offline fixtures do not prove
+live account/model access or routing eligibility.
 
 **Step 62 landed** as `3565141` after a final zero-skip Windows-launched WSL gate and six review
 lenses. The owner-exit proof now distinguishes missing/reused `/proc` records from unreadable or
@@ -128,8 +130,8 @@ There are **five** plan documents partitioning step ids 1-17 / 18-24 / 25-55 / 5
 `documentation/gemini-model-sweep-plan.md`. The first-measurement coordinator governs the
 qualification dependencies above.
 
-**Gate evidence:** after Steps 57 and 62 merged, master passed full `uv run pytest -q`, Ruff
-lint/format (66 files), strict mypy (29 source files), and `uv build`. The offload citation drift
+**Gate evidence:** after Steps 57, 62, and 64 merged, master passed full `uv run pytest -q`, Ruff
+lint/format (68 files), strict mypy (30 source files), and `uv build`. The offload citation drift
 recorded at Step 56 wrap was
 repaired separately in `48fdc93` before the Step 57 merge.
 Note a separate pre-existing agent_bench flake: `tests/agent_bench/test_cli.py::test_structure_only_
