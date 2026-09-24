@@ -1,9 +1,9 @@
 # First-Measurement Validity Gates and Luna Routing
 
-**Status:** IN PROGRESS (2026-09-23) — 1/8 steps complete (Step 56 DONE, merged to master as
-`a72b48d`); umbrella #60 and Step 56-63 issues #62/#63/#64/#65/#66/#67/#61/#68 backfilled; cross-plan
-links verified. Step 57 (next) and Step 62 (independent) remain to build; Steps 58/61/63 are live
-observation waits.
+**Status:** IN PROGRESS (2026-09-23) — 2/8 steps complete (Steps 56 and 57 DONE; Step 57
+merged to master as `27e475b`); umbrella #60 and Step 56-63 issues
+#62/#63/#64/#65/#66/#67/#61/#68 backfilled; cross-plan links verified. Step 62 is in final
+review; Steps 58/61/63 are live observation waits.
 
 **Repo-sync phase identifier:** `first-measurement-validity-and-luna-routing` (must be passed
 explicitly; it cannot be inferred from this filename)
@@ -280,10 +280,21 @@ Step 56 scope (§3 non-goal: do not touch the ledger). No live qualification ran
   and receipt hashes; a fake-live integration proves the wrapper plants unique cwd/environment/
   customization sentinels, embeds the exact preregistration before call 1, and rejects a sentinel or
   unresolved identity; and
-  `"uv run pytest -q tests/test_cli.py tests/test_report.py tests/test_report_html.py -k 'execution or identity or legacy or qualification'"`
+  `"uv run pytest -q tests/test_cli.py tests/test_report.py tests/test_report_html.py tests/test_context_qualification.py -k 'execution or identity or legacy or qualification or context or compare'"`
   exits 0
 - **Depends on:** 56
-- **Status:** NOT STARTED
+- **Status:** DONE (2026-09-23; merged as `27e475b`)
+
+The offline qualification wrapper writes a pre-call index, distinguishes fixture from live evidence,
+and checks the three terminal Claude aliases, concrete identities, sentinels, source/producer hashes,
+and stored receipt in `-VerifyOnly`. Markdown, JSONL, and HTML expose sealed, unresolved, and legacy
+evidence without changing official scores. A headless browser regression checks the visible HTML
+receipt and identity table. Six independent final reviewer lenses passed (correctness, bugs,
+security, tests, style, plan conformance). Post-merge `uv run pytest -q`, Ruff lint/format,
+strict mypy (29 source files), and `uv build` passed on master. Step 58's three live calls have not
+run. Its prior-session sentinel is simulated; the sealed builder's fresh cwd and
+`--no-session-persistence` are separately tested, while a genuine seeded-history challenge would
+require a different live call budget.
 
 ### Step 58: Live-qualify the sealed Instrument A context
 

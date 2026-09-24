@@ -90,7 +90,7 @@ Gate evidence at wrap: native suite from the repo root **462 passed, 110 skipped
 
 > **The WSL containment gate is not reliably green: 9/10 (`0,0,0,1,0,0,0,0,0,0`) at wrap time,** run post-`6706fb6` on 2026-08-24. The single red landed on run 4, whose output was not captured; runs 7-10 were captured but all passed, so the failing case is **still unidentified**. This is the *sixth* appearance of one shape in this branch — a test asserting on a quantity it does not control (see [[test-asserts-uncontrolled-quantity]]); issue #58 item 3 already names a known red-when-healthy race in `test_linux_scope_absence_interval_restarts_when_the_path_reappears` as a candidate. **Never call this gate green off one run.** Run it 6–8× and report the pass *rate*; retrying until green hides exactly the defect you need to see. Step 27 builds more canaries on this substrate — identify and fix the remaining flake before adding to it.
 
-**Current work: Step 56 DONE** (2026-09-23, #62) in
+**Current work: Steps 56-57 DONE** (2026-09-23, #62/#63) in
 `documentation/first-measurement-validity-and-luna-routing-plan.md` — the recovered candidate plus
 fix `47936ab` merged to master as `a72b48d`. The three review gaps are closed: non-Claude rubric
 judges are now rejected before run-dir/score mutation (shared `runner._execution_bindings` guard),
@@ -99,11 +99,19 @@ launcher-inventory test now discriminates via the known-folder resolver seam. An
 four-lens fresh-context review of the delta returned 4/4 PASS (one cosmetic Nit, no Block). The
 `../worktree_build-step-56-20260831053108` worktree is retained (fully merged; safe to remove later).
 
-**Next is Step 57** — receipt/identity reporting and the qualification wrapper. Step 58 performs
-three real Claude canaries before canonical Step 13 calibration. Canonical Steps 13-17 remain
-pending; Steps 13 and 16 require the local endpoint. `measure_twice/analyze/` does not yet exist.
-The authorized continuation after Step 57 is Gemini Step 64; its separate two-call live smoke
-(Step 65) needs locally provisioned credentials and call permission. Gemini is planned, not built.
+**Step 57 landed** as `27e475b` after six independent final PASS reviews. Markdown, JSONL, and
+HTML now expose execution receipts and per-alias provider identity, preserve official scores, and
+mark legacy or unresolved evidence ineligible. The hostile-context suite and autonomous
+qualification/`-VerifyOnly` wrapper are built and tested offline; no live Step 58 calls have run.
+The wrapper's prior-session marker is simulated. The sealed builder separately enforces a fresh
+temporary cwd and `--no-session-persistence`; Step 58's fixed three-call observation cannot prove
+absence of arbitrary old conversation leakage without a separate seeded-history experiment.
+
+Next on Instrument A is Step 58's three live Claude canaries before canonical Step 13 calibration.
+Canonical Steps 13-17 remain pending; Steps 13 and 16 require the local endpoint.
+`measure_twice/analyze/` does not yet exist. Gemini Step 64 is now ready for its authorized
+offline build; its separate two-call live smoke (Step 65) still needs locally provisioned
+credentials and call permission. Gemini is planned, not built.
 
 Coding-agent Step 27 (#29) remains blocked on coordinator Steps 62 and 63: the reviewed
 zombie-aware containment repair and an eight-run WSL qualification. Those are independent of
@@ -114,10 +122,9 @@ There are **five** plan documents partitioning step ids 1-17 / 18-24 / 25-55 / 5
 `documentation/gemini-model-sweep-plan.md`. The first-measurement coordinator governs the
 qualification dependencies above.
 
-**Gate evidence:** with Step 56 merged, master is at 610 passed / 113 skipped, plus clean Ruff
-lint/format, strict mypy (28 files) and `uv build`. The one failing test,
-`test_every_citation_is_current_and_the_map_is_exactly_rendered`, is pre-existing shared-workspace
-citation drift (identical on the pre-merge baseline; out of Step 56 scope — do not touch the ledger).
+**Gate evidence:** after Step 57 merged, master passed full `uv run pytest -q`, Ruff lint/format,
+strict mypy (29 files), and `uv build`. The offload citation drift recorded at Step 56 wrap was
+repaired separately in `48fdc93` before the Step 57 merge.
 Note a separate pre-existing agent_bench flake: `tests/agent_bench/test_cli.py::test_structure_only_
 executes_no_commands_calls_no_providers_and_writes_nothing` hashes the whole repo tree + `.git`
 (including transient `__pycache__/*.pyc`), so it can red on the FIRST full-suite run after any source
