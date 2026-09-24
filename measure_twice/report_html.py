@@ -44,7 +44,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from measure_twice.report import ReportError, _open_run_store, build_run_report
+from measure_twice.report import (
+    LEGACY_UNSEALED,
+    NOT_ROUTING_ELIGIBLE,
+    UNRESOLVED_IDENTITY,
+    ExecutionEvidence,
+    ModelReport,
+    ReportError,
+    _open_run_store,
+    build_run_report,
+)
 from measure_twice.runner import NO_RESPONSE_SCORER, RunError, RunRow, load_run_suite
 from measure_twice.scoring.deterministic import (
     PARSE_FAIL_MARKER,
@@ -129,6 +138,8 @@ class TransparencyReport:
     manifest: Mapping[str, object]
     items: list[ItemReport]
     reproduced_cells: int
+    execution: ExecutionEvidence | None
+    identity_by_model: dict[str, ModelReport]
 
 
 # --- Label recognition (public scorer surface only — never a second matcher) ---------------
@@ -332,6 +343,7 @@ def build_transparency_report(run_id: str, out_dir: str | Path = "data") -> Tran
     labels = _suite_labels(suite)
     roll_up = build_run_report(run_id, out_dir)
     models = [model.model for model in roll_up.models]
+    identity_by_model = {model.model: model for model in roll_up.models}
 
     rows_by_cell: dict[tuple[str, str], list[RunRow]] = {}
     for row in rows:
@@ -390,6 +402,8 @@ def build_transparency_report(run_id: str, out_dir: str | Path = "data") -> Tran
         manifest=manifest,
         items=items,
         reproduced_cells=reproduced,
+        execution=roll_up.execution,
+        identity_by_model=identity_by_model,
     )
 
 
@@ -536,6 +550,48 @@ def _limits(report: TransparencyReport) -> list[str]:
     return limits
 
 
+def _execution_payload(report: TransparencyReport) -> dict[str, object]:
+    """The additive execution-seal + per-alias identity block (plan §6.3/§6.4).
+
+    Named provider / requested / resolved identities and receipt hashes for every arm, plus the
+    run-level seal. A legacy run (no receipt) is marked ``LEGACY_UNSEALED`` and every arm
+    ``NOT_ROUTING_ELIGIBLE`` — the official scores rendered elsewhere are never changed.
+    """
+    evidence = report.execution
+    arms = [
+        {
+            "model": name,
+            "provider": model.provider,
+            "requested_model": model.requested_model,
+            "resolved_identities": list(model.resolved_identities),
+            "identity_unresolved": model.identity_unresolved,
+            "routing_eligible": model.routing_eligible,
+            "eligibility": model.eligibility,
+        }
+        for name, model in (
+            (name, report.identity_by_model[name]) for name in report.models
+        )
+    ]
+    return {
+        "sealed": evidence is not None,
+        "seal_status": LEGACY_UNSEALED if evidence is None else evidence.sealing_mode,
+        "not_routing_eligible": NOT_ROUTING_ELIGIBLE,
+        "unresolved_identity": UNRESOLVED_IDENTITY,
+        "profile_id": None if evidence is None else evidence.profile_id,
+        "execution_profile_sha256": (
+            None if evidence is None else evidence.execution_profile_sha256
+        ),
+        "provider_profile_sha256": (
+            None if evidence is None else evidence.provider_profile_sha256
+        ),
+        "context_profile_sha256": None if evidence is None else evidence.context_profile_sha256,
+        "receipt_sha256": None if evidence is None else evidence.receipt_sha256,
+        "claude_executable": None if evidence is None else evidence.claude_executable,
+        "claude_version": None if evidence is None else evidence.claude_version,
+        "arms": arms,
+    }
+
+
 def _payload(report: TransparencyReport) -> dict[str, object]:
     return {
         "title": f"{report.suite} — {report.run_id}",
@@ -545,6 +601,7 @@ def _payload(report: TransparencyReport) -> dict[str, object]:
         "floor": {"label": report.floor_label, "score": report.floor_score},
         "preregistration": report.preregistration,
         "provenance": _provenance_rows(report),
+        "execution": _execution_payload(report),
         "repro": (
             f"# re-render this page from the stored run (no model is called)\n"
             f"uv run mt report {report.run_id} --html\n\n"

@@ -26,9 +26,11 @@ from pathlib import Path
 import pytest
 from conftest import StubAdapters, _iid  # shared offline stub scaffolding (tests/conftest.py)
 
+from measure_twice.adapters.base import UNRESOLVED_MODEL_ID
+from measure_twice.adapters.claude_cli import SubprocessResult
 from measure_twice.cli import main
 from measure_twice.config import RunConfig
-from measure_twice.report import ReportError, build_run_report
+from measure_twice.report import LEGACY_UNSEALED, NOT_ROUTING_ELIGIBLE, ReportError, build_run_report
 from measure_twice.report_html import (
     OUTCOME_CORRECT,
     OUTCOME_NO_VERDICT,
@@ -411,3 +413,88 @@ def test_cli_compare_takes_precedence_over_html_and_prints_markdown(
     assert second.run_id in captured.out
     assert (tmp_path / "reports" / f"compare-{first.run_id}.md").is_file()
     assert not (tmp_path / "reports" / f"{first.run_id}.html").exists()
+
+
+# --- Step 57: execution seal + per-alias identity in the HTML page --------------------------
+
+
+def _strip_execution_receipt(out_dir: Path, run_id: str) -> None:
+    """Drop the additive execution receipt to make a stored run look LEGACY (rows untouched)."""
+    manifest_path = out_dir / "runs" / run_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["execution_receipt"]
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def _unresolved_stdout(text: str) -> SubprocessResult:
+    """A success envelope whose ambiguous ``modelUsage`` yields no concrete provider identity."""
+    body = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": text,
+            "modelUsage": {"model-a": {"inputTokens": 1}, "model-b": {"inputTokens": 1}},
+        }
+    )
+    return SubprocessResult(0, body, "")
+
+
+def test_html_surfaces_execution_seal_and_identity(tmp_path: Path) -> None:
+    result = _sweep(_taxonomy_suite(), out_dir=tmp_path)
+    report = build_transparency_report(result.run_id, tmp_path)
+    assert report.execution is not None
+    html = render_transparency_report(report)
+    execution = _island(html)["execution"]
+    assert isinstance(execution, dict)
+    assert execution["sealed"] is True
+    assert execution["profile_id"] == report.execution.profile_id
+    assert execution["receipt_sha256"] == report.execution.receipt_sha256
+    arms = execution["arms"]
+    assert isinstance(arms, list)
+    haiku = next(a for a in arms if a["model"] == "haiku")
+    assert haiku["provider"] == "claude-cli"
+    assert haiku["requested_model"] == "haiku"
+    assert haiku["resolved_identities"] == ["claude-x"]
+    assert haiku["routing_eligible"] is True
+    # The receipt hashes are literally present in the rendered page, not only in the island.
+    assert report.execution.receipt_sha256 in html
+
+
+def test_html_legacy_run_marked_unsealed(tmp_path: Path) -> None:
+    result = _sweep(_taxonomy_suite(), out_dir=tmp_path)
+    _strip_execution_receipt(tmp_path, result.run_id)
+    report = build_transparency_report(result.run_id, tmp_path)
+    assert report.execution is None
+    html = render_transparency_report(report)
+    execution = _island(html)["execution"]
+    assert isinstance(execution, dict)
+    assert execution["sealed"] is False
+    assert execution["seal_status"] == LEGACY_UNSEALED
+    assert execution["receipt_sha256"] is None
+    haiku = next(a for a in execution["arms"] if a["model"] == "haiku")
+    assert haiku["provider"] is None
+    assert haiku["routing_eligible"] is False
+    assert LEGACY_UNSEALED in html
+    assert NOT_ROUTING_ELIGIBLE in html
+
+
+def test_html_unresolved_identity_marked(tmp_path: Path) -> None:
+    stub = StubAdapters(claude=lambda p: _unresolved_stdout(_ANSWERS[_iid(p)]))
+    result = run(
+        suite=_taxonomy_suite(),
+        config=RunConfig(),
+        out_dir=tmp_path,
+        roster=["haiku"],
+        samples_per_cell=1,
+        scorer=make_deterministic_scorer(_taxonomy_suite().scoring),
+        local_transport_factory=stub.local_factory(),
+        claude_runner_factory=stub.claude_factory(),
+    )
+    report = build_transparency_report(result.run_id, tmp_path)
+    html = render_transparency_report(report)
+    haiku = next(a for a in _island(html)["execution"]["arms"] if a["model"] == "haiku")
+    assert haiku["identity_unresolved"] is True
+    assert UNRESOLVED_MODEL_ID in haiku["resolved_identities"]
+    assert haiku["routing_eligible"] is False
+    assert UNRESOLVED_MODEL_ID in html
