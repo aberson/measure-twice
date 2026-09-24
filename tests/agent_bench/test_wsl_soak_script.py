@@ -64,7 +64,7 @@ if ($hashValue -eq ('a' * 64)) { $hashValue = $projectMatch.Groups[1].Value }
 $switchboardHash = $switchboardMatch.Groups[1].Value
 if ($parts.Count -ge 4 -and $parts[3] -ne "") { $switchboardHash = $parts[3] }
 $exitCode = [int]$parts[1]
-$skipCount = if ($parts.Count -ge 3) { [int]$parts[2] } else { 0 }
+$skipCount = if ($parts.Count -ge 3) { $parts[2] } else { "0" }
 if ($hashValue -ne "") {
     Write-Output ("staged-tree-sha256: " + $hashValue)
     Write-Output ("staged-root: /tmp/fake-" + $index + " (fake ext4; removed on exit)")
@@ -169,6 +169,7 @@ def test_rejects_changed_staged_tree_hash_and_preserves_all_logs(tmp_path: Path)
 
     assert completed.returncode != 0
     assert "preregistered source fingerprints" in completed.stderr
+    assert "containment_gate_rate=7/8 (87.5%)" in completed.stdout
     verdict = (out_dir / "verdict.txt").read_text(encoding="utf-8")
     assert "verdict: FAIL" in verdict
     logs = sorted(out_dir.glob("run-*.log"))
@@ -183,6 +184,7 @@ def test_rejects_switchboard_staging_mismatch_and_preserves_logs(tmp_path: Path)
 
     assert completed.returncode != 0
     assert "preregistered source fingerprints" in completed.stderr
+    assert "containment_gate_rate=7/8 (87.5%)" in completed.stdout
     assert "verdict: FAIL" in (out_dir / "verdict.txt").read_text(encoding="utf-8")
     assert len(list(out_dir.glob("run-*.log"))) == 8
 
@@ -236,6 +238,39 @@ def test_verify_only_rejects_forged_pass_with_a_failed_run(tmp_path: Path) -> No
     verify, _ = _run_soak(tmp_path, plan=plan, repetitions=8, out=out_dir, verify_only=True)
     assert verify.returncode != 0
     assert "nonzero gate exit" in verify.stderr.lower()
+
+
+def test_verify_only_rejects_duplicate_verdict_and_hash_fields(tmp_path: Path) -> None:
+    completed, out_dir = _run_soak(tmp_path, plan=[f"{_HASH_A}|0"], repetitions=1)
+    assert completed.returncode == 0, completed.stderr
+    verdict_path = out_dir / "verdict.txt"
+    original = verdict_path.read_text(encoding="utf-8")
+
+    verdict_path.write_text(original + "verdict: FAIL\n", encoding="utf-8")
+    duplicate_verdict, _ = _run_soak(
+        tmp_path, plan=[f"{_HASH_A}|0"], repetitions=1, out=out_dir, verify_only=True
+    )
+    assert duplicate_verdict.returncode != 0
+    assert "duplicate receipt field 'verdict'" in duplicate_verdict.stderr
+
+    verdict_path.write_text(original + f"staged-tree-sha256: {_HASH_B}\n", encoding="utf-8")
+    duplicate_hash, _ = _run_soak(
+        tmp_path, plan=[f"{_HASH_A}|0"], repetitions=1, out=out_dir, verify_only=True
+    )
+    assert duplicate_hash.returncode != 0
+    assert "duplicate receipt field 'staged-tree-sha256'" in duplicate_hash.stderr
+
+    verdict_path.write_text(original, encoding="utf-8")
+    header_path = out_dir / "evidence-header.txt"
+    header_path.write_text(
+        header_path.read_text(encoding="utf-8") + f"source-tree-sha256: {_HASH_B}\n",
+        encoding="utf-8",
+    )
+    duplicate_header, _ = _run_soak(
+        tmp_path, plan=[f"{_HASH_A}|0"], repetitions=1, out=out_dir, verify_only=True
+    )
+    assert duplicate_header.returncode != 0
+    assert "duplicate receipt field 'source-tree-sha256'" in duplicate_header.stderr
 
 
 def test_verify_only_rejects_ambiguous_staged_hash(tmp_path: Path) -> None:
@@ -347,6 +382,14 @@ def test_zero_gate_exit_with_selected_skip_is_not_a_pass(tmp_path: Path) -> None
     assert "containment_gate_rate=0/1" in completed.stdout
     assert "run-01-selected-skips: 1" in (out_dir / "verdict.txt").read_text(encoding="utf-8")
     assert (out_dir / "run-01.log").exists()
+
+
+def test_nonzero_gate_with_unknown_skip_is_recorded(tmp_path: Path) -> None:
+    completed, out_dir = _run_soak(tmp_path, plan=[f"{_HASH_A}|2|unknown"], repetitions=1)
+    assert completed.returncode != 0
+    assert "containment_gate_rate=0/1" in completed.stdout
+    assert "run-01-selected-skips: unknown" in (out_dir / "verdict.txt").read_text(encoding="utf-8")
+    assert "selected-skips: unknown" in (out_dir / "run-01.log").read_text(encoding="utf-8")
 
 
 def test_zero_gate_exit_without_staged_hash_is_not_a_pass(tmp_path: Path) -> None:

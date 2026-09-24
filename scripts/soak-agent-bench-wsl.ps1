@@ -20,7 +20,7 @@ Set-StrictMode -Version Latest
 
 $HASH_PATTERN = 'staged-tree-sha256:\s*([0-9a-f]{64})'
 $SWITCHBOARD_HASH_PATTERN = 'staged-switchboard-sha256:\s*([0-9a-f]{64})'
-$SKIP_PATTERN = '(?m)^selected-skips:\s*(\d+)\s*$'
+$SKIP_PATTERN = '(?m)^selected-skips:\s*(\d+|unknown)\s*$'
 $STEP63_PREREG = "The reviewed containment repair will pass 8/8 independent WSL-ext4 gate invocations with zero selected skips and no live-identity or retained-FD escape; any lower pass rate returns the work to Step 62 and blocks Step 27."
 $PRODUCER_VERSION = "step62-soak-v5"
 
@@ -117,13 +117,18 @@ function Read-HeaderValue {
     if (-not (Test-Path -LiteralPath $Path)) {
         return $null
     }
+    $found = $false
+    $value = $null
     foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
         $match = [regex]::Match($line, ('^' + [regex]::Escape($Key) + ':\s*(.*)$'))
         if ($match.Success) {
-            return $match.Groups[1].Value
+            if ($found) { throw "duplicate receipt field '$Key' in $Path" }
+            $found = $true
+            $value = $match.Groups[1].Value
         }
     }
-    return $null
+    if (-not $found) { throw "missing receipt field '$Key' in $Path" }
+    return $value
 }
 
 function Get-RunLogPaths {
@@ -217,6 +222,8 @@ if ($VerifyOnly) {
 
     $headerPrereg = Read-HeaderValue -Path $headerPath -Key "preregistration"
     $headerReps = Read-HeaderValue -Path $headerPath -Key "repetitions"
+    $null = Read-HeaderValue -Path $headerPath -Key "distribution"
+    $null = Read-HeaderValue -Path $headerPath -Key "started-utc"
     $verdictValue = Read-HeaderValue -Path $verdictPath -Key "verdict"
     $verdictReps = Read-HeaderValue -Path $verdictPath -Key "repetitions"
     $verdictHash = Read-HeaderValue -Path $verdictPath -Key "staged-tree-sha256"
@@ -432,6 +439,7 @@ for ($index = 1; $index -le $Repetitions; $index++) {
         $stderrText = [System.IO.File]::ReadAllText($stderrPath)
     }
     $skipCount = Get-SelectedSkipCount -Text $stdoutText
+    if ($skipCount -eq "") { $skipCount = "unknown" }
     $combined = "=== run $index exit $exitCode ===`nrun-started-utc: $runStart`nrun-finished-utc: $runFinish`nrun-selected-skips: $skipCount`n=== stdout ===`n$stdoutText`n=== stderr ===`n$stderrText`n"
     [System.IO.File]::WriteAllText($logPath, $combined)
     foreach ($temp in @($stdoutPath, $stderrPath)) {
@@ -441,13 +449,16 @@ for ($index = 1; $index -le $Repetitions; $index++) {
     }
 
     $exitCodes += $exitCode
-    $hashes += (Get-StagedTreeHash -Text $stdoutText -Pattern $HASH_PATTERN)
-    $switchboardHashes += (Get-StagedTreeHash -Text $stdoutText -Pattern $SWITCHBOARD_HASH_PATTERN)
+    $runHash = Get-StagedTreeHash -Text $stdoutText -Pattern $HASH_PATTERN
+    $runSwitchboardHash = Get-StagedTreeHash -Text $stdoutText -Pattern $SWITCHBOARD_HASH_PATTERN
+    $hashes += $runHash
+    $switchboardHashes += $runSwitchboardHash
     $skips += $skipCount
     $starts += $runStart
     $finishes += $runFinish
     $logHashes += (Get-FileSha256 -Path $logPath)
-    if ($exitCode -eq 0 -and $skipCount -eq "0") {
+    if ($exitCode -eq 0 -and $skipCount -eq "0" -and
+        $runHash -eq $sourceTreeHash -and $runSwitchboardHash -eq $switchboardHash) {
         $passCount += 1
     }
     Write-Output "run $index exit $exitCode"

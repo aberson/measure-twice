@@ -167,11 +167,23 @@ set +e
 uv run pytest -q -m linux_isolation --junitxml="$junit_report"
 pytest_status=$?
 set -e
+skipped=unknown
+if [ -f "$junit_report" ]; then
+    if parsed_skips=$(junit_skip_count "$junit_report"); then
+        case "$parsed_skips" in
+            ''|*[!0-9]*) ;;
+            *) skipped=$parsed_skips ;;
+        esac
+    fi
+fi
+printf 'selected-skips: %s\n' "$skipped"
 if [ "$pytest_status" -ne 0 ]; then
     exit "$pytest_status"
 fi
-skipped=$(junit_skip_count "$junit_report")
-printf 'selected-skips: %s\n' "$skipped"
+if [ "$skipped" = unknown ]; then
+    printf 'Linux isolation JUnit skip count is unavailable\n' >&2
+    exit 2
+fi
 if [ "$skipped" -ne 0 ]; then
     printf 'Linux isolation gate selected %s skipped test(s); skips are forbidden\n' "$skipped" >&2
     exit 3
