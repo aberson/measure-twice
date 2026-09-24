@@ -34,7 +34,8 @@ from measure_twice.config import ENV_VAR, RunConfig
 from measure_twice.report import (
     LEGACY_UNSEALED,
     NOT_ROUTING_ELIGIBLE,
-    ROUTING_ELIGIBLE,
+    PRELIMINARY_SEAL_IDENTITY_OK,
+    UNVERIFIED_LEGACY,
     ReportError,
     build_comparison,
     build_run_report,
@@ -481,7 +482,8 @@ def test_report_surfaces_execution_receipt_and_identity(tmp_path: Path) -> None:
     assert haiku.requested_model == "haiku"
     assert haiku.resolved_identities == ("claude-x",)  # the stub's concrete provider identity
     assert haiku.identity_unresolved is False
-    assert haiku.routing_eligible is True
+    assert haiku.routing_eligible is None
+    assert haiku.eligibility == PRELIMINARY_SEAL_IDENTITY_OK
     assert haiku.suite_score == 100.0  # official score is untouched by the seal evidence
 
     md = render_run_report(report)
@@ -492,7 +494,7 @@ def test_report_surfaces_execution_receipt_and_identity(tmp_path: Path) -> None:
         report.execution.receipt_sha256,
         "claude-cli",
         "claude-x",
-        ROUTING_ELIGIBLE,
+        PRELIMINARY_SEAL_IDENTITY_OK,
         "Execution receipt",
     ):
         assert token in md
@@ -518,6 +520,9 @@ def test_report_legacy_run_marked_unsealed_without_changing_scores(tmp_path: Pat
     haiku = {m.model: m for m in report.models}["haiku"]
     assert haiku.provider is None
     assert haiku.requested_model is None
+    assert haiku.stored_identities == ("claude-x",)
+    assert haiku.resolved_identities == ()
+    assert haiku.identity_provenance == UNVERIFIED_LEGACY
     assert haiku.routing_eligible is False
     assert haiku.eligibility == NOT_ROUTING_ELIGIBLE
     # The official score is identical to the sealed reading.
@@ -550,6 +555,44 @@ def test_report_unresolved_identity_marked_distinctly(tmp_path: Path) -> None:
     assert NOT_ROUTING_ELIGIBLE in md
 
 
+def test_mixed_identity_set_is_ineligible_and_markdown_escapes_provider_text(
+    tmp_path: Path,
+) -> None:
+    suite = _verdict_suite()
+    result = _run_scored(suite, out_dir=tmp_path, roster=["haiku"])
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["model_id_resolved"] = "claude|<script>\nprobe"
+    rows[1]["model_id_resolved"] = UNRESOLVED_MODEL_ID
+    rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    report = build_run_report(result.run_id, tmp_path)
+    haiku = report.models[0]
+    assert haiku.resolved_identities == (UNRESOLVED_MODEL_ID, "claude|<script>\nprobe")
+    assert haiku.identity_unresolved is True
+    assert haiku.routing_eligible is False
+    md = render_run_report(report)
+    assert "claude\\|&lt;script&gt;<br>probe" in md
+    assert "<script>" not in md
+    assert NOT_ROUTING_ELIGIBLE in md
+
+
+def test_legacy_requested_alias_fallback_is_explicitly_unverified(tmp_path: Path) -> None:
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
+    _strip_execution_receipt(tmp_path, result.run_id)
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["model_id_resolved"] = "haiku"  # historical fallback from the requested alias
+    rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    model = build_run_report(result.run_id, tmp_path).models[0]
+    assert model.stored_identities == ("haiku",)
+    assert model.resolved_identities == ()
+    assert model.identity_provenance == UNVERIFIED_LEGACY
+    assert model.identity_unresolved is True
+    assert model.routing_eligible is False
+
+
 def test_jsonl_export_carries_execution_and_identity(tmp_path: Path) -> None:
     """Per-model JSONL carries additive seal and identity fields."""
     suite = _verdict_suite()
@@ -565,7 +608,8 @@ def test_jsonl_export_carries_execution_and_identity(tmp_path: Path) -> None:
     assert sealed_line["requested_model"] == "haiku"
     assert sealed_line["resolved_identities"] == ["claude-x"]
     assert sealed_line["identity_unresolved"] is False
-    assert sealed_line["routing_eligible"] is True
+    assert sealed_line["routing_eligible"] is None
+    assert sealed_line["eligibility"] == PRELIMINARY_SEAL_IDENTITY_OK
     assert len(sealed_line["receipt_sha256"]) == 64
 
     _strip_execution_receipt(tmp_path, result.run_id)
@@ -574,4 +618,7 @@ def test_jsonl_export_carries_execution_and_identity(tmp_path: Path) -> None:
     assert legacy_line["provider"] is None
     assert legacy_line["receipt_sha256"] is None
     assert legacy_line["routing_eligible"] is False
+    assert legacy_line["stored_identities"] == ["claude-x"]
+    assert legacy_line["resolved_identities"] == []
+    assert legacy_line["identity_provenance"] == UNVERIFIED_LEGACY
     assert legacy_line["suite_score"] == sealed_line["suite_score"]  # score never changed

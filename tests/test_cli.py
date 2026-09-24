@@ -16,6 +16,7 @@ from test_report import (
 
 from measure_twice.adapters.base import UNRESOLVED_MODEL_ID
 from measure_twice.cli import main
+from measure_twice.model_sweep_execution import canonical_sha256
 from measure_twice.report import LEGACY_UNSEALED, NOT_ROUTING_ELIGIBLE
 
 
@@ -48,11 +49,12 @@ def test_report_execution_identity_entry_points(
     record = json.loads(capsys.readouterr().out)
     assert record["suite_score"] == 100.0
     assert record["seal_status"] == (LEGACY_UNSEALED if state == "legacy" else "prompt-only-v1")
-    assert record["routing_eligible"] is (state == "sealed")
+    assert record["routing_eligible"] is (None if state == "sealed" else False)
     if state == "sealed":
         assert record["provider"] == "claude-cli"
         assert record["requested_model"] == "haiku"
         assert record["resolved_identities"] == ["claude-x"]
+        assert record["eligibility"] == "PRELIMINARY_SEAL_IDENTITY_OK"
         assert len(record["receipt_sha256"]) == 64
     elif state == "unresolved":
         assert record["resolved_identities"] == [UNRESOLVED_MODEL_ID]
@@ -60,6 +62,9 @@ def test_report_execution_identity_entry_points(
         assert UNRESOLVED_MODEL_ID in md
     else:
         assert record["provider"] is None
+        assert record["stored_identities"] == ["claude-x"]
+        assert record["resolved_identities"] == []
+        assert record["identity_provenance"] == "UNVERIFIED_LEGACY"
         assert record["receipt_sha256"] is None
         assert LEGACY_UNSEALED in md
 
@@ -72,3 +77,51 @@ def test_report_execution_identity_entry_points(
         assert "claude-x" in html
     elif state == "unresolved":
         assert UNRESOLVED_MODEL_ID in html
+
+
+def test_report_compare_enforces_execution_and_shows_per_run_evidence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "data"
+    suite = _verdict_suite()
+    first = _run_scored(suite, out_dir=out, roster=["haiku"])
+    second = _run_scored(suite, out_dir=out, roster=["haiku"])
+    command = ["report", first.run_id, "--compare", second.run_id, "--out", str(out)]
+
+    assert main(command) == 0
+    compared = capsys.readouterr().out
+    assert compared.count("## Execution receipt & identity") == 2
+    assert compared.count("| haiku | claude-cli | haiku | claude-x |") == 2
+    assert compared.count("- **Receipt hash:**") == 2
+    assert "PRELIMINARY_SEAL_IDENTITY_OK" in compared
+
+    manifest_path = out / "runs" / second.run_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    receipt = manifest["execution_receipt"]
+    receipt["claude_cli"]["version"] = "different-claude-version"
+    receipt["receipt_sha256"] = canonical_sha256(
+        {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert main(command) == 1
+    assert "different receipt_sha256" in capsys.readouterr().err
+
+    receipt["claude_cli"]["version"] = "test-claude 1.0"
+    receipt["context_profile_sha256"] = "0" * 64
+    receipt["receipt_sha256"] = canonical_sha256(
+        {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert main(command) == 1
+    assert "different context_profile_sha256" in capsys.readouterr().err
+
+    _strip_execution_receipt(out, second.run_id)
+    assert main(command) == 1
+    assert "sealed and legacy-unsealed" in capsys.readouterr().err
+
+    _strip_execution_receipt(out, first.run_id)
+    assert main(command) == 0
+    legacy_comparison = capsys.readouterr().out
+    assert legacy_comparison.count("LEGACY_UNSEALED") >= 2
+    assert legacy_comparison.count("UNVERIFIED_LEGACY") >= 2
+    assert "NOT_ROUTING_ELIGIBLE" in legacy_comparison

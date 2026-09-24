@@ -331,8 +331,8 @@ def _handle_report(args: argparse.Namespace) -> int:
 
     Without ``--compare``: the per-run markdown report (or per-model JSONL with ``--jsonl``). With
     ``--compare``: the cross-run comparison table over the given runs, which FAILS LOUD (non-zero
-    exit) if their suite hashes differ — a changed hash is a different instrument (plan §3), never a
-    silent cross-instrument comparison. Prints the rendering to stdout AND writes it under
+    exit) if their suite or execution hashes differ. Prints the rendering to stdout and writes it
+    under
     ``<out>/reports/`` (plan §7); a :class:`ReportError` surfaces as a clean non-zero exit.
     """
     out_dir = Path(args.out)
@@ -669,8 +669,7 @@ def _build_parser(
         help="render a per-run markdown report, or a cross-run comparison (--compare)",
         description="Render a stored run's per-model report (0-100 suite score + item/no-response/"
         "parse-fail/error counts), or a cross-run comparison table with --compare. Cross-run "
-        "comparison requires EQUAL suite hashes (a changed hash is a different instrument); a "
-        "mismatch fails loud.",
+        "comparison requires equal suite and execution hashes; a mismatch fails loud.",
     )
     report_parser.add_argument("run_id", metavar="<run_id>", help="the run id to report on")
     report_parser.add_argument(

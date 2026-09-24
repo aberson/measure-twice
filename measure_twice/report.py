@@ -16,11 +16,9 @@ Deferred (plan §3, not Step 7): the "latest-per-(suite_hash, model) by manifest
 (``--compare``), which the Step-7 done-when needs; latest-per resolution is more natural once
 Phase C has accumulated many runs.
 
-Cross-run comparison (``mt report --compare``) compares runs BY EQUAL SUITE HASH only (plan §3: "a
-changed hash = a different instrument; cross-run comparisons require equal hashes"). Comparing runs
-with mismatched ``suite_hash`` is a fail-loud :class:`ReportError` naming the mismatch — never a
-silent comparison across two different instruments (``measurement-validity.md`` § match measurement
-scope to decision scope).
+Cross-run comparison (``mt report --compare``) requires equal suite and execution/receipt hashes.
+Legacy and sealed runs cannot be compared. Each allowed comparison prints the execution and
+identity evidence for every run beside the unchanged official scores.
 
 Run-store access reuses the runner's OWN readers (``_resolve_run_dir`` traversal guard,
 ``_read_manifest``, ``_read_rows`` torn-line tolerance) so the run-store layout has ONE owner
@@ -36,6 +34,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from html import escape as html_escape
 from pathlib import Path
 from typing import Final
 
@@ -47,8 +46,9 @@ from measure_twice.scoring.deterministic import PARSE_FAIL_MARKER, suite_score
 __all__ = [
     "LEGACY_UNSEALED",
     "NOT_ROUTING_ELIGIBLE",
-    "ROUTING_ELIGIBLE",
+    "PRELIMINARY_SEAL_IDENTITY_OK",
     "UNRESOLVED_IDENTITY",
+    "UNVERIFIED_LEGACY",
     "ComparisonReport",
     "ExecutionEvidence",
     "ModelReport",
@@ -69,8 +69,9 @@ __all__ = [
 # additive report annotations; Step 59 owns the constant-control routing verdict, this step only
 # gates on the seal and on identity evidence.
 LEGACY_UNSEALED: Final[str] = "LEGACY_UNSEALED"
-ROUTING_ELIGIBLE: Final[str] = "ROUTING_ELIGIBLE"
+PRELIMINARY_SEAL_IDENTITY_OK: Final[str] = "PRELIMINARY_SEAL_IDENTITY_OK"
 NOT_ROUTING_ELIGIBLE: Final[str] = "NOT_ROUTING_ELIGIBLE"
+UNVERIFIED_LEGACY: Final[str] = "UNVERIFIED_LEGACY"
 UNRESOLVED_IDENTITY: Final[str] = UNRESOLVED_MODEL_ID
 
 
@@ -126,13 +127,11 @@ class ModelReport:
     ``n_no_response`` / ``n_parse_fail`` / ``n_error`` are the first-class signal counts.
 
     Identity/seal evidence (plan §6.3/§6.4, additive — the score is never changed): ``provider`` and
-    ``requested_model`` come from the run's execution receipt (``None`` on a legacy run or an alias
-    absent from the receipt); ``resolved_identities`` is the sorted set of concrete
-    provider-returned ids observed in the rows, with :data:`UNRESOLVED_IDENTITY` listed distinctly
-    when a row carried no concrete identity. ``identity_unresolved`` is ``True`` when ANY observed
-    identity is unresolved or none is concrete. ``routing_eligible`` is ``False`` for a legacy run,
-    for an alias missing from the receipt, or for an unresolved identity — this step's coarse seal
-    gate, NOT the Step-59 constant-control eligibility verdict.
+    ``requested_model`` come from the receipt. ``stored_identities`` preserves row values, while
+    ``resolved_identities`` contains only identities backed by a sealed, bound provider. Historical
+    rows may hold requested-alias fallbacks and are marked ``UNVERIFIED_LEGACY``. A sealed arm with
+    complete identity evidence receives only a preliminary status. Step 59 owns positive routing
+    eligibility after calibration controls.
     """
 
     model: str
@@ -145,14 +144,18 @@ class ModelReport:
     n_error: int
     provider: str | None
     requested_model: str | None
+    stored_identities: tuple[str, ...]
     resolved_identities: tuple[str, ...]
+    identity_provenance: str
     identity_unresolved: bool
-    routing_eligible: bool
+    routing_eligible: bool | None
 
     @property
     def eligibility(self) -> str:
-        """The rendered routing-eligibility label for this arm."""
-        return ROUTING_ELIGIBLE if self.routing_eligible else NOT_ROUTING_ELIGIBLE
+        """The preliminary status; only Step 59 can assign positive routing eligibility."""
+        return (
+            PRELIMINARY_SEAL_IDENTITY_OK if self.routing_eligible is None else NOT_ROUTING_ELIGIBLE
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,11 +199,11 @@ class RunReport:
 
 @dataclass(frozen=True, slots=True)
 class ComparisonReport:
-    """A cross-run comparison over runs sharing ONE ``suite_hash`` (fail-loud on any mismatch).
+    """A cross-run comparison over runs sharing suite and execution hashes.
 
     ``runs`` are the per-run reports in the caller's order (primary first); ``models`` is the sorted
     union of every model that appears in any run — so the rendered table is deterministic regardless
-    of per-run roster order. ``suite_hash`` is the single shared instrument identity.
+    of per-run roster order.
     """
 
     suite: str
@@ -292,15 +295,26 @@ def _model_report(
     computed exactly as before and is never touched by any of this.
     """
     scores = [row.score for row in rows if row.score is not None]
-    resolved = sorted({row.model_id_resolved or UNRESOLVED_IDENTITY for row in rows})
+    binding = execution.binding_for(model) if execution is not None else None
+    stored = sorted({row.model_id_resolved or UNRESOLVED_IDENTITY for row in rows})
+    resolved = stored if binding is not None else []
     concrete = [value for value in resolved if value != UNRESOLVED_IDENTITY]
     identity_unresolved = (UNRESOLVED_IDENTITY in resolved) or not concrete
-    binding = execution.binding_for(model) if execution is not None else None
     provider = None if binding is None else binding[0]
     requested_model = None if binding is None else binding[1]
-    # Coarse seal gate ONLY (Step 59 owns the constant-control verdict): a legacy run, an alias the
-    # receipt never bound, or an unresolved identity is not routing-eligible.
-    routing_eligible = execution is not None and binding is not None and not identity_unresolved
+    preliminary = execution is not None and binding is not None and not identity_unresolved
+    routing_eligible: bool | None = None if preliminary else False
+    identity_provenance = (
+        UNVERIFIED_LEGACY
+        if execution is None
+        else (
+            "UNBOUND_RECEIPT_IDENTITY"
+            if binding is None
+            else (
+                "PROVIDER_CONFIRMED" if not identity_unresolved else "PROVIDER_IDENTITY_UNRESOLVED"
+            )
+        )
+    )
     return ModelReport(
         model=model,
         n_cells=len(rows),
@@ -311,7 +325,9 @@ def _model_report(
         suite_score=suite_score(scores) if scores else None,
         provider=provider,
         requested_model=requested_model,
+        stored_identities=tuple(stored),
         resolved_identities=tuple(resolved),
+        identity_provenance=identity_provenance,
         identity_unresolved=identity_unresolved,
         routing_eligible=routing_eligible,
         n_no_response=sum(1 for row in rows if row.scorer == NO_RESPONSE_SCORER),
@@ -365,14 +381,7 @@ def build_run_report(run_id: str, out_dir: str | Path = "data") -> RunReport:
 
 
 def build_comparison(run_ids: Sequence[str], out_dir: str | Path = "data") -> ComparisonReport:
-    """Build a cross-run comparison over ``run_ids`` — FAIL LOUD if their ``suite_hash`` differ.
-
-    Every run must measure the SAME instrument: a differing ``suite_hash`` means a different suite
-    content (plan §3), so comparing scores across them is comparing apples to oranges — it raises
-    :class:`ReportError` naming the first mismatching run and both hashes rather than silently
-    tabulating across instruments. The models axis is the sorted union across runs, so the table is
-    deterministic regardless of per-run roster order.
-    """
+    """Compare runs with equal suite and execution receipts; reject every mismatch."""
     if not run_ids:
         raise ReportError("build_comparison requires at least one run id")
     reports = [build_run_report(run_id, out_dir) for run_id in run_ids]
@@ -384,6 +393,24 @@ def build_comparison(run_ids: Sequence[str], out_dir: str | Path = "data") -> Co
                 f"{base.run_id} has {base.suite_hash} but {report.run_id} has {report.suite_hash}; "
                 "a changed suite hash is a DIFFERENT instrument (plan §3)"
             )
+        base_receipt = base.execution
+        other_receipt = report.execution
+        if (base_receipt is None) != (other_receipt is None):
+            raise ReportError(
+                f"cannot compare sealed and legacy-unsealed runs: {base.run_id} vs {report.run_id}"
+            )
+        if base_receipt is not None and other_receipt is not None:
+            for field in (
+                "execution_profile_sha256",
+                "provider_profile_sha256",
+                "context_profile_sha256",
+                "receipt_sha256",
+            ):
+                if getattr(base_receipt, field) != getattr(other_receipt, field):
+                    raise ReportError(
+                        f"cannot compare runs with different {field}: "
+                        f"{base.run_id} vs {report.run_id}"
+                    )
     models = sorted({m.model for report in reports for m in report.models})
     return ComparisonReport(
         suite=base.suite, suite_hash=base.suite_hash, runs=reports, models=models
@@ -399,8 +426,21 @@ def _fmt_score(score: float | None) -> str:
 
 
 def _fmt_resolved(model: ModelReport) -> str:
-    """The observed resolved-identity set for a table cell (or ``(none)`` if empty)."""
-    return ", ".join(model.resolved_identities) if model.resolved_identities else "(none)"
+    """Show row identity values with their provenance, escaping untrusted Markdown text."""
+    values = model.resolved_identities or model.stored_identities
+    return ", ".join(_md_cell(value) for value in values) if values else "(none)"
+
+
+def _md_cell(value: str) -> str:
+    """Escape arbitrary provider text in a Markdown table cell."""
+    return (
+        html_escape(value, quote=True)
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("`", "\\`")
+        .replace("\r", " ")
+        .replace("\n", "<br>")
+    )
 
 
 def _execution_lines(report: RunReport) -> list[str]:
@@ -427,18 +467,19 @@ def _execution_lines(report: RunReport) -> list[str]:
             f"- **Context-profile hash:** `{evidence.context_profile_sha256}`",
             f"- **Receipt hash:** `{evidence.receipt_sha256}`",
             f"- **Claude CLI:** {cli}",
+            "- **Routing:** preliminary seal and identity evidence only; "
+            "Step 59 must assess validity.",
             "",
         ]
     lines += [
-        "| Model | Provider | Requested | Resolved identity | Identity | Routing |",
+        "| Model | Provider | Requested | Stored identity | Provenance | Status |",
         "|---|---|---|---|---|---|",
     ]
     for model in report.models:
-        identity = UNRESOLVED_IDENTITY if model.identity_unresolved else "resolved"
         lines.append(
-            f"| {model.model} | {model.provider or '(legacy)'} | "
-            f"{model.requested_model or '(legacy)'} | {_fmt_resolved(model)} | "
-            f"{identity} | {model.eligibility} |"
+            f"| {_md_cell(model.model)} | {_md_cell(model.provider or '(legacy)')} | "
+            f"{_md_cell(model.requested_model or '(legacy)')} | {_fmt_resolved(model)} | "
+            f"{model.identity_provenance} | {model.eligibility} |"
         )
     lines.append("")
     return lines
@@ -490,7 +531,7 @@ def render_comparison(comparison: ComparisonReport) -> str:
         "# measure-twice cross-run comparison",
         "",
         f"- **Suite:** {comparison.suite} (`{comparison.suite_hash}`)",
-        f"- **Runs compared:** {len(comparison.runs)} (equal suite hash)",
+        f"- **Runs compared:** {len(comparison.runs)} (equal suite and execution hashes)",
         "",
         header,
         divider,
@@ -502,6 +543,9 @@ def render_comparison(comparison: ComparisonReport) -> str:
         ]
         lines.append(f"| {model} | " + " | ".join(cells) + " |")
     lines.append("")
+    for run in comparison.runs:
+        lines += [f"## Run {run.run_id}", "", f"- **Seal:** `{run.seal_status}`", ""]
+        lines += _execution_lines(run)
     return "\n".join(lines)
 
 
@@ -533,7 +577,9 @@ def run_report_jsonl(report: RunReport) -> str:
                 "seal_status": report.seal_status,
                 "provider": model.provider,
                 "requested_model": model.requested_model,
+                "stored_identities": list(model.stored_identities),
                 "resolved_identities": list(model.resolved_identities),
+                "identity_provenance": model.identity_provenance,
                 "identity_unresolved": model.identity_unresolved,
                 "routing_eligible": model.routing_eligible,
                 "eligibility": model.eligibility,

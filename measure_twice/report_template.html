@@ -144,6 +144,7 @@
   }
   .p-ok { background:var(--ok-bg); color:var(--ok); border-color:var(--ok-line) }
   .p-miss { background:var(--miss-bg); color:var(--miss); border-color:var(--miss-line) }
+  .p-prelim { background:var(--surface-2); color:var(--ink-2); border-color:var(--rule) }
   .p-refuse { background:var(--refuse-bg); color:var(--refuse); border-color:var(--refuse-line) }
   .p-silent { background:var(--silent-bg); color:var(--silent); border-color:var(--silent-line) }
 
@@ -429,7 +430,7 @@
       note.innerHTML = "<p>Sealed under <strong>" + esc(X.seal_status) + "</strong> "
         + "(profile <span class='mono'>" + esc(X.profile_id) + "</span>). Official scores are the "
         + "same values the scorer produced; the seal adds identity evidence, it does not change "
-        + "them.</p>";
+        + "them. Routing eligibility requires the Step 59 validity checks.</p>";
     }
     var rows = [];
     if (X.sealed) {
@@ -454,16 +455,15 @@
       ex.appendChild(c);
     });
     var h = '<thead><tr><th>Model</th><th>Provider</th><th>Requested</th>'
-      + '<th>Resolved identity</th><th>Identity</th><th>Routing</th></tr></thead><tbody>';
+      + '<th>Stored identity</th><th>Provenance</th><th>Status</th></tr></thead><tbody>';
     X.arms.forEach(function(a){
-      var resolved = a.resolved_identities.length ? a.resolved_identities.join(", ") : "(none)";
-      var ident = a.identity_unresolved ? X.unresolved_identity : "resolved";
-      var cls = a.routing_eligible ? "p-ok" : "p-miss";
+      var stored = a.stored_identities.length ? a.stored_identities.join(", ") : "(none)";
+      var cls = a.routing_eligible === false ? "p-miss" : "p-prelim";
       h += '<tr><td class="mono">' + esc(a.model) + '</td>'
         + '<td class="mono">' + esc(a.provider == null ? "(legacy)" : a.provider) + '</td>'
         + '<td class="mono">' + esc(a.requested_model == null ? "(legacy)" : a.requested_model) + '</td>'
-        + '<td class="mono">' + esc(resolved) + '</td>'
-        + '<td class="mono">' + esc(ident) + '</td>'
+        + '<td class="mono">' + esc(stored) + '</td>'
+        + '<td class="mono">' + esc(a.identity_provenance) + '</td>'
         + '<td><span class="pill ' + cls + '">' + esc(a.eligibility) + '</span></td></tr>';
     });
     document.getElementById("identtbl").innerHTML = h + '</tbody>';

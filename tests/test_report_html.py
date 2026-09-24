@@ -461,7 +461,11 @@ def test_html_surfaces_execution_seal_and_identity(tmp_path: Path) -> None:
     assert haiku["provider"] == "claude-cli"
     assert haiku["requested_model"] == "haiku"
     assert haiku["resolved_identities"] == ["claude-x"]
-    assert haiku["routing_eligible"] is True
+    assert haiku["routing_eligible"] is None
+    assert haiku["eligibility"] == "PRELIMINARY_SEAL_IDENTITY_OK"
+    assert "<th>Stored identity</th><th>Provenance</th><th>Status</th>" in html
+    assert "esc(stored)" in html
+    assert "esc(a.identity_provenance)" in html
     # The receipt hashes are literally present in the rendered page, not only in the island.
     assert report.execution.receipt_sha256 in html
 
@@ -479,6 +483,10 @@ def test_html_legacy_run_marked_unsealed(tmp_path: Path) -> None:
     assert execution["receipt_sha256"] is None
     haiku = next(a for a in execution["arms"] if a["model"] == "haiku")
     assert haiku["provider"] is None
+    assert haiku["stored_identities"] == ["claude-x"]
+    assert haiku["resolved_identities"] == []
+    assert haiku["identity_provenance"] == "UNVERIFIED_LEGACY"
+    assert "<th>Stored identity</th><th>Provenance</th><th>Status</th>" in html
     assert haiku["routing_eligible"] is False
     assert LEGACY_UNSEALED in html
     assert NOT_ROUTING_ELIGIBLE in html
@@ -503,3 +511,19 @@ def test_html_unresolved_identity_marked(tmp_path: Path) -> None:
     assert UNRESOLVED_MODEL_ID in haiku["resolved_identities"]
     assert haiku["routing_eligible"] is False
     assert UNRESOLVED_MODEL_ID in html
+
+
+def test_html_mixed_identity_set_is_visible_and_negative(tmp_path: Path) -> None:
+    result = _sweep(_taxonomy_suite(), out_dir=tmp_path)
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    next(row for row in rows if row["model"] == "haiku")["model_id_resolved"] = UNRESOLVED_MODEL_ID
+    rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    html = render_transparency_report(build_transparency_report(result.run_id, tmp_path))
+    arm = next(a for a in _island(html)["execution"]["arms"] if a["model"] == "haiku")
+    assert arm["resolved_identities"] == [UNRESOLVED_MODEL_ID, "claude-x"]
+    assert arm["stored_identities"] == [UNRESOLVED_MODEL_ID, "claude-x"]
+    assert arm["identity_provenance"] == "PROVIDER_IDENTITY_UNRESOLVED"
+    assert arm["routing_eligible"] is False
+    assert arm["eligibility"] == NOT_ROUTING_ELIGIBLE
+    assert "<th>Stored identity</th><th>Provenance</th><th>Status</th>" in html
