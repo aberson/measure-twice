@@ -205,6 +205,19 @@ def test_verify_only_rejects_forged_pass_with_a_failed_run(tmp_path: Path) -> No
     assert "nonzero gate exit" in verify.stderr.lower()
 
 
+def test_verify_only_rejects_ambiguous_staged_hash(tmp_path: Path) -> None:
+    plan = [f"{_HASH_A}|0"]
+    completed, out_dir = _run_soak(tmp_path, plan=plan, repetitions=1)
+    assert completed.returncode == 0, completed.stderr
+    log_path = out_dir / "run-01.log"
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(f"staged-tree-sha256: {_HASH_B}\n")
+
+    verify, _ = _run_soak(tmp_path, plan=plan, repetitions=1, out=out_dir, verify_only=True)
+    assert verify.returncode != 0
+    assert "exactly one staged-tree hash" in verify.stderr.lower()
+
+
 def test_soak_preserves_existing_evidence_and_quotes_gate_path(tmp_path: Path) -> None:
     spaced = tmp_path / "gate path with spaces"
     spaced.mkdir()

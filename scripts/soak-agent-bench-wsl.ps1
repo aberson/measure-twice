@@ -23,9 +23,9 @@ $HASH_PATTERN = 'staged-tree-sha256:\s*([0-9a-f]{64})'
 function Get-StagedTreeHash {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
 
-    $match = [regex]::Match($Text, $HASH_PATTERN)
-    if ($match.Success) {
-        return $match.Groups[1].Value
+    $first = [regex]::Match($Text, $HASH_PATTERN)
+    if ($first.Success -and -not $first.NextMatch().Success) {
+        return $first.Groups[1].Value
     }
     return ""
 }
@@ -140,11 +140,15 @@ if ($VerifyOnly) {
         $failures += "verdict staged-tree hash is absent or malformed"
     }
 
-    $logs = Get-RunLogPaths -Directory $Out
+    $logs = @(Get-RunLogPaths -Directory $Out)
     $expectedCount = 0
     if ([int]::TryParse($verdictReps, [ref]$expectedCount) -and $expectedCount -gt 0) {
         if ($logs.Count -ne $expectedCount) {
             $failures += "expected $expectedCount run logs but found $($logs.Count)"
+        }
+        if ($expectedCount -ne $Repetitions) {
+            $failures += "verdict repetitions ($expectedCount) do not match the requested $Repetitions"
+            $expectedCount = 0
         }
     }
     else {
@@ -160,7 +164,7 @@ if ($VerifyOnly) {
         $logText = [System.IO.File]::ReadAllText($log)
         $logHash = Get-StagedTreeHash -Text $logText
         if ($logHash -eq "") {
-            $failures += "run log carries no staged-tree hash: $log"
+            $failures += "run log must carry exactly one staged-tree hash: $log"
         }
         elseif ($verdictHash -match '^[0-9a-f]{64}$' -and $logHash -ne $verdictHash) {
             $failures += "run log staged-tree hash drifted from the verdict (stale): $log"
