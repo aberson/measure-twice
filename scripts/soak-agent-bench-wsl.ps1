@@ -19,14 +19,18 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $HASH_PATTERN = 'staged-tree-sha256:\s*([0-9a-f]{64})'
+$SWITCHBOARD_HASH_PATTERN = 'staged-switchboard-sha256:\s*([0-9a-f]{64})'
 $SKIP_PATTERN = '(?m)^selected-skips:\s*(\d+)\s*$'
 $STEP63_PREREG = "The reviewed containment repair will pass 8/8 independent WSL-ext4 gate invocations with zero selected skips and no live-identity or retained-FD escape; any lower pass rate returns the work to Step 62 and blocks Step 27."
-$PRODUCER_VERSION = "step62-soak-v4"
+$PRODUCER_VERSION = "step62-soak-v5"
 
 function Get-StagedTreeHash {
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Pattern
+    )
 
-    $first = [regex]::Match($Text, $HASH_PATTERN)
+    $first = [regex]::Match($Text, $Pattern)
     if ($first.Success -and -not $first.NextMatch().Success) {
         return $first.Groups[1].Value
     }
@@ -180,7 +184,7 @@ $gateHash = Get-FileSha256 -Path $GateScript
 $sourceTreeHash = Get-GateSourceSha256 -Root $projectRoot -ExcludeFindings
 $switchboardHash = if ($production) {
     Get-GateSourceSha256 -Root (Join-Path (Split-Path -Parent $projectRoot) "switchboard")
-} else { "fixture" }
+} else { $sourceTreeHash }
 $expectedPrereg = if ($production) { $STEP63_PREREG } else { $Preregister }
 
 if ([string]::IsNullOrWhiteSpace($Out)) {
@@ -216,6 +220,7 @@ if ($VerifyOnly) {
     $verdictValue = Read-HeaderValue -Path $verdictPath -Key "verdict"
     $verdictReps = Read-HeaderValue -Path $verdictPath -Key "repetitions"
     $verdictHash = Read-HeaderValue -Path $verdictPath -Key "staged-tree-sha256"
+    $verdictSwitchboardHash = Read-HeaderValue -Path $verdictPath -Key "staged-switchboard-sha256"
 
     if ([string]::IsNullOrWhiteSpace($headerPrereg)) {
         $failures += "preregistration sentence is absent from the evidence header"
@@ -256,6 +261,12 @@ if ($VerifyOnly) {
     if ($verdictHash -notmatch '^[0-9a-f]{64}$') {
         $failures += "verdict staged-tree hash is absent or malformed"
     }
+    if ($verdictSwitchboardHash -notmatch '^[0-9a-f]{64}$') {
+        $failures += "verdict staged-switchboard hash is absent or malformed"
+    }
+    if ($verdictHash -ne $sourceTreeHash -or $verdictSwitchboardHash -ne $switchboardHash) {
+        $failures += "verdict staged source hashes differ from preregistered fingerprints"
+    }
 
     $logs = @(Get-RunLogPaths -Directory $Out)
     $expectedCount = 0
@@ -283,12 +294,23 @@ if ($VerifyOnly) {
             (Get-FileSha256 -Path $log)) {
             $failures += "run $index log was edited after the run"
         }
-        $logHash = Get-StagedTreeHash -Text $logText
+        $logHash = Get-StagedTreeHash -Text $logText -Pattern $HASH_PATTERN
+        $logSwitchboardHash = Get-StagedTreeHash -Text $logText -Pattern $SWITCHBOARD_HASH_PATTERN
         if ($logHash -eq "") {
             $failures += "run log must carry exactly one staged-tree hash: $log"
         }
         elseif ($verdictHash -match '^[0-9a-f]{64}$' -and $logHash -ne $verdictHash) {
             $failures += "run log staged-tree hash drifted from the verdict (stale): $log"
+        }
+        if ($logSwitchboardHash -eq "") {
+            $failures += "run log must carry exactly one staged-switchboard hash: $log"
+        }
+        elseif ($verdictSwitchboardHash -match '^[0-9a-f]{64}$' -and
+            $logSwitchboardHash -ne $verdictSwitchboardHash) {
+            $failures += "run log staged-switchboard hash drifted from the verdict (stale): $log"
+        }
+        if ($logHash -ne $sourceTreeHash -or $logSwitchboardHash -ne $switchboardHash) {
+            $failures += "run $index staged source hashes differ from preregistered fingerprints"
         }
         $logExit = [regex]::Match($logText, '^=== run (\d+) exit (-?\d+) ===')
         $recordedExit = Read-HeaderValue -Path $verdictPath -Key ("run-{0:D2}-exit" -f $index)
@@ -370,6 +392,7 @@ $headerLines = @(
 
 $exitCodes = @()
 $hashes = @()
+$switchboardHashes = @()
 $skips = @()
 $starts = @()
 $finishes = @()
@@ -418,7 +441,8 @@ for ($index = 1; $index -le $Repetitions; $index++) {
     }
 
     $exitCodes += $exitCode
-    $hashes += (Get-StagedTreeHash -Text $stdoutText)
+    $hashes += (Get-StagedTreeHash -Text $stdoutText -Pattern $HASH_PATTERN)
+    $switchboardHashes += (Get-StagedTreeHash -Text $stdoutText -Pattern $SWITCHBOARD_HASH_PATTERN)
     $skips += $skipCount
     $starts += $runStart
     $finishes += $runFinish
@@ -431,7 +455,9 @@ for ($index = 1; $index -le $Repetitions; $index++) {
 
 # Reject any nonzero gate exit and assert exactly ONE staged-tree hash across the runs.
 $distinctHashes = @($hashes | Where-Object { $_ -ne "" } | Select-Object -Unique)
+$distinctSwitchboardHashes = @($switchboardHashes | Where-Object { $_ -ne "" } | Select-Object -Unique)
 $singleHash = ""
+$singleSwitchboardHash = ""
 $hashConsistent = $true
 if ($distinctHashes.Count -eq 1) {
     $singleHash = $distinctHashes[0]
@@ -439,17 +465,29 @@ if ($distinctHashes.Count -eq 1) {
 elseif ($distinctHashes.Count -gt 1) {
     $hashConsistent = $false
 }
+if ($distinctSwitchboardHashes.Count -eq 1) {
+    $singleSwitchboardHash = $distinctSwitchboardHashes[0]
+}
+elseif ($distinctSwitchboardHashes.Count -gt 1) {
+    $hashConsistent = $false
+}
 
 # A passing run that carried no hash is a broken receipt, not a pass.
 $everyPassHasHash = $true
+$everyHashMatchesPreregistration = $true
 for ($index = 0; $index -lt $exitCodes.Count; $index++) {
-    if ($exitCodes[$index] -eq 0 -and $hashes[$index] -eq "") {
+    if ($exitCodes[$index] -eq 0 -and
+        ($hashes[$index] -eq "" -or $switchboardHashes[$index] -eq "")) {
         $everyPassHasHash = $false
+    }
+    if ($hashes[$index] -ne $sourceTreeHash -or $switchboardHashes[$index] -ne $switchboardHash) {
+        $everyHashMatchesPreregistration = $false
     }
 }
 
 $allPassed = ($passCount -eq $Repetitions)
-$isPass = $allPassed -and $hashConsistent -and $everyPassHasHash -and ($singleHash -ne "")
+$isPass = $allPassed -and $hashConsistent -and $everyPassHasHash -and
+    $everyHashMatchesPreregistration -and ($singleHash -ne "") -and ($singleSwitchboardHash -ne "")
 $verdict = if ($isPass) { "PASS" } else { "FAIL" }
 $rateLine = Format-Rate -PassCount $passCount -Total $Repetitions
 
@@ -464,6 +502,7 @@ for ($index = 1; $index -le $Repetitions; $index++) {
 }
 $verdictLines += "pass-count: $passCount"
 $verdictLines += "staged-tree-sha256: $singleHash"
+$verdictLines += "staged-switchboard-sha256: $singleSwitchboardHash"
 $verdictLines += "hash-consistent: $hashConsistent"
 $verdictLines += $rateLine
 $verdictLines += "verdict: $verdict"
@@ -474,6 +513,9 @@ if (-not $hashConsistent) {
 }
 if (-not $everyPassHasHash) {
     [Console]::Error.WriteLine("a passing run produced no staged-tree hash")
+}
+if (-not $everyHashMatchesPreregistration) {
+    [Console]::Error.WriteLine("a staged project or switchboard hash differs from preregistered source fingerprints")
 }
 
 Write-Output $rateLine

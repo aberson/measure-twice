@@ -127,14 +127,17 @@ if find "$stage" -name .git -o -name .venv | grep -q .; then
     exit 2
 fi
 
-tree_hash=$(
-    cd "$stage/measure-twice"
+tree_hash_for() (
+    cd "$1"
     while IFS= read -r -d '' relative; do
         printf '%s\0' "$relative"
         sha256sum -- "$relative" | cut -d ' ' -f 1
     done < <(find . -type f -printf '%P\0' | LC_ALL=C sort -z) | sha256sum | cut -d ' ' -f 1
 )
+tree_hash=$(tree_hash_for "$stage/measure-twice")
+switchboard_hash=$(tree_hash_for "$stage/switchboard")
 printf 'staged-tree-sha256: %s\n' "$tree_hash"
+printf 'staged-switchboard-sha256: %s\n' "$switchboard_hash"
 printf 'staged-root: %s (WSL ext4 temporary; removed on exit)\n' "$stage"
 
 command -v uv >/dev/null || {

@@ -46,6 +46,10 @@ if (-not (Test-Path -LiteralPath $headerPath) -or
     exit 9
 }
 Write-Output "prereg-header-present: true"
+$headerText = [System.IO.File]::ReadAllText($headerPath)
+$projectMatch = [regex]::Match($headerText, '(?m)^source-tree-sha256: ([0-9a-f]{64})$')
+$switchboardMatch = [regex]::Match($headerText, '(?m)^switchboard-tree-sha256: ([0-9a-f]{64})$')
+if (-not $projectMatch.Success -or -not $switchboardMatch.Success) { exit 9 }
 $counterPath = Join-Path $stateDir "counter"
 $index = 0
 if (Test-Path -LiteralPath $counterPath) {
@@ -56,12 +60,16 @@ $line = $plan[$index]
 [System.IO.File]::WriteAllText($counterPath, [string]($index + 1))
 $parts = $line.Split('|')
 $hashValue = $parts[0]
+if ($hashValue -eq ('a' * 64)) { $hashValue = $projectMatch.Groups[1].Value }
+$switchboardHash = $switchboardMatch.Groups[1].Value
+if ($parts.Count -ge 4 -and $parts[3] -ne "") { $switchboardHash = $parts[3] }
 $exitCode = [int]$parts[1]
 $skipCount = if ($parts.Count -ge 3) { [int]$parts[2] } else { 0 }
 if ($hashValue -ne "") {
     Write-Output ("staged-tree-sha256: " + $hashValue)
     Write-Output ("staged-root: /tmp/fake-" + $index + " (fake ext4; removed on exit)")
 }
+Write-Output ("staged-switchboard-sha256: " + $switchboardHash)
 Write-Output ("fake gate index " + $index + " exit " + $exitCode)
 Write-Output ("selected-skips: " + $skipCount)
 if ($exitCode -ne 0) {
@@ -140,7 +148,7 @@ def test_clean_eight_of_eight_prints_rate_and_verify_only_passes(tmp_path: Path)
     assert _PREREG in header
     verdict = (out_dir / "verdict.txt").read_text(encoding="utf-8")
     assert "verdict: PASS" in verdict
-    assert _HASH_A in verdict
+    assert "staged-switchboard-sha256:" in verdict
     logs = sorted(out_dir.glob("run-*.log"))
     assert len(logs) == 8
 
@@ -160,11 +168,23 @@ def test_rejects_changed_staged_tree_hash_and_preserves_all_logs(tmp_path: Path)
     completed, out_dir = _run_soak(tmp_path, plan=plan, repetitions=8)
 
     assert completed.returncode != 0
+    assert "preregistered source fingerprints" in completed.stderr
     verdict = (out_dir / "verdict.txt").read_text(encoding="utf-8")
     assert "verdict: FAIL" in verdict
     logs = sorted(out_dir.glob("run-*.log"))
     assert len(logs) == 8  # every run log is preserved for forensics
     assert (out_dir / "evidence-header.txt").exists()
+
+
+def test_rejects_switchboard_staging_mismatch_and_preserves_logs(tmp_path: Path) -> None:
+    plan = [f"{_HASH_A}|0" for _ in range(8)]
+    plan[4] = f"{_HASH_A}|0|0|{_HASH_B}"
+    completed, out_dir = _run_soak(tmp_path, plan=plan, repetitions=8)
+
+    assert completed.returncode != 0
+    assert "preregistered source fingerprints" in completed.stderr
+    assert "verdict: FAIL" in (out_dir / "verdict.txt").read_text(encoding="utf-8")
+    assert len(list(out_dir.glob("run-*.log"))) == 8
 
 
 def test_rejects_seven_of_eight_and_preserves_all_logs(tmp_path: Path) -> None:
