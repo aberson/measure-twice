@@ -2548,7 +2548,7 @@ def _record_control_failure_unless_collected(
             unreleased_startup and guard.control_missing_during_unreleased_startup(error)
         ) or guard.control_missing_after_collection(error, wait_for_owner=True)
     except BaseException as proof_error:
-        errors.extend((error, proof_error))
+        errors.extend((proof_error, error))
         return False
     if not collected:
         errors.append(error)

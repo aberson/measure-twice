@@ -663,7 +663,7 @@ def test_linux_fast_scope_collection_is_terminal_only_with_proved_owner_exit_and
         "path-replaced": "scope path was replaced before collection",
         "malformed-control": "cgroup.events is malformed",
         "missing-supervisor-record": "invalid status record",
-        "proof-raises": "could not read Linux resource guard cgroup.events",
+        "proof-raises": "injected collection proof failure",
     }.get(case)
     try:
         if expected_message is None:
