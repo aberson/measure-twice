@@ -31,6 +31,7 @@ param(
     [string]$Models = "haiku,sonnet,opus",
     [string[]]$MtCommand = @("uv", "run", "mt"),
     [int]$Samples = 1,
+    [switch]$FixtureMode,
     [switch]$VerifyOnly
 )
 
@@ -75,6 +76,7 @@ function Invoke-EvidenceCheck([string]$IndexPath, [string]$OutPath, [bool]$Store
     $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
     $args = @("run", "--project", $projectRoot, "python", "-m", "measure_twice.context_qualification", "--index", $IndexPath, "--out", $OutPath)
     if ($Stored) { $args += "--verify-only" }
+    if ($FixtureMode) { $args += "--fixture-mode" }
     $output = & uv @args
     if ($LASTEXITCODE -ne 0) {
         $detail = "stored run evidence did not verify"
@@ -108,22 +110,31 @@ $modelList = @($Models.Split(",") | ForEach-Object { $_.Trim() } | Where-Object 
 if ($Models -ne "haiku,sonnet,opus" -or $Samples -ne 1) {
     Fail-Closed "qualification requires -Models haiku,sonnet,opus and -Samples 1"
 }
+if (-not $FixtureMode -and ($MtCommand.Count -ne 3 -or $MtCommand[0] -cne "uv" -or $MtCommand[1] -cne "run" -or $MtCommand[2] -cne "mt")) {
+    Fail-Closed "production qualification requires pinned -MtCommand uv run mt; use -FixtureMode for test commands"
+}
 $outFull = [System.IO.Path]::GetFullPath($Out)
 $indexPath = Join-Path $outFull "index.json"
+$indexDigestPath = Join-Path $outFull "index.sha256"
 
 # ---------------------------------------------------------------------------- VerifyOnly path -----
 
 if ($VerifyOnly) {
     $index = Read-JsonFile $indexPath
     if ($null -eq $index) { Fail-Closed "no qualification index at $indexPath (nothing to verify)" }
+    $expectedMode = if ($FixtureMode) { "FIXTURE" } else { "LIVE" }
+    if ($index.evidence_mode -ne $expectedMode) {
+        Fail-Closed "stored evidence mode '$($index.evidence_mode)' does not match requested $expectedMode verification"
+    }
     if ($index.preregistration -ne $ExpectedPreregistration) {
         Fail-Closed "stored preregistration does not match the frozen Step 58 sentence"
     }
-    if ($index.status -ne "PASS") {
-        Fail-Closed "stored qualification status is '$($index.status)', not PASS"
+    $expectedStatus = if ($FixtureMode) { "FIXTURE_PASS" } else { "PASS" }
+    if ($index.status -ne $expectedStatus) {
+        Fail-Closed "stored qualification status is '$($index.status)', not $expectedStatus"
     }
     $eval = Invoke-EvidenceCheck $indexPath $outFull $true
-    Write-Line "verify=PASS passed=$($eval.passed) total=$($eval.total) receipt=$($eval.receipt.receipt_sha256)"
+    Write-Line "verify=$expectedStatus passed=$($eval.passed) total=$($eval.total) receipt=$($eval.receipt.receipt_sha256)"
     exit 0
 }
 
@@ -188,16 +199,23 @@ try {
         session = $sentinels.session
     })
     $verifierPath = Join-Path $PSScriptRoot "..\measure_twice\context_qualification.py"
+    $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+    $callSources = [ordered]@{}
+    foreach ($relative in @("measure_twice/cli.py", "measure_twice/runner.py", "measure_twice/model_sweep_execution.py", "measure_twice/config.py", "measure_twice/adapters/base.py", "measure_twice/adapters/claude_cli.py", "measure_twice/adapters/_claude_runtime.py")) {
+        $callSources[$relative] = (Get-FileHash -LiteralPath (Join-Path $projectRoot $relative) -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
     $producer = [ordered]@{
         version         = $ProducerVersion
         wrapper_sha256  = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
         verifier_sha256 = (Get-FileHash -LiteralPath $verifierPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        call_sources    = $callSources
     }
 
     # INDEX BEFORE the calls: the exact preregistration, the sentinels, and IN_PROGRESS status.
     $beforeIndex = [ordered]@{
         schema_version   = $IndexSchemaVersion
         producer         = $producer
+        evidence_mode    = $(if ($FixtureMode) { "FIXTURE" } else { "LIVE" })
         status           = "IN_PROGRESS"
         preregistration  = $Preregister
         suite            = $Suite
@@ -222,6 +240,11 @@ try {
     # Sweep from the hostile cwd so any regression that re-enables project customization or repo
     # access encounters the planted markers. The absolute suite/profile/out paths remain fixed.
     Set-Location -LiteralPath $canaryCwd
+    $runsPath = Join-Path $outFull "runs"
+    $runDirsBefore = @()
+    if (Test-Path -LiteralPath $runsPath) {
+        $runDirsBefore = @(Get-ChildItem -LiteralPath $runsPath -Directory | ForEach-Object Name)
+    }
     $lead = @()
     if ($MtCommand.Count -gt 1) { $lead = $MtCommand[1..($MtCommand.Count - 1)] }
     $runArgs = $lead + @(
@@ -239,11 +262,18 @@ try {
     $runOutput = & $MtCommand[0] @runArgs
     $runExit = $LASTEXITCODE
     foreach ($line in $runOutput) { Write-Line "mt: $line" }
-    $runId = $null
+    $printedRunId = $null
     foreach ($line in $runOutput) {
         $m = [regex]::Match([string]$line, "(run_\S+?):")
-        if ($m.Success) { $runId = $m.Groups[1].Value; break }
+        if ($m.Success) { $printedRunId = $m.Groups[1].Value; break }
     }
+    $newRunDirs = @()
+    if (Test-Path -LiteralPath $runsPath) {
+        $newRunDirs = @(Get-ChildItem -LiteralPath $runsPath -Directory | Where-Object { $_.Name -notin $runDirsBefore } | ForEach-Object Name)
+    }
+    if ($newRunDirs.Count -gt 1) { Fail-Closed "mt run created multiple new run directories: $($newRunDirs -join ', ')" }
+    $runId = if ($newRunDirs.Count -eq 1) { $newRunDirs[0] } else { $null }
+    if ($null -ne $printedRunId -and $printedRunId -ne $runId) { Fail-Closed "printed run id does not match the new run directory" }
     if ($null -ne $runId) {
         $beforeIndex.run_id = $runId
         Write-JsonFile $indexPath $beforeIndex
@@ -257,12 +287,13 @@ try {
     $eval = Invoke-EvidenceCheck $indexPath $outFull $false
     Clear-PlantedContext
     $script:CleanedUp = $true
-    $status = "PASS"
+    $status = if ($FixtureMode) { "FIXTURE_PASS" } else { "PASS" }
 
     # INDEX AFTER the calls: the verdict, per-arm identity/sentinel evidence, and the receipt.
     $afterIndex = [ordered]@{
         schema_version   = $IndexSchemaVersion
         producer         = $producer
+        evidence_mode    = $beforeIndex.evidence_mode
         status           = $status
         qualification    = $status
         preregistration  = $Preregister
@@ -284,8 +315,9 @@ try {
         started_utc      = $beforeIndex.started_utc
         finished_utc     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     }
-    Write-Line "qualification=$status passed=$($eval.passed) total=$($eval.total)"
     Write-JsonFile $indexPath $afterIndex
+    [System.IO.File]::WriteAllText($indexDigestPath, (Get-FileHash -LiteralPath $indexPath -Algorithm SHA256).Hash.ToLowerInvariant())
+    Write-Line "qualification=$status passed=$($eval.passed) total=$($eval.total)"
     $script:QualificationSucceeded = $true
     exit 0
 }
@@ -297,7 +329,7 @@ catch {
 finally {
     if (-not $script:QualificationSucceeded -and (Test-Path -LiteralPath $indexPath)) {
         $lastIndex = Read-JsonFile $indexPath
-        if ($lastIndex.status -eq "IN_PROGRESS" -or $lastIndex.status -eq "PASS") {
+        if ($lastIndex.status -eq "IN_PROGRESS" -or $lastIndex.status -eq "PASS" -or $lastIndex.status -eq "FIXTURE_PASS") {
             $lastIndex.status = "FAIL"
             $lastIndex | Add-Member -NotePropertyName qualification -NotePropertyValue "FAIL" -Force
             $lastIndex | Add-Member -NotePropertyName reason -NotePropertyValue $script:FailureReason -Force

@@ -446,9 +446,8 @@ def _stored_identity(value: object) -> str:
     return value if value.strip() else "(blank identity)"
 
 
-def _fmt_resolved(model: ModelReport) -> str:
-    """Show row identity values with their provenance, escaping untrusted Markdown text."""
-    values = model.stored_identities
+def _fmt_identities(values: tuple[str, ...]) -> str:
+    """Show an identity set, escaping untrusted Markdown text."""
     return ", ".join(_md_cell(value) for value in values) if values else "(none)"
 
 
@@ -493,13 +492,16 @@ def _execution_lines(report: RunReport) -> list[str]:
             "",
         ]
     lines += [
-        "| Model | Provider | Requested | Stored identity | Provenance | Status |",
-        "|---|---|---|---|---|---|",
+        "| Model | Provider | Requested | Resolved identity | Stored identity | "
+        "Provenance | Status |",
+        "|---|---|---|---|---|---|---|",
     ]
     for model in report.models:
         lines.append(
             f"| {_md_cell(model.model)} | {_md_cell(model.provider or '(legacy)')} | "
-            f"{_md_cell(model.requested_model or '(legacy)')} | {_fmt_resolved(model)} | "
+            f"{_md_cell(model.requested_model or '(legacy)')} | "
+            f"{_fmt_identities(model.resolved_identities)} | "
+            f"{_fmt_identities(model.stored_identities)} | "
             f"{model.identity_provenance} | {model.eligibility} |"
         )
     lines.append("")

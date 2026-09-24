@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,6 +29,15 @@ PREREGISTRATION = (
 )
 MODELS = ("haiku", "sonnet", "opus")
 PRODUCER_VERSION = "step57-context-qualification-v1"
+CALL_SOURCES = (
+    "measure_twice/cli.py",
+    "measure_twice/runner.py",
+    "measure_twice/model_sweep_execution.py",
+    "measure_twice/config.py",
+    "measure_twice/adapters/base.py",
+    "measure_twice/adapters/claude_cli.py",
+    "measure_twice/adapters/_claude_runtime.py",
+)
 EXPECTED = {
     "canary-context": "ALEPH",
 }
@@ -54,27 +65,50 @@ def _read_index(path: Path) -> dict[str, Any]:
     return cast("dict[str, Any]", value)
 
 
-def evaluate(index_path: Path, out_dir: Path, *, verify_only: bool) -> dict[str, Any]:
+def evaluate(
+    index_path: Path, out_dir: Path, *, verify_only: bool, fixture_mode: bool = False
+) -> dict[str, Any]:
     """Check every expected terminal cell and freeze/compare the evidence file digests."""
     index = _read_index(index_path)
     _require(index.get("schema_version") == 1, "unsupported qualification index schema")
+    project_root = Path(__file__).resolve().parent.parent
     producer = {
         "version": PRODUCER_VERSION,
-        "wrapper_sha256": _sha(
-            Path(__file__).resolve().parent.parent / "scripts" / "qualify-model-sweep-context.ps1"
-        ),
+        "wrapper_sha256": _sha(project_root / "scripts" / "qualify-model-sweep-context.ps1"),
         "verifier_sha256": _sha(Path(__file__).resolve()),
+        "call_sources": {relative: _sha(project_root / relative) for relative in CALL_SOURCES},
     }
     _require(index.get("producer") == producer, "qualification producer version or digest changed")
+    evidence_mode = "FIXTURE" if fixture_mode else "LIVE"
+    _require(index.get("evidence_mode") == evidence_mode, "qualification evidence mode mismatch")
     _require(index.get("preregistration") == PREREGISTRATION, "preregistration mismatch")
     _require(index.get("models") == list(MODELS), "qualification must select all three aliases")
     _require(index.get("samples") == 1, "qualification must use one sample per cell")
     if verify_only:
-        _require(index.get("status") == "PASS", "stored qualification is not PASS")
-        _require(index.get("qualification") == "PASS", "stored qualification verdict is not PASS")
+        pass_status = "FIXTURE_PASS" if fixture_mode else "PASS"
+        _require(index.get("status") == pass_status, f"stored qualification is not {pass_status}")
+        _require(
+            index.get("qualification") == pass_status,
+            f"stored qualification verdict is not {pass_status}",
+        )
         _require(
             index.get("passed") == 3 and index.get("total") == 3, "stored pass count is not 3/3"
         )
+        _require(index.get("reason") == "", "stored PASS has a failure reason")
+        _require(
+            (out_dir / "index.sha256").is_file()
+            and (out_dir / "index.sha256").read_text(encoding="ascii").strip() == _sha(index_path),
+            "qualification index receipt changed",
+        )
+        for key in ("started_utc", "finished_utc"):
+            stamp = index.get(key)
+            if not isinstance(stamp, str):
+                raise QualificationError(f"stored {key} is invalid")
+            _require(
+                re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp) is not None,
+                f"stored {key} is invalid",
+            )
+            datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
     else:
         _require(index.get("status") == "IN_PROGRESS", "pre-call index is not IN_PROGRESS")
 
@@ -116,6 +150,11 @@ def evaluate(index_path: Path, out_dir: Path, *, verify_only: bool) -> dict[str,
     }
     manifest = _read_manifest(run_dir)
     _require(manifest.get("run_id") == run_id, "manifest run id mismatch")
+    if verify_only:
+        _require(
+            index["started_utc"] <= manifest.get("started_utc", "") <= index["finished_utc"],
+            "qualification timestamps do not bracket the run",
+        )
     _require(
         manifest.get("preregistration") == PREREGISTRATION, "manifest preregistration mismatch"
     )
@@ -282,9 +321,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--index", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--fixture-mode", action="store_true")
     args = parser.parse_args(argv)
     try:
-        result = evaluate(args.index, args.out, verify_only=args.verify_only)
+        result = evaluate(
+            args.index, args.out, verify_only=args.verify_only, fixture_mode=args.fixture_mode
+        )
     except (QualificationError, ValueError, OSError, KeyError, TypeError) as exc:
         print(json.dumps({"error": str(exc)}))
         print(f"qualification evidence invalid: {exc}", file=sys.stderr)

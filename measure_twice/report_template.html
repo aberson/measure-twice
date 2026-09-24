@@ -455,13 +455,15 @@
       ex.appendChild(c);
     });
     var h = '<thead><tr><th>Model</th><th>Provider</th><th>Requested</th>'
-      + '<th>Stored identity</th><th>Provenance</th><th>Status</th></tr></thead><tbody>';
+      + '<th>Resolved identity</th><th>Stored identity</th><th>Provenance</th><th>Status</th></tr></thead><tbody>';
     X.arms.forEach(function(a){
+      var resolved = a.resolved_identities.length ? a.resolved_identities.join(", ") : "(none)";
       var stored = a.stored_identities.length ? a.stored_identities.join(", ") : "(none)";
       var cls = a.routing_eligible === false ? "p-miss" : "p-prelim";
       h += '<tr><td class="mono">' + esc(a.model) + '</td>'
         + '<td class="mono">' + esc(a.provider == null ? "(legacy)" : a.provider) + '</td>'
         + '<td class="mono">' + esc(a.requested_model == null ? "(legacy)" : a.requested_model) + '</td>'
+        + '<td class="mono">' + esc(resolved) + '</td>'
         + '<td class="mono">' + esc(stored) + '</td>'
         + '<td class="mono">' + esc(a.identity_provenance) + '</td>'
         + '<td><span class="pill ' + cls + '">' + esc(a.eligibility) + '</span></td></tr>';

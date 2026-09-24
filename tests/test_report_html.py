@@ -463,7 +463,8 @@ def test_html_surfaces_execution_seal_and_identity(tmp_path: Path) -> None:
     assert haiku["resolved_identities"] == ["claude-x"]
     assert haiku["routing_eligible"] is None
     assert haiku["eligibility"] == "PRELIMINARY_SEAL_IDENTITY_OK"
-    assert "<th>Stored identity</th><th>Provenance</th><th>Status</th>" in html
+    assert "<th>Resolved identity</th><th>Stored identity</th>" in html
+    assert "esc(resolved)" in html
     assert "esc(stored)" in html
     assert "esc(a.identity_provenance)" in html
     # The receipt hashes are literally present in the rendered page, not only in the island.
@@ -486,7 +487,7 @@ def test_html_legacy_run_marked_unsealed(tmp_path: Path) -> None:
     assert haiku["stored_identities"] == ["claude-x"]
     assert haiku["resolved_identities"] == []
     assert haiku["identity_provenance"] == "UNVERIFIED_LEGACY"
-    assert "<th>Stored identity</th><th>Provenance</th><th>Status</th>" in html
+    assert "<th>Resolved identity</th><th>Stored identity</th>" in html
     assert haiku["routing_eligible"] is False
     assert LEGACY_UNSEALED in html
     assert NOT_ROUTING_ELIGIBLE in html
@@ -527,4 +528,5 @@ def test_html_mixed_identity_set_is_visible_and_negative(tmp_path: Path) -> None
     assert arm["identity_provenance"] == "PROVIDER_IDENTITY_UNRESOLVED"
     assert arm["routing_eligible"] is False
     assert arm["eligibility"] == NOT_ROUTING_ELIGIBLE
-    assert "<th>Stored identity</th><th>Provenance</th><th>Status</th>" in html
+    assert "<th>Resolved identity</th><th>Stored identity</th>" in html
+    assert "esc(resolved)" in html

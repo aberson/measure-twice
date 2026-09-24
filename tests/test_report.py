@@ -598,6 +598,8 @@ def test_markdown_shows_concrete_and_unresolved_identities_in_same_arm(tmp_path:
     assert "claude-x" in identity_line
     assert UNRESOLVED_MODEL_ID in identity_line
     assert NOT_ROUTING_ELIGIBLE in identity_line
+    assert "| claude-x | UNRESOLVED_PROVIDER_IDENTITY, claude-x |" in identity_line
+    assert "| Resolved identity | Stored identity |" in render_run_report(report)
 
 
 def test_legacy_requested_alias_fallback_is_explicitly_unverified(tmp_path: Path) -> None:
