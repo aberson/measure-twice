@@ -26,6 +26,7 @@ PREREGISTRATION = (
     "identity fails the 3/3 qualification and blocks Step 13."
 )
 MODELS = ("haiku", "sonnet", "opus")
+PRODUCER_VERSION = "step57-context-qualification-v1"
 EXPECTED = {
     "canary-context": "ALEPH",
 }
@@ -57,6 +58,14 @@ def evaluate(index_path: Path, out_dir: Path, *, verify_only: bool) -> dict[str,
     """Check every expected terminal cell and freeze/compare the evidence file digests."""
     index = _read_index(index_path)
     _require(index.get("schema_version") == 1, "unsupported qualification index schema")
+    producer = {
+        "version": PRODUCER_VERSION,
+        "wrapper_sha256": _sha(
+            Path(__file__).resolve().parent.parent / "scripts" / "qualify-model-sweep-context.ps1"
+        ),
+        "verifier_sha256": _sha(Path(__file__).resolve()),
+    }
+    _require(index.get("producer") == producer, "qualification producer version or digest changed")
     _require(index.get("preregistration") == PREREGISTRATION, "preregistration mismatch")
     _require(index.get("models") == list(MODELS), "qualification must select all three aliases")
     _require(index.get("samples") == 1, "qualification must use one sample per cell")

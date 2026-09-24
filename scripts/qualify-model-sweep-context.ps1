@@ -42,6 +42,7 @@ $ErrorActionPreference = "Stop"
 $ExpectedPreregistration = "All three live Claude canaries (haiku, sonnet, and opus) will return the requested token without reproducing any unique repository, environment, customization, or session sentinel, and every arm will record provider, requested alias, concrete resolved identity, Claude CLI path and version, and the same context-profile hash; any sentinel or unresolved identity fails the 3/3 qualification and blocks Step 13."
 
 $IndexSchemaVersion = 1
+$ProducerVersion = "step57-context-qualification-v1"
 $UnresolvedIdentity = "UNRESOLVED_PROVIDER_IDENTITY"
 $EnvSentinelName = "MT_CONTEXT_CANARY_ENVIRONMENT"
 $SessionSentinelName = "MT_CONTEXT_CANARY_SESSION"
@@ -186,10 +187,17 @@ try {
         environment = $sentinels.environment
         session = $sentinels.session
     })
+    $verifierPath = Join-Path $PSScriptRoot "..\measure_twice\context_qualification.py"
+    $producer = [ordered]@{
+        version         = $ProducerVersion
+        wrapper_sha256  = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        verifier_sha256 = (Get-FileHash -LiteralPath $verifierPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
 
     # INDEX BEFORE the calls: the exact preregistration, the sentinels, and IN_PROGRESS status.
     $beforeIndex = [ordered]@{
         schema_version   = $IndexSchemaVersion
+        producer         = $producer
         status           = "IN_PROGRESS"
         preregistration  = $Preregister
         suite            = $Suite
@@ -254,6 +262,7 @@ try {
     # INDEX AFTER the calls: the verdict, per-arm identity/sentinel evidence, and the receipt.
     $afterIndex = [ordered]@{
         schema_version   = $IndexSchemaVersion
+        producer         = $producer
         status           = $status
         qualification    = $status
         preregistration  = $Preregister

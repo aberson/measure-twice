@@ -167,6 +167,34 @@ def test_qualification_fake_live_and_verify_only_rechecks_hashes(tmp_path: Path)
         timeout=90,
     )
     assert verify.returncode == 0, verify.stdout + verify.stderr
+    for field, stale_value in (
+        ("version", "old-producer"),
+        ("wrapper_sha256", "0" * 64),
+        ("verifier_sha256", "0" * 64),
+    ):
+        stale_index = {**index, "producer": {**index["producer"], field: stale_value}}
+        index_path.write_text(json.dumps(stale_index), encoding="utf-8")
+        stale = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(SCRIPT),
+                "-VerifyOnly",
+                "-Out",
+                str(tmp_path / "out"),
+            ],
+            cwd=tmp_path,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=90,
+        )
+        assert stale.returncode != 0
+        assert "qualification producer version or digest changed" in stale.stderr
+    index_path.write_text(json.dumps(index), encoding="utf-8")
     run_dir = tmp_path / "out" / "runs" / index["run_id"]
     manifest_path = run_dir / "manifest.json"
     manifest_path.write_text(manifest_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")

@@ -448,7 +448,7 @@ def _stored_identity(value: object) -> str:
 
 def _fmt_resolved(model: ModelReport) -> str:
     """Show row identity values with their provenance, escaping untrusted Markdown text."""
-    values = model.resolved_identities or model.stored_identities
+    values = model.stored_identities
     return ", ".join(_md_cell(value) for value in values) if values else "(none)"
 
 

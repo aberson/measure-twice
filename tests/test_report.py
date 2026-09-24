@@ -579,6 +579,27 @@ def test_mixed_identity_set_is_ineligible_and_markdown_escapes_provider_text(
     assert NOT_ROUTING_ELIGIBLE in md
 
 
+def test_markdown_shows_concrete_and_unresolved_identities_in_same_arm(tmp_path: Path) -> None:
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["model_id_resolved"] = UNRESOLVED_MODEL_ID
+    rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    report = build_run_report(result.run_id, tmp_path)
+    model = report.models[0]
+    assert model.resolved_identities == ("claude-x",)
+    assert model.identity_unresolved is True
+    identity_line = next(
+        line
+        for line in render_run_report(report).splitlines()
+        if line.startswith("| haiku | claude-cli |")
+    )
+    assert "claude-x" in identity_line
+    assert UNRESOLVED_MODEL_ID in identity_line
+    assert NOT_ROUTING_ELIGIBLE in identity_line
+
+
 def test_legacy_requested_alias_fallback_is_explicitly_unverified(tmp_path: Path) -> None:
     result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
     _strip_execution_receipt(tmp_path, result.run_id)
