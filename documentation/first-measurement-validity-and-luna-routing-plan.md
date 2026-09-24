@@ -1,9 +1,9 @@
 # First-Measurement Validity Gates and Luna Routing
 
-**Status:** IN PROGRESS (2026-09-23) — 2/8 steps complete (Steps 56 and 57 DONE; Step 57
-merged to master as `27e475b`); umbrella #60 and Step 56-63 issues
-#62/#63/#64/#65/#66/#67/#61/#68 backfilled; cross-plan links verified. Step 62 is in final
-review; Steps 58/61/63 are live observation waits.
+**Status:** IN PROGRESS (2026-09-23) — 3/8 steps complete (Steps 56, 57, and 62 DONE;
+Step 57 merged as `27e475b`, Step 62 as `3565141`); umbrella #60 and Step 56-63 issues
+#62/#63/#64/#65/#66/#67/#61/#68 backfilled; cross-plan links verified. Steps 58/61/63
+are live observation waits.
 
 **Repo-sync phase identifier:** `first-measurement-validity-and-luna-routing` (must be passed
 explicitly; it cannot be inferred from this filename)
@@ -436,7 +436,17 @@ and an explicit config, then existing Step 14. The contaminated first run is not
   `"powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-agent-bench-wsl.ps1 -Distribution Ubuntu"`
   exits 0 with zero selected skips from a staged WSL-ext4 tree
 - **Depends on:** 26 (shipped)
-- **Status:** NOT STARTED
+- **Status:** DONE (2026-09-23; merged as `3565141`)
+
+The final Step 62 tree passed the full Windows suite, Ruff lint/format, strict mypy, `uv build`,
+and the Windows-launched WSL gate with zero selected skips and staged project hash
+`04f47ee37b68814c99b94f45efa9158201fe5f3d12d9dae61cc15a324337d2ff`. Ubuntu was
+terminated afterward. The final review covered correctness, bugs, security, test quality, style,
+and plan conformance. Review found and fixed malformed soak hash parsing and a `/proc` read error
+that could otherwise appear to prove owner exit. The test-quality review replaced a mirrored Git
+manifest test with a real fixture soak and `-VerifyOnly` check. Post-merge master passed the full
+suite, Ruff lint/format, strict mypy, and `uv build`. Step 63's eight-run live soak has not run;
+Step 27 remains blocked on it.
 
 ### Step 63: Soak the reviewed containment gate on WSL ext4
 
