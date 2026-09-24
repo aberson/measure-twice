@@ -11,7 +11,6 @@ The result-driving .ps1 logic is anchored red-on-garbage here (the FAIL cases), 
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
 import subprocess
@@ -40,6 +39,13 @@ param([string]$Distribution = "")
 $ErrorActionPreference = "Stop"
 $stateDir = $env:MT_FAKE_GATE_STATEDIR
 $planPath = $env:MT_FAKE_GATE_PLAN
+$headerPath = Join-Path $env:MT_FAKE_GATE_OUT "evidence-header.txt"
+if (-not (Test-Path -LiteralPath $headerPath) -or
+    -not ([System.IO.File]::ReadAllText($headerPath).Contains($env:MT_FAKE_GATE_PREREG))) {
+    [Console]::Error.WriteLine("fake gate ran before preregistration header existed")
+    exit 9
+}
+Write-Output "prereg-header-present: true"
 $counterPath = Join-Path $stateDir "counter"
 $index = 0
 if (Test-Path -LiteralPath $counterPath) {
@@ -78,6 +84,7 @@ def _run_soak(
     repetitions: int,
     out: Path | None = None,
     verify_only: bool = False,
+    soak_script: Path = _SOAK_SCRIPT,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     gate = _write_fake_gate(tmp_path)
     plan_path = tmp_path / "plan.txt"
@@ -91,7 +98,7 @@ def _run_soak(
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        str(_SOAK_SCRIPT),
+        str(soak_script),
         "-Distribution",
         "FakeUbuntu",
         "-Repetitions",
@@ -109,6 +116,8 @@ def _run_soak(
         **os.environ,
         "MT_FAKE_GATE_PLAN": str(plan_path),
         "MT_FAKE_GATE_STATEDIR": str(state_dir),
+        "MT_FAKE_GATE_OUT": str(out_dir),
+        "MT_FAKE_GATE_PREREG": _PREREG,
     }
     completed = subprocess.run(  # noqa: S603 - resolved PowerShell running a test-authored script
         args,
@@ -126,6 +135,7 @@ def test_clean_eight_of_eight_prints_rate_and_verify_only_passes(tmp_path: Path)
 
     assert completed.returncode == 0, completed.stderr
     assert "containment_gate_rate=8/8 (100.0%)" in completed.stdout
+    assert "prereg-header-present: true" in (out_dir / "run-01.log").read_text(encoding="utf-8")
     header = (out_dir / "evidence-header.txt").read_text(encoding="utf-8")
     assert _PREREG in header
     verdict = (out_dir / "verdict.txt").read_text(encoding="utf-8")
@@ -319,8 +329,95 @@ def test_zero_gate_exit_with_selected_skip_is_not_a_pass(tmp_path: Path) -> None
     assert (out_dir / "run-01.log").exists()
 
 
+def test_zero_gate_exit_without_staged_hash_is_not_a_pass(tmp_path: Path) -> None:
+    plan = [f"{_HASH_A}|0" for _ in range(8)]
+    plan[3] = "|0"
+    completed, out_dir = _run_soak(tmp_path, plan=plan, repetitions=8)
+    assert completed.returncode != 0
+    assert "a passing run produced no staged-tree hash" in completed.stderr
+    assert "verdict: FAIL" in (out_dir / "verdict.txt").read_text(encoding="utf-8")
+    assert len(list(out_dir.glob("run-*.log"))) == 8
+
+
+def test_production_requires_eight_repetitions(tmp_path: Path) -> None:
+    rejected = subprocess.run(  # noqa: S603 - resolved PowerShell running a repo script
+        [
+            _POWERSHELL,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(_SOAK_SCRIPT),
+            "-Out",
+            str(tmp_path / "receipt"),
+            "-Repetitions",
+            "1",
+            "-VerifyOnly",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert rejected.returncode != 0
+    assert "exactly 8 repetitions" in rejected.stderr
+
+
+def test_verify_rejects_stale_isolation_source_and_edited_rate(tmp_path: Path) -> None:
+    fixture_root = tmp_path / "reviewed-tree"
+    source_files = [
+        "scripts/soak-agent-bench-wsl.ps1",
+        "measure_twice/agent_bench/process.py",
+        "measure_twice/agent_bench/isolation.py",
+        "tests/agent_bench/test_process.py",
+        "tests/agent_bench/test_isolation.py",
+    ]
+    for relative in source_files:
+        destination = fixture_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_REPO_ROOT / relative, destination)
+
+    fixture_script = fixture_root / "scripts" / "soak-agent-bench-wsl.ps1"
+    completed, out_dir = _run_soak(
+        tmp_path, plan=[f"{_HASH_A}|0"], repetitions=1, soak_script=fixture_script
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    isolation = fixture_root / "measure_twice" / "agent_bench" / "isolation.py"
+    isolation.write_text(isolation.read_text(encoding="utf-8") + "\n# drift\n", encoding="utf-8")
+    stale, _ = _run_soak(
+        tmp_path,
+        plan=[f"{_HASH_A}|0"],
+        repetitions=1,
+        out=out_dir,
+        verify_only=True,
+        soak_script=fixture_script,
+    )
+    assert stale.returncode != 0
+    assert "source-tree-sha256" in stale.stderr
+
+    # Restore the producer so this second failure isolates the recorded rate.
+    shutil.copyfile(_REPO_ROOT / "measure_twice/agent_bench/isolation.py", isolation)
+    verdict_path = out_dir / "verdict.txt"
+    verdict_path.write_text(
+        verdict_path.read_text(encoding="utf-8").replace(
+            "containment_gate_rate=1/1 (100.0%)", "containment_gate_rate=0/1 (0.0%)"
+        ),
+        encoding="utf-8",
+    )
+    edited, _ = _run_soak(
+        tmp_path,
+        plan=[f"{_HASH_A}|0"],
+        repetitions=1,
+        out=out_dir,
+        verify_only=True,
+        soak_script=fixture_script,
+    )
+    assert edited.returncode != 0
+    assert "recorded containment gate rate" in edited.stderr
+
+
 def test_git_manifest_ignores_growing_qualification_evidence(tmp_path: Path) -> None:
-    """Use the launcher's real git manifest command and staged-tree hash algorithm."""
+    """Use the launcher's real git manifest command to exclude growing evidence."""
 
     repo = tmp_path / "manifest-repo"
     repo.mkdir()
@@ -337,29 +434,22 @@ def test_git_manifest_ignores_growing_qualification_evidence(tmp_path: Path) -> 
         capture_output=True,
     )
 
-    def staged_hash() -> tuple[str, list[str]]:
+    def manifest_paths() -> list[str]:
         raw = subprocess.check_output(  # noqa: S603 - exact launcher manifest command
             [git, "-C", str(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
         )
-        paths = [part.decode("utf-8") for part in raw.split(b"\0") if part]
-        digest = hashlib.sha256()
-        for path in sorted(paths):
-            digest.update(path.encode("utf-8") + b"\0")
-            digest.update(
-                hashlib.sha256((repo / path).read_bytes()).hexdigest().encode("ascii") + b"\n"
-            )
-        return digest.hexdigest(), paths
+        return [part.decode("utf-8") for part in raw.split(b"\0") if part]
 
-    before, _ = staged_hash()
+    before = manifest_paths()
     evidence = repo / "data" / "qualification" / "agent-bench-containment-step63"
     evidence.mkdir(parents=True)
     (evidence / "evidence-header.txt").write_text("preregistered\n", encoding="utf-8")
     (evidence / "run-01.log").write_text("first\n", encoding="utf-8")
-    after_first, paths = staged_hash()
+    after_first = manifest_paths()
     (evidence / "run-02.log").write_text("second\n", encoding="utf-8")
-    after_second, _ = staged_hash()
+    after_second = manifest_paths()
     assert before == after_first == after_second
-    assert all("qualification" not in path for path in paths)
+    assert all("qualification" not in path for path in after_second)
 
 
 def test_soak_script_is_ascii_only() -> None:

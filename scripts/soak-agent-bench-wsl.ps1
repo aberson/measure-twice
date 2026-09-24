@@ -21,7 +21,7 @@ Set-StrictMode -Version Latest
 $HASH_PATTERN = 'staged-tree-sha256:\s*([0-9a-f]{64})'
 $SKIP_PATTERN = '(?m)^selected-skips:\s*(\d+)\s*$'
 $STEP63_PREREG = "The reviewed containment repair will pass 8/8 independent WSL-ext4 gate invocations with zero selected skips and no live-identity or retained-FD escape; any lower pass rate returns the work to Step 62 and blocks Step 27."
-$PRODUCER_VERSION = "step62-soak-v2"
+$PRODUCER_VERSION = "step62-soak-v3"
 
 function Get-StagedTreeHash {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
@@ -47,6 +47,32 @@ function Get-FileSha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-SourceTreeSha256 {
+    param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+
+    $relativeRoots = @("measure_twice/agent_bench", "tests/agent_bench")
+    $records = @()
+    foreach ($relativeRoot in $relativeRoots) {
+        $directory = Join-Path $ProjectRoot $relativeRoot
+        if (-not (Test-Path -LiteralPath $directory)) {
+            throw "containment source directory is absent: $directory"
+        }
+        foreach ($file in @(Get-ChildItem -LiteralPath $directory -Recurse -File)) {
+            if ($file.Extension -notin @(".py", ".json")) { continue }
+            $relative = $file.FullName.Substring($ProjectRoot.Length + 1).Replace('\', '/')
+            $records += "$relative`:$(Get-FileSha256 -Path $file.FullName)"
+        }
+    }
+    if ($records.Count -eq 0) { throw "containment source tree is empty" }
+    $body = (@($records | Sort-Object) -join "`n") + "`n"
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        return [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
 }
 
 function Read-HeaderValue {
@@ -116,13 +142,13 @@ if ($production) {
 }
 $producerMode = if ($production) { "production" } else { "fixture" }
 $GateScript = [System.IO.Path]::GetFullPath($GateScript)
-$processSource = Join-Path (Split-Path -Parent $scriptRoot) "measure_twice/agent_bench/process.py"
-if (-not (Test-Path -LiteralPath $GateScript) -or -not (Test-Path -LiteralPath $processSource)) {
-    throw "gate script or containment source is absent"
+$projectRoot = Split-Path -Parent $scriptRoot
+if (-not (Test-Path -LiteralPath $GateScript)) {
+    throw "gate script is absent"
 }
 $soakHash = Get-FileSha256 -Path $PSCommandPath
 $gateHash = Get-FileSha256 -Path $GateScript
-$processHash = Get-FileSha256 -Path $processSource
+$sourceTreeHash = Get-SourceTreeSha256 -ProjectRoot $projectRoot
 $expectedPrereg = if ($production) { $STEP63_PREREG } else { $Preregister }
 
 if ([string]::IsNullOrWhiteSpace($Out)) {
@@ -130,6 +156,9 @@ if ([string]::IsNullOrWhiteSpace($Out)) {
 }
 if ($Repetitions -lt 1) {
     throw "-Repetitions must be a positive integer, got $Repetitions"
+}
+if ($production -and $Repetitions -ne 8) {
+    throw "production containment soak requires exactly 8 repetitions"
 }
 
 $headerPath = Join-Path $Out "evidence-header.txt"
@@ -167,7 +196,7 @@ if ($VerifyOnly) {
         "producer-version" = $PRODUCER_VERSION
         "soak-script-sha256" = $soakHash
         "gate-script-sha256" = $gateHash
-        "process-sha256" = $processHash
+        "source-tree-sha256" = $sourceTreeHash
         "gate-script" = $GateScript
     }
     foreach ($key in $bindings.Keys) {
@@ -263,6 +292,12 @@ if ($VerifyOnly) {
     if ((Read-HeaderValue -Path $verdictPath -Key "hash-consistent") -ne "True") {
         $failures += "verdict does not assert a consistent staged-tree hash"
     }
+    $expectedRate = Format-Rate -PassCount $expectedCount -Total $expectedCount
+    $recordedRates = @([System.IO.File]::ReadAllLines($verdictPath) |
+        Where-Object { $_ -like 'containment_gate_rate=*' })
+    if ($recordedRates.Count -ne 1 -or $recordedRates[0] -cne $expectedRate) {
+        $failures += "recorded containment gate rate is absent or inconsistent"
+    }
 
     if ($failures.Count -gt 0) {
         foreach ($failure in $failures) { [Console]::Error.WriteLine($failure) }
@@ -294,7 +329,7 @@ $headerLines = @(
     "gate-script: $GateScript",
     "soak-script-sha256: $soakHash",
     "gate-script-sha256: $gateHash",
-    "process-sha256: $processHash",
+    "source-tree-sha256: $sourceTreeHash",
     "started-utc: $([DateTime]::UtcNow.ToString('o'))"
 )
 [System.IO.File]::WriteAllText($headerPath, ($headerLines -join "`n") + "`n")
