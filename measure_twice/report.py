@@ -40,6 +40,7 @@ from typing import Final
 
 from measure_twice import runner
 from measure_twice.adapters.base import UNRESOLVED_MODEL_ID
+from measure_twice.model_sweep_execution import is_concrete_provider_identity
 from measure_twice.runner import NO_RESPONSE_SCORER, RunError, RunRow
 from measure_twice.scoring.deterministic import PARSE_FAIL_MARKER, suite_score
 
@@ -296,10 +297,23 @@ def _model_report(
     """
     scores = [row.score for row in rows if row.score is not None]
     binding = execution.binding_for(model) if execution is not None else None
-    stored = sorted({row.model_id_resolved or UNRESOLVED_IDENTITY for row in rows})
-    resolved = stored if binding is not None else []
-    concrete = [value for value in resolved if value != UNRESOLVED_IDENTITY]
-    identity_unresolved = (UNRESOLVED_IDENTITY in resolved) or not concrete
+    raw_identities: list[object] = [row.model_id_resolved for row in rows]
+    stored = sorted({_stored_identity(value) for value in raw_identities})
+    resolved = (
+        sorted(
+            {
+                str(value)
+                for value in raw_identities
+                if is_concrete_provider_identity(value, binding[0])
+            }
+        )
+        if binding is not None
+        else []
+    )
+    identity_unresolved = not resolved or (
+        binding is not None
+        and any(not is_concrete_provider_identity(value, binding[0]) for value in raw_identities)
+    )
     provider = None if binding is None else binding[0]
     requested_model = None if binding is None else binding[1]
     preliminary = execution is not None and binding is not None and not identity_unresolved
@@ -423,6 +437,13 @@ def build_comparison(run_ids: Sequence[str], out_dir: str | Path = "data") -> Co
 def _fmt_score(score: float | None) -> str:
     """A score cell: one-decimal 0-100, or ``n/a`` when the model has no numeric score."""
     return "n/a" if score is None else f"{score:.1f}"
+
+
+def _stored_identity(value: object) -> str:
+    """Keep blank historical strings visible; reject a corrupt non-string run store."""
+    if not isinstance(value, str):
+        raise ReportError("model_id_resolved must be a string (corrupt run store)")
+    return value if value.strip() else "(blank identity)"
 
 
 def _fmt_resolved(model: ModelReport) -> str:

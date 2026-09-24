@@ -508,7 +508,8 @@ def test_html_unresolved_identity_marked(tmp_path: Path) -> None:
     html = render_transparency_report(report)
     haiku = next(a for a in _island(html)["execution"]["arms"] if a["model"] == "haiku")
     assert haiku["identity_unresolved"] is True
-    assert UNRESOLVED_MODEL_ID in haiku["resolved_identities"]
+    assert UNRESOLVED_MODEL_ID in haiku["stored_identities"]
+    assert haiku["resolved_identities"] == []
     assert haiku["routing_eligible"] is False
     assert UNRESOLVED_MODEL_ID in html
 
@@ -521,7 +522,7 @@ def test_html_mixed_identity_set_is_visible_and_negative(tmp_path: Path) -> None
     rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
     html = render_transparency_report(build_transparency_report(result.run_id, tmp_path))
     arm = next(a for a in _island(html)["execution"]["arms"] if a["model"] == "haiku")
-    assert arm["resolved_identities"] == [UNRESOLVED_MODEL_ID, "claude-x"]
+    assert arm["resolved_identities"] == ["claude-x"]
     assert arm["stored_identities"] == [UNRESOLVED_MODEL_ID, "claude-x"]
     assert arm["identity_provenance"] == "PROVIDER_IDENTITY_UNRESOLVED"
     assert arm["routing_eligible"] is False

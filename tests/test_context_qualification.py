@@ -81,6 +81,15 @@ result = run(
 if mode == 'incomplete':
     rows_path = result.run_dir / 'rows.jsonl'
     rows_path.write_text('\\n'.join(rows_path.read_text().splitlines()[:-1]) + '\\n')
+if mode in ('alias_only', 'blank_identity', 'nonstring_identity'):
+    rows_path = result.run_dir / 'rows.jsonl'
+    rows = [json.loads(line) for line in rows_path.read_text().splitlines()]
+    for row in rows:
+        row['model_id_resolved'] = (
+            row['model'] if mode == 'alias_only'
+            else ('   ' if mode == 'blank_identity' else 123)
+        )
+    rows_path.write_text('\\n'.join(json.dumps(row) for row in rows) + '\\n')
 print(f'{result.run_id}: {result.cells_completed}/{result.cells_total} cells done')
 """.replace("TESTS_PATH", repr(str(ROOT / "tests"))),
         encoding="utf-8",
@@ -95,6 +104,8 @@ print(f'{result.run_id}: {result.cells_completed}/{result.cells_total} cells don
 def _wrapper(tmp_path: Path, fake: Path, *, mode: str = "pass") -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["MT_FAKE_CANARY_MODE"] = mode
+    if mode == "cleanup_failure":
+        env["MT_CONTEXT_CANARY_TEST_FAIL_CLEANUP"] = "1"
     return subprocess.run(
         [
             "powershell",
@@ -205,7 +216,10 @@ def test_qualification_fake_live_and_verify_only_rechecks_hashes(tmp_path: Path)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell 5.1 wrapper runs on Windows")
-@pytest.mark.parametrize("mode", ["leak", "unresolved", "incomplete"])
+@pytest.mark.parametrize(
+    "mode",
+    ["leak", "unresolved", "incomplete", "alias_only", "blank_identity", "nonstring_identity"],
+)
 def test_qualification_rejects_bad_fake_live_evidence(tmp_path: Path, mode: str) -> None:
     result = _wrapper(tmp_path, _fake_command(tmp_path), mode=mode)
     assert result.returncode != 0, result.stdout + result.stderr
@@ -216,7 +230,7 @@ def test_qualification_rejects_bad_fake_live_evidence(tmp_path: Path, mode: str)
     assert index["reason"]
     if mode == "incomplete":
         assert "one terminal row" in index["reason"]
-    elif mode == "unresolved":
+    elif mode in ("unresolved", "alias_only", "blank_identity", "nonstring_identity"):
         assert "unresolved provider identity" in index["reason"]
     else:
         assert "planted sentinel" in index["reason"]
@@ -234,6 +248,38 @@ def test_qualification_refuses_to_overwrite_failed_attempt(tmp_path: Path) -> No
     assert second.returncode != 0
     assert "already has qualification evidence" in second.stderr
     assert index_path.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell 5.1 wrapper runs on Windows")
+def test_post_verification_cleanup_failure_never_leaves_pass(tmp_path: Path) -> None:
+    result = _wrapper(tmp_path, _fake_command(tmp_path), mode="cleanup_failure")
+    assert result.returncode != 0
+    index_path = tmp_path / "out" / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert index["status"] == index["qualification"] == "FAIL"
+    assert "injected cleanup failure" in index["reason"]
+    assert index["run_id"].startswith("run_")
+    assert not list(tmp_path.glob(".mt-context-canary-*"))
+    verify = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(SCRIPT),
+            "-VerifyOnly",
+            "-Out",
+            str(tmp_path / "out"),
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=90,
+    )
+    assert verify.returncode != 0
+    assert "not PASS" in verify.stderr
 
 
 def test_verifier_rejects_missing_index(tmp_path: Path) -> None:

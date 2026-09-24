@@ -13,9 +13,8 @@ import sys
 from pathlib import Path
 from typing import Any, cast
 
-from measure_twice.adapters.base import UNRESOLVED_MODEL_ID
 from measure_twice.config import load_config
-from measure_twice.model_sweep_execution import ExecutionReceipt
+from measure_twice.model_sweep_execution import ExecutionReceipt, is_concrete_provider_identity
 from measure_twice.runner import _read_execution_receipt, _read_manifest, _read_rows, load_run_suite
 from measure_twice.suite import load_suite
 
@@ -220,8 +219,8 @@ def evaluate(index_path: Path, out_dir: Path, *, verify_only: bool) -> dict[str,
             )
             _require(row.score == 1.0, f"{model}/{row.item_id} was not scored correct")
             _require(
-                bool(row.model_id_resolved) and row.model_id_resolved != UNRESOLVED_MODEL_ID,
-                f"{model}/{row.item_id} has unresolved provider identity",
+                is_concrete_provider_identity(row.model_id_resolved, bindings[model].provider),
+                f"{model}/{row.item_id} has unresolved provider identity (malformed or alias-only)",
             )
         arms.append(
             {

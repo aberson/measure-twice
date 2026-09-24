@@ -57,7 +57,8 @@ def test_report_execution_identity_entry_points(
         assert record["eligibility"] == "PRELIMINARY_SEAL_IDENTITY_OK"
         assert len(record["receipt_sha256"]) == 64
     elif state == "unresolved":
-        assert record["resolved_identities"] == [UNRESOLVED_MODEL_ID]
+        assert record["stored_identities"] == [UNRESOLVED_MODEL_ID]
+        assert record["resolved_identities"] == []
         assert record["eligibility"] == NOT_ROUTING_ELIGIBLE
         assert UNRESOLVED_MODEL_ID in md
     else:

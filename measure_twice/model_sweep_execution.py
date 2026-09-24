@@ -20,6 +20,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, cast
 
+from measure_twice.adapters.base import UNRESOLVED_MODEL_ID
+
 __all__ = [
     "CLAUDE_ARGV_TEMPLATE",
     "CLAUDE_ENV_ALLOWLIST",
@@ -39,6 +41,7 @@ __all__ = [
     "ModelBinding",
     "ModelSweepExecutionProfile",
     "canonical_sha256",
+    "is_concrete_provider_identity",
 ]
 
 PROFILE_SCHEMA_VERSION: Final[int] = 1
@@ -46,6 +49,23 @@ EXECUTION_RECEIPT_SCHEMA_VERSION: Final[int] = 1
 PROVIDER_LOCAL: Final[str] = "local-openai"
 PROVIDER_CLAUDE: Final[str] = "claude-cli"
 SUPPORTED_PROVIDERS: Final[frozenset[str]] = frozenset({PROVIDER_LOCAL, PROVIDER_CLAUDE})
+
+
+def is_concrete_provider_identity(value: object, provider: str) -> bool:
+    """Whether a stored row value is usable as provider identity evidence.
+
+    Claude's public aliases are requests, not resolved model IDs. Its returned ID must carry the
+    ``claude-`` model namespace; local OpenAI-compatible servers can return their configured model
+    names directly. Malformed historical row values stay visible but cannot qualify an arm.
+    """
+    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+        return False
+    if value == UNRESOLVED_MODEL_ID:
+        return False
+    if provider == PROVIDER_CLAUDE:
+        return re.fullmatch(r"claude-[A-Za-z0-9][A-Za-z0-9._-]*", value) is not None
+    return bool(value.strip())
+
 
 CLAUDE_SEALING_MODE: Final[str] = "prompt-only-v1"
 CLAUDE_EXECUTABLE: Final[str] = "claude"

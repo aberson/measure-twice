@@ -547,7 +547,8 @@ def test_report_unresolved_identity_marked_distinctly(tmp_path: Path) -> None:
     assert report.sealed is True
     haiku = {m.model: m for m in report.models}["haiku"]
     assert haiku.identity_unresolved is True
-    assert UNRESOLVED_MODEL_ID in haiku.resolved_identities
+    assert UNRESOLVED_MODEL_ID in haiku.stored_identities
+    assert haiku.resolved_identities == ()
     assert haiku.routing_eligible is False
 
     md = render_run_report(report)
@@ -568,7 +569,8 @@ def test_mixed_identity_set_is_ineligible_and_markdown_escapes_provider_text(
 
     report = build_run_report(result.run_id, tmp_path)
     haiku = report.models[0]
-    assert haiku.resolved_identities == (UNRESOLVED_MODEL_ID, "claude|<script>\nprobe")
+    assert haiku.stored_identities == (UNRESOLVED_MODEL_ID, "claude|<script>\nprobe")
+    assert haiku.resolved_identities == ()
     assert haiku.identity_unresolved is True
     assert haiku.routing_eligible is False
     md = render_run_report(report)
@@ -591,6 +593,38 @@ def test_legacy_requested_alias_fallback_is_explicitly_unverified(tmp_path: Path
     assert model.identity_provenance == UNVERIFIED_LEGACY
     assert model.identity_unresolved is True
     assert model.routing_eligible is False
+
+
+@pytest.mark.parametrize("bad_identity", ["haiku", "   "])
+def test_malformed_or_alias_only_identity_never_gets_preliminary_status(
+    tmp_path: Path, bad_identity: object
+) -> None:
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
+    before_score = build_run_report(result.run_id, tmp_path).models[0].suite_score
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["model_id_resolved"] = bad_identity
+    rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    model = build_run_report(result.run_id, tmp_path).models[0]
+    assert model.resolved_identities == ()
+    assert model.identity_unresolved is True
+    assert model.identity_provenance == "PROVIDER_IDENTITY_UNRESOLVED"
+    assert model.routing_eligible is False
+    assert model.eligibility == NOT_ROUTING_ELIGIBLE
+    assert model.suite_score == before_score
+
+
+def test_nonstring_identity_fails_report_loud_without_editing_store(tmp_path: Path) -> None:
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["model_id_resolved"] = 123
+    changed = "\n".join(json.dumps(row) for row in rows) + "\n"
+    rows_path.write_text(changed, encoding="utf-8")
+    with pytest.raises(ReportError, match="model_id_resolved must be a string"):
+        build_run_report(result.run_id, tmp_path)
+    assert rows_path.read_text(encoding="utf-8") == changed
 
 
 def test_jsonl_export_carries_execution_and_identity(tmp_path: Path) -> None:

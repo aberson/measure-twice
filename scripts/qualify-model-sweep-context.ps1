@@ -87,6 +87,22 @@ function Invoke-EvidenceCheck([string]$IndexPath, [string]$OutPath, [bool]$Store
     return ($output | ConvertFrom-Json)
 }
 
+function Clear-PlantedContext {
+    # Test injection exercises a failure after evidence verification but before PASS is written.
+    if ($env:MT_CONTEXT_CANARY_TEST_FAIL_CLEANUP -eq "1") {
+        Set-Item Env:MT_CONTEXT_CANARY_TEST_FAIL_CLEANUP -Value "consumed"
+        throw "injected cleanup failure"
+    }
+    Set-Location -LiteralPath $repoRoot
+    if (Test-Path -LiteralPath $repoFile) { Remove-Item -LiteralPath $repoFile -Force }
+    if (Test-Path -LiteralPath $custFile) { Remove-Item -LiteralPath $custFile -Force }
+    if (Test-Path -LiteralPath $canaryCwd) { Remove-Item -LiteralPath $canaryCwd -Force }
+    if ($null -eq $plantedEnvSaved) { Remove-Item -Path "Env:$EnvSentinelName" -ErrorAction SilentlyContinue }
+    else { Set-Item -Path "Env:$EnvSentinelName" -Value $plantedEnvSaved }
+    if ($null -eq $plantedSessionSaved) { Remove-Item -Path "Env:$SessionSentinelName" -ErrorAction SilentlyContinue }
+    else { Set-Item -Path "Env:$SessionSentinelName" -Value $plantedSessionSaved }
+}
+
 $modelList = @($Models.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
 if ($Models -ne "haiku,sonnet,opus" -or $Samples -ne 1) {
     Fail-Closed "qualification requires -Models haiku,sonnet,opus and -Samples 1"
@@ -148,6 +164,8 @@ $snapshotRepo = Join-Path $plantingDir "repository.txt"
 $snapshotCust = Join-Path $plantingDir "CLAUDE.md"
 $snapshotEnv = Join-Path $plantingDir "environment.json"
 $script:FailureReason = "qualification ended before PASS"
+$script:CleanedUp = $false
+$script:QualificationSucceeded = $false
 
 $plantedEnvSaved = [Environment]::GetEnvironmentVariable($EnvSentinelName, "Process")
 $plantedSessionSaved = [Environment]::GetEnvironmentVariable($SessionSentinelName, "Process")
@@ -229,6 +247,8 @@ try {
         Fail-Closed "planted cwd evidence changed during the model sweep"
     }
     $eval = Invoke-EvidenceCheck $indexPath $outFull $false
+    Clear-PlantedContext
+    $script:CleanedUp = $true
     $status = "PASS"
 
     # INDEX AFTER the calls: the verdict, per-arm identity/sentinel evidence, and the receipt.
@@ -255,9 +275,9 @@ try {
         started_utc      = $beforeIndex.started_utc
         finished_utc     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     }
-    Write-JsonFile $indexPath $afterIndex
-    Write-Line "wrote post-call index to $indexPath"
     Write-Line "qualification=$status passed=$($eval.passed) total=$($eval.total)"
+    Write-JsonFile $indexPath $afterIndex
+    $script:QualificationSucceeded = $true
     exit 0
 }
 catch {
@@ -266,10 +286,9 @@ catch {
     exit 1
 }
 finally {
-    Set-Location -LiteralPath $repoRoot
-    if (Test-Path -LiteralPath $indexPath) {
+    if (-not $script:QualificationSucceeded -and (Test-Path -LiteralPath $indexPath)) {
         $lastIndex = Read-JsonFile $indexPath
-        if ($lastIndex.status -eq "IN_PROGRESS") {
+        if ($lastIndex.status -eq "IN_PROGRESS" -or $lastIndex.status -eq "PASS") {
             $lastIndex.status = "FAIL"
             $lastIndex | Add-Member -NotePropertyName qualification -NotePropertyValue "FAIL" -Force
             $lastIndex | Add-Member -NotePropertyName reason -NotePropertyValue $script:FailureReason -Force
@@ -277,11 +296,8 @@ finally {
             Write-JsonFile $indexPath $lastIndex
         }
     }
-    if (Test-Path -LiteralPath $repoFile) { Remove-Item -LiteralPath $repoFile -Force }
-    if (Test-Path -LiteralPath $custFile) { Remove-Item -LiteralPath $custFile -Force }
-    if (Test-Path -LiteralPath $canaryCwd) { Remove-Item -LiteralPath $canaryCwd -Force }
-    if ($null -eq $plantedEnvSaved) { Remove-Item -Path "Env:$EnvSentinelName" -ErrorAction SilentlyContinue }
-    else { Set-Item -Path "Env:$EnvSentinelName" -Value $plantedEnvSaved }
-    if ($null -eq $plantedSessionSaved) { Remove-Item -Path "Env:$SessionSentinelName" -ErrorAction SilentlyContinue }
-    else { Set-Item -Path "Env:$SessionSentinelName" -Value $plantedSessionSaved }
+    if (-not $script:CleanedUp) {
+        try { Clear-PlantedContext }
+        catch { [Console]::Error.WriteLine("qualify-model-sweep-context: cleanup retry failed: $($_.Exception.Message)") }
+    }
 }
