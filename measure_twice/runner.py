@@ -662,9 +662,26 @@ def _doctor_execution(
 def _execution_bindings(
     config: RunConfig, suite: Suite, roster: Sequence[str], judges: Sequence[str]
 ) -> tuple[ModelBinding, ...]:
-    """Select the collection roster and, only for rubric suites, its future judges."""
+    """Select the collection roster and, only for rubric suites, its future judges.
+
+    A rubric run's judges must be scoreable by the shipped ``mt score`` path, whose only default
+    judge caller is Claude-only (``measure_twice/scoring/judge.py`` ``default_judge_caller``). A
+    non-Claude judge binding would pass every other fresh-run check and mint a run the product CLI
+    can never score — producer/consumer drift. Reject it HERE, before any run-dir mutation, so
+    collection and scoring agree on which judge selections are valid (fail-closed, plan §8 D9;
+    first-measurement plan §3 keeps judge providers Claude-only). An injected non-Claude
+    ``JudgeCaller`` is a library capability, not a CLI one, so it never reaches this path.
+    """
     aliases = list(roster)
     if suite.scoring.type == "rubric":
+        judge_bindings = _resolve_bindings(config, list(dict.fromkeys(judges)), label="judges")
+        unsupported = [b for b in judge_bindings if b.provider != PROVIDER_CLAUDE]
+        if unsupported:
+            detail = ", ".join(f"{b.alias!r} bound to provider {b.provider!r}" for b in unsupported)
+            raise RunError(
+                f"rubric judge(s) not scoreable by the default Claude judge: {detail}; "
+                f"rubric judging supports only the {PROVIDER_CLAUDE!r} provider"
+            )
         aliases.extend(judges)
     return _resolve_bindings(config, list(dict.fromkeys(aliases)), label="execution")
 

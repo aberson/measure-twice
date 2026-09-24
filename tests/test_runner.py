@@ -246,6 +246,48 @@ def test_local_dispatch_preserves_distinct_public_requested_and_observed_models(
     ]
 
 
+def test_rubric_run_rejects_non_claude_judge_before_run_dir(tmp_path: Path) -> None:
+    """A rubric suite whose selected judge is bound to a non-Claude provider is rejected BEFORE any
+    run-dir mutation: the shipped ``mt score`` path is Claude-only, so collecting such a run would
+    mint a store the product CLI can never score (producer/consumer drift, fail-closed)."""
+    profile = DEFAULT_EXECUTION_PROFILE.to_mapping()
+    profile["models"].append(
+        {
+            "alias": "public-local",
+            "provider": PROVIDER_LOCAL,
+            "requested_model": "registry.example/org/model:tag",
+        }
+    )
+    config = RunConfig(execution_profile=ModelSweepExecutionProfile.from_mapping(profile))
+    with pytest.raises(RunError, match=r"rubric judge.*not scoreable by the default Claude judge"):
+        run(
+            suite=_suite(["a"], scoring_type="rubric"),
+            config=config,
+            out_dir=tmp_path,
+            roster=["general-35b"],
+            judges=["public-local"],
+        )
+    assert not (tmp_path / "runs").exists()  # failed before any run-dir mutation
+
+
+def test_rubric_run_allows_claude_judge(tmp_path: Path) -> None:
+    """The rubric-judge provider guard admits a Claude-bound judge: a rubric collection with a
+    Claude judge mints its run dir normally (the guard rejects only non-Claude judge providers)."""
+    config = ModelSweepExecutionProfile.from_mapping(_sealed_test_config()["execution_profile"])
+    run_config = RunConfig(execution_profile=config, judges=["public-sonnet"])
+    stub = StubAdapters()
+    result = run(
+        suite=_suite(["a"], scoring_type="rubric"),
+        config=run_config,
+        out_dir=tmp_path,
+        roster=["public-sonnet"],
+        judges=["public-sonnet"],
+        claude_runner_factory=stub.claude_factory(),
+    )
+    assert not result.aborted
+    assert (tmp_path / "runs" / result.run_id).is_dir()
+
+
 def test_full_sweep_writes_manifest_and_all_rows(tmp_path: Path) -> None:
     suite = _suite(["a", "b", "c"])
     stub = StubAdapters()

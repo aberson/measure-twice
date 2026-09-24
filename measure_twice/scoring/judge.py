@@ -278,16 +278,26 @@ def _judge_one_cell(
         n_parse_fail = 0
         for _sample in range(k):
             result = judge_caller(judge_prompt, judge)
+            identity = result.resolved_model
+            has_identity = bool(identity.strip()) and identity != UNRESOLVED_MODEL_ID
+            if has_identity:
+                # A concrete provider identity pins this judge for the WHOLE pass, even on a
+                # non-success sample: the Claude adapter retains a real resolved id on failed,
+                # truncated, and no-response envelopes (adapters/claude_cli.py), so identity drift
+                # can surface on an unhappy sample too. Enforce continuity BEFORE the ok gate so a
+                # mixed pass (identity B on a failed sample, identity A on a parsed one) can never
+                # record a score under a silently changed identity — the fail-closed per-pass
+                # identity invariant must hold on every reachable sample, not just successes.
+                previous = identities.setdefault(judge, identity)
+                if previous != identity:
+                    raise ScoringError(f"judge {judge!r} provider identity changed during scoring")
             if not result.ok:
                 # INVOKE-ERROR (adapter error OR no-response): no usable text to parse. Excluded
-                # from both counters — a broken transport/empty answer is not a broken format.
+                # from both counters — a broken transport/empty answer is not a broken format. Any
+                # concrete identity it DID carry was already drift-checked above.
                 continue
-            identity = result.resolved_model
-            if not identity.strip() or identity == UNRESOLVED_MODEL_ID:
+            if not has_identity:
                 raise ScoringError(f"judge {judge!r} returned unresolved provider identity")
-            previous = identities.setdefault(judge, identity)
-            if previous != identity:
-                raise ScoringError(f"judge {judge!r} provider identity changed during scoring")
             value = parse_judge_score(result.response_raw)
             if value is None:
                 n_parse_fail += 1  # PARSE-FAIL: returned text, no parseable SCORE — counts to rate.

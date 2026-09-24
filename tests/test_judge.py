@@ -328,6 +328,80 @@ def test_invoke_error_and_parse_fail_counted_separately() -> None:
     assert result.per_judge_parse_stats == (("sonnet", 1, 2),)  # 1 fail / 2 attempts (err excluded)
 
 
+# --- The per-pass concrete-identity invariant (holds on non-success samples too) ----------------
+
+
+def _error_with_identity(identity: str) -> ModelCallResult:
+    """An adapter ERROR that STILL carries a concrete provider identity (the Claude adapter retains
+    a resolved id on failed/truncated envelopes) — the drift vector the invariant guards."""
+    return ModelCallResult.error(reason_class=RC_OS_ERROR, resolved_model=identity, elapsed_s=0.0)
+
+
+def _no_response_with_identity(identity: str) -> ModelCallResult:
+    """A NO-RESPONSE result carrying a concrete provider identity (the adapter retains it)."""
+    return ModelCallResult.no_response_result(resolved_model=identity, elapsed_s=0.0)
+
+
+def test_identity_drift_on_non_success_error_sample_aborts() -> None:
+    """A failed sample from concrete identity B followed by a parsed success from identity A must
+    abort: the per-pass identity invariant holds on the unhappy path, not just on successes."""
+    caller = _scripted_caller(
+        {
+            "sonnet": [
+                ModelCallResult.success(
+                    response_raw="SCORE: 7", resolved_model="claude-a", elapsed_s=0.0
+                ),
+                _error_with_identity("claude-b"),  # drift on a NON-success sample
+                ModelCallResult.success(
+                    response_raw="SCORE: 7", resolved_model="claude-a", elapsed_s=0.0
+                ),
+            ]
+        }
+    )
+    with pytest.raises(ScoringError, match="provider identity changed"):
+        judge_run([_cell("r")], judges=["sonnet"], judge_caller=caller, k=3)
+
+
+def test_identity_drift_on_no_response_sample_aborts() -> None:
+    """The same invariant on a NO-RESPONSE sample carrying a drifted concrete identity."""
+    caller = _scripted_caller(
+        {
+            "sonnet": [
+                _no_response_with_identity("claude-b"),  # first sample pins the baseline id
+                ModelCallResult.success(
+                    response_raw="SCORE: 5", resolved_model="claude-a", elapsed_s=0.0
+                ),
+                ModelCallResult.success(
+                    response_raw="SCORE: 5", resolved_model="claude-a", elapsed_s=0.0
+                ),
+            ]
+        }
+    )
+    with pytest.raises(ScoringError, match="provider identity changed"):
+        judge_run([_cell("r")], judges=["sonnet"], judge_caller=caller, k=3)
+
+
+def test_unresolved_identity_on_non_success_sample_is_tolerated() -> None:
+    """A failed sample with NO concrete identity (transport died before resolution) must NOT trip
+    the drift/unresolved guards — only a concrete drifted id does. The parsed successes still score.
+    """
+    caller = _scripted_caller(
+        {
+            "sonnet": [
+                _invoke_error(),  # default resolved_model is UNRESOLVED — tolerated on a failure
+                ModelCallResult.success(
+                    response_raw="SCORE: 8", resolved_model="claude-a", elapsed_s=0.0
+                ),
+                ModelCallResult.success(
+                    response_raw="SCORE: 6", resolved_model="claude-a", elapsed_s=0.0
+                ),
+            ]
+        }
+    )
+    result = judge_run([_cell("r")], judges=["sonnet"], judge_caller=caller, k=3)
+    assert result.results[0].judge_scores == (7.0,)  # median([8, 6]); the invoke-error is excluded
+
+
 # --- The per-judge parse-fail gate (PER-JUDGE, not pooled) ---------------------------------------
 
 
@@ -766,7 +840,11 @@ def test_cli_rubric_contract_from_collection_through_judge_process(
             "malformed": "unresolved",
             "identity-drift": "identity changed",
             "profile-drift": "stored receipt",
-            "provider-drift": "stored receipt",
+            # A score-time config that rebinds a Claude judge to a local provider is now caught by
+            # the shared collection/score-preflight provider guard (runner._execution_bindings, via
+            # load_run_judge_contract) BEFORE the receipt-drift check — same rejection (rc=1, no
+            # store mutation, no doctor probes), a more specific message.
+            "provider-drift": "not scoreable by the default Claude judge",
             "runtime-drift": "stored sealed contract",
             "legacy": "legacy-unsealed",
             "missing-judge-binding": "stored execution receipt",
@@ -866,61 +944,44 @@ def test_cli_mt_score_doctor_failure_is_clean_and_store_is_untouched(
     assert rows_path.read_bytes() == before
 
 
-def test_cli_mt_score_local_bound_default_judge_fails_cleanly_before_any_mutation(
+def test_cli_mt_run_rejects_local_bound_rubric_judge_before_any_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """A rubric collection whose selected judge is bound to a non-Claude provider is rejected at
+    COLLECTION, before any run-dir mutation — the shipped ``mt score`` path is Claude-only, so a
+    run with a local judge could never be scored (producer/consumer drift, fail-closed). This is
+    the earlier, primary boundary for the contract the default Claude judge caller also defends.
+    """
     monkeypatch.delenv(ENV_VAR, raising=False)
-    run_id = _seed_rubric_run(tmp_path, judges=["general-35b"])
-    run_dir = tmp_path / "runs" / run_id
-    before = {
-        name: (run_dir / name).read_bytes()
-        for name in ("rows.jsonl", "manifest.json", "suite.json")
-    }
-    before_entries = {path.name for path in run_dir.iterdir()}
-    config_path = tmp_path / "local-judge-config.json"
-    config_path.write_text(json.dumps({"judges": ["general-35b"]}), encoding="utf-8")
-    factory_calls: list[str] = []
-
-    def forbidden_factory() -> object:
-        factory_calls.append("created")
-        return lambda *_args: SubprocessResult(0, "", "")
+    suite_path = tmp_path / "rubric.json"
+    suite_path.write_text(json.dumps(asdict(_rubric_suite())), encoding="utf-8")
+    stub = StubAdapters()
 
     rc = main(
-        ["score", run_id, "--out", str(tmp_path), "--config", str(config_path)],
-        deps=CliDeps(claude_runner_factory=forbidden_factory),  # type: ignore[arg-type]
+        [
+            "run",
+            "--suite",
+            str(suite_path),
+            "--models",
+            "general-35b",
+            "--judges",
+            "general-35b",  # a local-openai binding — not scoreable by the default Claude judge
+            "--out",
+            str(tmp_path),
+        ],
+        deps=CliDeps(
+            local_transport_factory=stub.local_factory(),
+            claude_runner_factory=stub.claude_factory(),
+        ),
     )
 
     assert rc == 1
     error = capsys.readouterr().err
     assert "general-35b" in error and "local-openai" in error
-    assert factory_calls == []
-    assert {name: (run_dir / name).read_bytes() for name in before} == before
-    assert {path.name for path in run_dir.iterdir()} == before_entries
-    assert not (run_dir / "rows.jsonl.tmp").exists()
-
-
-def test_cli_mt_score_local_bound_injected_judge_caller_still_succeeds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv(ENV_VAR, raising=False)
-    run_id = _seed_rubric_run(tmp_path, judges=["general-35b"])
-    config_path = tmp_path / "local-judge-config.json"
-    config_path.write_text(json.dumps({"judges": ["general-35b"]}), encoding="utf-8")
-    caller = _scripted_caller({"general-35b": [_ok("SCORE: 7"), _ok("SCORE: 8"), _ok("SCORE: 9")]})
-
-    rc = main(
-        ["score", run_id, "--out", str(tmp_path), "--config", str(config_path)],
-        deps=CliDeps(judge_caller=caller),
-    )
-
-    assert rc == 0
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "runs" / run_id / "rows.jsonl").read_text().splitlines()
-    ]
-    assert rows[0]["score"] == pytest.approx(0.8)
+    assert stub.claude_calls == []  # rejected before any doctor/model call
+    assert not (tmp_path / "runs").exists()  # no run dir minted
 
 
 def test_rubric_run_scorer_skips_no_response_rows(tmp_path: Path) -> None:

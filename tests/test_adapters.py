@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 from conftest import _claude_stdout
 
-from measure_twice.adapters import claude_cli
+from measure_twice.adapters import _claude_runtime, claude_cli
 from measure_twice.adapters.base import (
     NO_RESPONSE,
     RC_BAD_ENVELOPE,
@@ -512,26 +512,56 @@ def test_claude_batch_default_runtime_doctor_fails_before_budget_or_model_call()
 def test_production_launcher_inventory_is_code_owned_not_ambient_root_variables(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Ambient root variables point at hostile decoys; production must ignore every one of them.
     monkeypatch.setenv("HOME", str(tmp_path / "hostile-home"))
     monkeypatch.setenv("USERPROFILE", str(tmp_path / "hostile-profile"))
     monkeypatch.setenv("APPDATA", str(tmp_path / "hostile-appdata"))
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "hostile-program-files"))
 
-    policy = _runtime_launcher_policy()
-
-    assert policy
-    assert all(boundary.launcher_directory.is_absolute() for boundary in policy)
-    assert all(not boundary.launcher_directory.is_relative_to(tmp_path) for boundary in policy)
     if sys.platform == "win32":
-        paths = claude_cli._windows_runtime_paths()
-        assert tuple(boundary.launcher_directory for boundary in policy) == (
-            paths.profile / ".local" / "bin",
-            paths.roaming_app_data / "npm",
-            paths.program_files / "nodejs",
-            paths.program_data / "chocolatey" / "bin",
+        # Discriminate the ambient-root regression this test NAMES by exercising the known-folder
+        # resolver seam directly: pin it to code-owned sentinel roots DISTINCT from every hostile
+        # env path, then prove the policy is built from those sentinels. A regression reading
+        # HOME/USERPROFILE/APPDATA/ProgramFiles would land under the hostile decoys and fail the
+        # equality below. This avoids two dead ends of a plain env-mutation test: a warm
+        # ``lru_cache(maxsize=1)`` (pre-mutation roots make the assert vacuous) and the fact that
+        # ``SHGetKnownFolderPath`` itself fails under the hostile environment, so a fresh real call
+        # cannot run here anyway — the seam is what production owns, so it is what we assert on.
+        sentinel = _claude_runtime._WindowsRuntimePaths(
+            profile=tmp_path / "kf-profile",
+            roaming_app_data=tmp_path / "kf-roaming",
+            local_app_data=tmp_path / "kf-local",
+            program_files=tmp_path / "kf-program-files",
+            program_data=tmp_path / "kf-program-data",
+            windows=tmp_path / "kf-windows",
         )
-        assert paths.profile / ".local" / "share" / "claude" / "versions" in policy[0].target_roots
+        monkeypatch.setattr(_claude_runtime, "_windows_runtime_paths", lambda: sentinel)
+        policy = _runtime_launcher_policy()
+
+        assert policy
+        assert all(boundary.launcher_directory.is_absolute() for boundary in policy)
+        assert tuple(boundary.launcher_directory for boundary in policy) == (
+            sentinel.profile / ".local" / "bin",
+            sentinel.roaming_app_data / "npm",
+            sentinel.program_files / "nodejs",
+            sentinel.program_data / "chocolatey" / "bin",
+        )
+        assert (
+            sentinel.profile / ".local" / "share" / "claude" / "versions" in policy[0].target_roots
+        )
+        for boundary in policy:  # no launcher root leaks from a hostile ambient variable.
+            assert not boundary.launcher_directory.is_relative_to(tmp_path / "hostile-home")
+            assert not boundary.launcher_directory.is_relative_to(tmp_path / "hostile-profile")
+            assert not boundary.launcher_directory.is_relative_to(tmp_path / "hostile-appdata")
+            assert not boundary.launcher_directory.is_relative_to(
+                tmp_path / "hostile-program-files"
+            )
     else:
+        policy = _runtime_launcher_policy()
+
+        assert policy
+        assert all(boundary.launcher_directory.is_absolute() for boundary in policy)
+        assert all(not boundary.launcher_directory.is_relative_to(tmp_path) for boundary in policy)
         account_home = claude_cli._posix_account_home()
         assert policy[0].launcher_directory == account_home / ".local" / "bin"
         assert account_home / ".local" / "share" / "claude" / "versions" in policy[0].target_roots
