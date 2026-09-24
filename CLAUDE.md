@@ -90,17 +90,16 @@ Gate evidence at wrap: native suite from the repo root **462 passed, 110 skipped
 
 > **The WSL containment gate is not reliably green: 9/10 (`0,0,0,1,0,0,0,0,0,0`) at wrap time,** run post-`6706fb6` on 2026-08-24. The single red landed on run 4, whose output was not captured; runs 7-10 were captured but all passed, so the failing case is **still unidentified**. This is the *sixth* appearance of one shape in this branch — a test asserting on a quantity it does not control (see [[test-asserts-uncontrolled-quantity]]); issue #58 item 3 already names a known red-when-healthy race in `test_linux_scope_absence_interval_restarts_when_the_path_reappears` as a candidate. **Never call this gate green off one run.** Run it 6–8× and report the pass *rate*; retrying until green hides exactly the defect you need to see. Step 27 builds more canaries on this substrate — identify and fix the remaining flake before adding to it.
 
-**Current work: Step 56 remains BLOCKED** (2026-09-09, #62) in
-`documentation/first-measurement-validity-and-luna-routing-plan.md`. Candidate `7f6a1df` is
-committed and pushed on `build-step-56-20260831053108`; it is preserved in
-`../worktree_build-step-56-20260831053108` (19 changed files). **Keep this worktree.**
-The configured five review rounds ended with three distinct gaps: unsupported judge providers
-accepted during collection, known identity drift ignored on failed judge samples, and a cached-path
-weakness in one Windows isolation test. Six independent reviews and offline reproductions are
-saved locally; the candidate has not merged. The next action is to resolve that bounded repair
-scope before advancing.
+**Current work: Step 56 DONE** (2026-09-23, #62) in
+`documentation/first-measurement-validity-and-luna-routing-plan.md` — the recovered candidate plus
+fix `47936ab` merged to master as `a72b48d`. The three review gaps are closed: non-Claude rubric
+judges are now rejected before run-dir/score mutation (shared `runner._execution_bindings` guard),
+per-pass judge provider-identity continuity is enforced on non-success samples too, and the Windows
+launcher-inventory test now discriminates via the known-folder resolver seam. An independent
+four-lens fresh-context review of the delta returned 4/4 PASS (one cosmetic Nit, no Block). The
+`../worktree_build-step-56-20260831053108` worktree is retained (fully merged; safe to remove later).
 
-**Then Step 57** adds receipt/identity reporting and the qualification wrapper. Step 58 performs
+**Next is Step 57** — receipt/identity reporting and the qualification wrapper. Step 58 performs
 three real Claude canaries before canonical Step 13 calibration. Canonical Steps 13-17 remain
 pending; Steps 13 and 16 require the local endpoint. `measure_twice/analyze/` does not yet exist.
 The authorized continuation after Step 57 is Gemini Step 64; its separate two-call live smoke
@@ -115,9 +114,16 @@ There are **five** plan documents partitioning step ids 1-17 / 18-24 / 25-55 / 5
 `documentation/gemini-model-sweep-plan.md`. The first-measurement coordinator governs the
 qualification dependencies above.
 
-**Gate evidence:** shipped code remains at 489 passed / 111 skipped (the #69 fix). The unmerged
-Step 56 candidate has 607 passed / 113 skipped, plus clean Ruff lint/format, strict mypy and build;
-its review gate is still NEEDS-WORK. Historical Steps 25-26 numbers above remain unchanged.
+**Gate evidence:** with Step 56 merged, master is at 610 passed / 113 skipped, plus clean Ruff
+lint/format, strict mypy (28 files) and `uv build`. The one failing test,
+`test_every_citation_is_current_and_the_map_is_exactly_rendered`, is pre-existing shared-workspace
+citation drift (identical on the pre-merge baseline; out of Step 56 scope — do not touch the ledger).
+Note a separate pre-existing agent_bench flake: `tests/agent_bench/test_cli.py::test_structure_only_
+executes_no_commands_calls_no_providers_and_writes_nothing` hashes the whole repo tree + `.git`
+(including transient `__pycache__/*.pyc`), so it can red on the FIRST full-suite run after any source
+change recompiles a `.pyc` inside its before/after window; it is warm-cache green and is a candidate
+fix for Step 62's agent_bench scope (see [[test-asserts-uncontrolled-quantity]]). Historical
+Steps 25-26 numbers above remain unchanged.
 
 > **Bundle bytecode is a load-time rejection, not a silent hash change (#69, fixed).** The loader refuses a bundle whose `seed/` or `oracle/` tree holds a `__pycache__` directory or a `.pyc`/`.pyo` file, naming the path. `__pycache__/` and `*.pyc` are gitignored (`.pyo` is not), so plain `git status` cannot see the common case — use `git status --porcelain --ignored -- suites`. The rule covers that one artifact class only; other generated files are still hashed silently.
 

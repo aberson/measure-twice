@@ -1,8 +1,9 @@
 # First-Measurement Validity Gates and Luna Routing
 
-**Status:** BLOCKED (2026-09-09) — 0/8 steps complete; umbrella #60 and Step 56-63 issues
-#62/#63/#64/#65/#66/#67/#61/#68 backfilled; cross-plan links verified. Step 56 is preserved
-unmerged after its review cap; the remaining defects are recorded below.
+**Status:** IN PROGRESS (2026-09-23) — 1/8 steps complete (Step 56 DONE, merged to master as
+`a72b48d`); umbrella #60 and Step 56-63 issues #62/#63/#64/#65/#66/#67/#61/#68 backfilled; cross-plan
+links verified. Step 57 (next) and Step 62 (independent) remain to build; Steps 58/61/63 are live
+observation waits.
 
 **Repo-sync phase identifier:** `first-measurement-validity-and-luna-routing` (must be passed
 explicitly; it cannot be inferred from this filename)
@@ -239,16 +240,23 @@ only run/evidence artifacts; they add no code and contain no confirmation prompt
   `"uv run pytest -q tests/test_model_sweep_execution.py tests/test_adapters.py tests/test_config.py tests/test_runner.py"`
   exits 0 through the production builder
 - **Depends on:** 7, 12 (shipped)
-- **Status:** BLOCKED (2026-09-09)
+- **Status:** DONE (2026-09-23)
 
-The recovery candidate `7f6a1df` is committed and pushed on
-`build-step-56-20260831053108`, but remains unmerged after the configured five review rounds.
-The complete native suite passes (607 passed, 113 explicit platform skips), as do Ruff lint/format,
-strict mypy, and package build. The aggregate of six independent reviews is NEEDS-WORK: collection accepts
-judge providers that the default CLI cannot score; rubric scoring ignores concrete identity drift
-on non-success judge samples; and one Windows environment-isolation test can reuse a warm path
-cache. Offline production-path probes reproduced all three problems. Preserve the candidate and
-review evidence; resolve these before Step 57 or Gemini Step 64. No live qualification ran.
+The recovery candidate (branch `build-step-56-20260831053108`) plus the fix commit `47936ab`
+merged to master as `a72b48d` on 2026-09-23. The three previously-blocking defects are resolved:
+(1) `runner._execution_bindings` now rejects any non-Claude rubric judge before run-dir creation
+AND at the `mt score` preflight (shared guard), so a run the Claude-only scorer cannot judge can
+neither be collected nor freshly judged; (2) `judge._judge_one_cell` enforces per-pass provider-
+identity continuity on every sample carrying a concrete id, including failed/no-response envelopes,
+while still tolerating a genuinely-unresolved identity on a failed sample; (3) the Windows
+launcher-inventory test now exercises the known-folder resolver seam directly (code-owned sentinel
+roots vs hostile env decoys), verified to fail on a simulated env-reading regression. An
+independent four-lens fresh-context review of the delta returned 4/4 PASS (correctness, bugs,
+test-quality, plan-conformance; one cosmetic Nit, no Block). Post-merge gates on master: Ruff
+lint/format clean, mypy --strict clean (28 files), `uv build` clean, `pytest` 610 passed /
+113 skipped. The sole failing test — `test_every_citation_is_current_and_the_map_is_exactly_rendered`
+— is pre-existing shared-workspace citation drift identical on the pre-merge baseline and out of
+Step 56 scope (§3 non-goal: do not touch the ledger). No live qualification ran (Step 58 owns it).
 
 ### Step 57: Report the seal and build its live qualification path
 
