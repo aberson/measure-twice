@@ -2088,11 +2088,33 @@ class _LinuxResourceGuardState:
         return namespace_owner
 
     def outer_owner_exited(self) -> bool:
+        """Has the exact captured outer owner terminated (record gone, or a killed zombie)?
+
+        The immutable start token (``/proc/<pid>/stat`` field 19) alone cannot separate a
+        SIGKILLed-but-unreaped zombie -- which has terminated and executes nothing, so it is
+        contained -- from a process that is still running, which is an escape: both keep a record
+        whose token is unchanged. This predicate is only consulted from the post-kill bounded
+        settle loops in :meth:`control_missing_after_collection`, so the exact owner is expected to
+        already be gone. Accept the ``Z`` state there as a settled terminal state while any live
+        state (``R``/``S``/``D``/``T``/...) still fails closed, preserving the live-process escape
+        assertion the containment gate depends on.
+        """
+
         identity = self.outer_owner_identity
         if identity is None:
             raise ProcessExecutionError("Linux resource guard outer owner was not captured")
         pid, starttime = identity
-        return _pid_starttime(pid) != starttime
+        if _pid_starttime(pid) != starttime:
+            # The exact process is gone: the record vanished, or a reused PID no longer matches
+            # this owner's immutable start token.
+            return True
+        state = _pid_state(pid)
+        # Re-confirm identity after reading the state: a reap-then-PID-reuse between the two reads
+        # could otherwise let an unrelated new process's state decide this. If the token still
+        # matches, the state belongs to the exact captured owner; if it changed, the owner is gone.
+        if _pid_starttime(pid) != starttime:
+            return True
+        return state == "Z"
 
     def _verify_expected_scope_identity(self) -> None:
         try:

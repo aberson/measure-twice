@@ -1,0 +1,282 @@
+[CmdletBinding()]
+param(
+    [string]$Distribution = "",
+    [int]$Repetitions = 8,
+    [string]$Out = "",
+    [string]$Preregister = "",
+    [switch]$VerifyOnly,
+    [string]$GateScript = ""
+)
+
+# Autonomous soak wrapper for the Windows control-plane WSL-ext4 containment gate
+# (scripts/test-agent-bench-wsl.ps1). It runs the gate N times, captures every per-run log,
+# asserts ONE staged-tree hash across runs, rejects ANY nonzero gate exit, writes the
+# preregistration to the evidence header BEFORE run 1, and prints the pass rate. -VerifyOnly is a
+# fail-closed receipt check over an already-produced evidence directory. ASCII-only by contract
+# (see .claude/rules/windows-shell.md): PowerShell 5.1 decodes a no-BOM .ps1 as cp1252.
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+$HASH_PATTERN = 'staged-tree-sha256:\s*([0-9a-f]{64})'
+
+function Get-StagedTreeHash {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+
+    $match = [regex]::Match($Text, $HASH_PATTERN)
+    if ($match.Success) {
+        return $match.Groups[1].Value
+    }
+    return ""
+}
+
+function Read-HeaderValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Key
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        $match = [regex]::Match($line, ('^' + [regex]::Escape($Key) + ':\s*(.*)$'))
+        if ($match.Success) {
+            return $match.Groups[1].Value
+        }
+    }
+    return $null
+}
+
+function Get-RunLogPaths {
+    param([Parameter(Mandatory = $true)][string]$Directory)
+
+    return @(
+        Get-ChildItem -LiteralPath $Directory -Filter 'run-*.log' -File |
+            Sort-Object -Property Name |
+            ForEach-Object { $_.FullName }
+    )
+}
+
+function New-RunLogPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][int]$Index
+    )
+
+    $name = "run-{0:D2}.log" -f $Index
+    return (Join-Path $Directory $name)
+}
+
+function Format-Rate {
+    param(
+        [Parameter(Mandatory = $true)][int]$PassCount,
+        [Parameter(Mandatory = $true)][int]$Total
+    )
+
+    $pct = 0.0
+    if ($Total -gt 0) {
+        $pct = 100.0 * $PassCount / $Total
+    }
+    $pctText = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:0.0}", $pct)
+    return "containment_gate_rate=$PassCount/$Total ($pctText%)"
+}
+
+$scriptRoot = Split-Path -Parent $PSCommandPath
+if ([string]::IsNullOrWhiteSpace($GateScript)) {
+    $GateScript = Join-Path $scriptRoot "test-agent-bench-wsl.ps1"
+}
+
+if ([string]::IsNullOrWhiteSpace($Out)) {
+    throw "-Out is required (the evidence directory for headers, per-run logs, and the verdict)"
+}
+if ($Repetitions -lt 1) {
+    throw "-Repetitions must be a positive integer, got $Repetitions"
+}
+
+$headerPath = Join-Path $Out "evidence-header.txt"
+$verdictPath = Join-Path $Out "verdict.txt"
+
+if ($VerifyOnly) {
+    # Fail-closed receipt check: the evidence directory must already carry a header, a PASS
+    # verdict, the expected number of run logs, and one staged-tree hash carried by every log.
+    $failures = @()
+    if (-not (Test-Path -LiteralPath $headerPath)) {
+        $failures += "evidence header is absent: $headerPath"
+    }
+    if (-not (Test-Path -LiteralPath $verdictPath)) {
+        $failures += "verdict is absent: $verdictPath"
+    }
+    if ($failures.Count -gt 0) {
+        foreach ($failure in $failures) { [Console]::Error.WriteLine($failure) }
+        exit 1
+    }
+
+    $headerPrereg = Read-HeaderValue -Path $headerPath -Key "preregistration"
+    $headerReps = Read-HeaderValue -Path $headerPath -Key "repetitions"
+    $verdictValue = Read-HeaderValue -Path $verdictPath -Key "verdict"
+    $verdictReps = Read-HeaderValue -Path $verdictPath -Key "repetitions"
+    $verdictHash = Read-HeaderValue -Path $verdictPath -Key "staged-tree-sha256"
+
+    if ([string]::IsNullOrWhiteSpace($headerPrereg)) {
+        $failures += "preregistration sentence is absent from the evidence header"
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($Preregister) -and $headerPrereg -ne $Preregister) {
+        $failures += "preregistration sentence does not match the expected one (stale)"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Preregister)) {
+        # Cross-check the run-time expectation against the recorded count.
+        if ($headerReps -ne [string]$Repetitions) {
+            $failures += "expected $Repetitions repetitions but the header records $headerReps"
+        }
+    }
+    if ($headerReps -ne $verdictReps) {
+        $failures += "header repetitions ($headerReps) and verdict repetitions ($verdictReps) disagree"
+    }
+    if ($verdictValue -ne "PASS") {
+        $failures += "terminal verdict is not PASS (got '$verdictValue')"
+    }
+    if ($verdictHash -notmatch '^[0-9a-f]{64}$') {
+        $failures += "verdict staged-tree hash is absent or malformed"
+    }
+
+    $logs = Get-RunLogPaths -Directory $Out
+    $expectedCount = 0
+    if ([int]::TryParse($verdictReps, [ref]$expectedCount)) {
+        if ($logs.Count -ne $expectedCount) {
+            $failures += "expected $expectedCount run logs but found $($logs.Count)"
+        }
+    }
+    else {
+        $failures += "verdict repetitions is not an integer: '$verdictReps'"
+    }
+    foreach ($log in $logs) {
+        $logHash = Get-StagedTreeHash -Text ([System.IO.File]::ReadAllText($log))
+        if ($logHash -eq "") {
+            $failures += "run log carries no staged-tree hash: $log"
+        }
+        elseif ($verdictHash -match '^[0-9a-f]{64}$' -and $logHash -ne $verdictHash) {
+            $failures += "run log staged-tree hash drifted from the verdict (stale): $log"
+        }
+    }
+
+    if ($failures.Count -gt 0) {
+        foreach ($failure in $failures) { [Console]::Error.WriteLine($failure) }
+        exit 1
+    }
+    Write-Output "verify-only=PASS $((Format-Rate -PassCount $expectedCount -Total $expectedCount))"
+    exit 0
+}
+
+if ([string]::IsNullOrWhiteSpace($Preregister)) {
+    throw "-Preregister is required for a soak run (the claim is written before run 1)"
+}
+if (-not (Test-Path -LiteralPath $GateScript)) {
+    throw "gate script not found: $GateScript"
+}
+$powershell = Get-Command powershell.exe -ErrorAction Stop
+
+if (-not (Test-Path -LiteralPath $Out)) {
+    $null = New-Item -ItemType Directory -Path $Out -Force
+}
+
+# Write the preregistration to the evidence header BEFORE run 1: the claim precedes any data.
+$headerLines = @(
+    "preregistration: $Preregister",
+    "repetitions: $Repetitions",
+    "distribution: $Distribution",
+    "gate-script: $GateScript",
+    "started-utc: $([DateTime]::UtcNow.ToString('o'))"
+)
+[System.IO.File]::WriteAllText($headerPath, ($headerLines -join "`n") + "`n")
+
+$exitCodes = @()
+$hashes = @()
+$passCount = 0
+for ($index = 1; $index -le $Repetitions; $index++) {
+    $logPath = New-RunLogPath -Directory $Out -Index $index
+    $stdoutPath = "$logPath.stdout"
+    $stderrPath = "$logPath.stderr"
+    $gateArgs = @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $GateScript,
+        "-Distribution", $Distribution
+    )
+    # Foreground child process (never backgrounded): captures the exact exit code without the
+    # gate's own `exit` terminating this wrapper, and preserves the full run log as evidence.
+    $process = Start-Process -FilePath $powershell.Source -ArgumentList $gateArgs `
+        -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $exitCode = $process.ExitCode
+
+    $stdoutText = ""
+    if (Test-Path -LiteralPath $stdoutPath) {
+        $stdoutText = [System.IO.File]::ReadAllText($stdoutPath)
+    }
+    $stderrText = ""
+    if (Test-Path -LiteralPath $stderrPath) {
+        $stderrText = [System.IO.File]::ReadAllText($stderrPath)
+    }
+    $combined = "=== run $index exit $exitCode ===`n=== stdout ===`n$stdoutText`n=== stderr ===`n$stderrText`n"
+    [System.IO.File]::WriteAllText($logPath, $combined)
+    foreach ($temp in @($stdoutPath, $stderrPath)) {
+        if (Test-Path -LiteralPath $temp) {
+            Remove-Item -LiteralPath $temp -Force
+        }
+    }
+
+    $exitCodes += $exitCode
+    $hashes += (Get-StagedTreeHash -Text $stdoutText)
+    if ($exitCode -eq 0) {
+        $passCount += 1
+    }
+    Write-Output "run $index exit $exitCode"
+}
+
+# Reject any nonzero gate exit and assert exactly ONE staged-tree hash across the runs.
+$distinctHashes = @($hashes | Where-Object { $_ -ne "" } | Select-Object -Unique)
+$singleHash = ""
+$hashConsistent = $true
+if ($distinctHashes.Count -eq 1) {
+    $singleHash = $distinctHashes[0]
+}
+elseif ($distinctHashes.Count -gt 1) {
+    $hashConsistent = $false
+}
+
+# A passing run that carried no hash is a broken receipt, not a pass.
+$everyPassHasHash = $true
+for ($index = 0; $index -lt $exitCodes.Count; $index++) {
+    if ($exitCodes[$index] -eq 0 -and $hashes[$index] -eq "") {
+        $everyPassHasHash = $false
+    }
+}
+
+$allPassed = ($passCount -eq $Repetitions)
+$isPass = $allPassed -and $hashConsistent -and $everyPassHasHash -and ($singleHash -ne "")
+$verdict = if ($isPass) { "PASS" } else { "FAIL" }
+$rateLine = Format-Rate -PassCount $passCount -Total $Repetitions
+
+$verdictLines = @("preregistration: $Preregister", "repetitions: $Repetitions")
+for ($index = 1; $index -le $Repetitions; $index++) {
+    $verdictLines += ("run-{0:D2}-exit: {1}" -f $index, $exitCodes[$index - 1])
+}
+$verdictLines += "pass-count: $passCount"
+$verdictLines += "staged-tree-sha256: $singleHash"
+$verdictLines += "hash-consistent: $hashConsistent"
+$verdictLines += $rateLine
+$verdictLines += "verdict: $verdict"
+[System.IO.File]::WriteAllText($verdictPath, ($verdictLines -join "`n") + "`n")
+
+if (-not $hashConsistent) {
+    [Console]::Error.WriteLine("staged-tree hash drifted across runs: $($distinctHashes -join ', ')")
+}
+if (-not $everyPassHasHash) {
+    [Console]::Error.WriteLine("a passing run produced no staged-tree hash")
+}
+
+Write-Output $rateLine
+Write-Output "verdict=$verdict"
+if ($isPass) {
+    exit 0
+}
+exit 1

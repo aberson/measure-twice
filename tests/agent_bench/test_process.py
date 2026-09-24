@@ -1026,6 +1026,174 @@ def test_identity_settle_accepts_a_zombie_but_still_fails_on_a_live_process(
         live.wait()
 
 
+def _guard_with_owner(
+    scope_dir: Path, owner_identity: tuple[int, int]
+) -> process_module._LinuxResourceGuardState:
+    """Build a minimal resource-guard state pinned to one captured outer-owner identity."""
+
+    scope_dir.mkdir()
+    (scope_dir / "cgroup.kill").write_bytes(b"")
+    kill_fd = os.open(scope_dir / "cgroup.kill", os.O_WRONLY | os.O_CLOEXEC)
+    capability = LinuxPathCapability.acquire_absolute(scope_dir, expected="directory")
+    guard = process_module._LinuxResourceGuardState(
+        capability,
+        kill_fd,
+        LinuxResourceGuard(1, 1, 100),
+        str(scope_dir),
+        capability.identity,
+        {},
+        {},
+    )
+    guard.outer_owner_identity = owner_identity
+    guard.trusted_for_cleanup = True
+    guard.validated_for_release = True
+    return guard
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc identity state semantics")
+def test_outer_owner_exited_settles_gone_and_zombie_but_fails_on_live(tmp_path: Path) -> None:
+    """Production terminal identity settlement: gone and ``Z`` settle, a live process stays red.
+
+    Red-on-garbage anchor for the wiring of :func:`_pid_state` into
+    :meth:`_LinuxResourceGuardState.outer_owner_exited`.  Widening it to accept any readable record
+    (e.g. a live ``S``) would silently blind the containment gate; pin both directions here.
+    """
+
+    baseline = _linux_fd_snapshot()
+    # "gone": a reaped process whose exact (pid, start token) can never match again.
+    reaped = subprocess.Popen(
+        ("/bin/true",),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    reaped.wait(timeout=5)
+    gone_guard = _guard_with_owner(tmp_path / "gone.scope", (reaped.pid, 1))
+    try:
+        assert gone_guard.outer_owner_exited() is True
+    finally:
+        gone_guard.close()
+
+    live = subprocess.Popen(
+        ("/bin/sleep", "30"),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        token = process_module._pid_starttime(live.pid)
+        assert token is not None
+        # "live": a running process (state R/S) is an escape and must still fail closed.
+        live_guard = _guard_with_owner(tmp_path / "live.scope", (live.pid, token))
+        try:
+            assert live_guard.outer_owner_exited() is False
+        finally:
+            live_guard.close()
+
+        # "zombie": same pid and same start token as the live case -- only the state differs, and
+        # that alone is what makes it contained rather than an escape.
+        live.kill()
+        deadline = time.monotonic() + 5.0
+        while process_module._pid_state(live.pid) != "Z":
+            if time.monotonic() >= deadline:
+                raise AssertionError("setup: the killed owner never became a zombie")
+            time.sleep(0.01)
+        assert process_module._pid_starttime(live.pid) == token
+        zombie_guard = _guard_with_owner(tmp_path / "zombie.scope", (live.pid, token))
+        try:
+            assert zombie_guard.outer_owner_exited() is True
+        finally:
+            zombie_guard.close()
+    finally:
+        live.kill()
+        live.wait()
+    _assert_linux_fd_baseline(baseline)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux zombie-owner terminal settlement")
+def test_zombie_outer_owner_settles_collection_and_closes_every_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SIGKILLed-but-unreaped outer owner is terminal: collection settles with no FD leak.
+
+    This is the integration twin of the direct predicate anchor: the killed-but-unreaped owner
+    keeps an unchanged start token, so before this repair the bounded settle loop in
+    ``control_missing_after_collection`` timed out and surfaced a false infrastructure failure.
+    The live-owner timeout path (which must still fail closed while closing every owned FD) is
+    covered by ``test_linux_fast_scope_collection_...``'s ``owner-alive`` case, unchanged by this
+    repair.
+    """
+
+    monkeypatch.setattr(process_module, "_REAP_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(process_module, "_POLL_INTERVAL_S", 0.005)
+    baseline = _linux_fd_snapshot()
+    scope = tmp_path / "zombie-collect.scope"
+    scope.mkdir()
+    (scope / "cgroup.kill").write_bytes(b"")
+    kill_fd = os.open(scope / "cgroup.kill", os.O_WRONLY | os.O_CLOEXEC)
+    capability = LinuxPathCapability.acquire_absolute(scope, expected="directory")
+    # Retire the scope so a pinned cgroup.events read returns ENOENT, forcing the collection
+    # settle path that consults outer_owner_exited().
+    (scope / "cgroup.kill").unlink()
+    scope.rmdir()
+
+    owner = subprocess.Popen(
+        ("/bin/sleep", "30"),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    guard = process_module._LinuxResourceGuardState(
+        capability,
+        kill_fd,
+        LinuxResourceGuard(1, 1, 100),
+        str(scope),
+        capability.identity,
+        {},
+        {},
+    )
+    status_read_fd = -1
+    try:
+        token = cast("int", process_module._pid_starttime(owner.pid))
+        owner.kill()
+        deadline = time.monotonic() + 5.0
+        while process_module._pid_state(owner.pid) != "Z":
+            if time.monotonic() >= deadline:
+                raise AssertionError("setup: the killed owner never became a zombie")
+            time.sleep(0.01)
+        guard.outer_owner_identity = (owner.pid, token)
+        guard.trusted_for_cleanup = True
+        guard.validated_for_release = True
+
+        status_read_fd, status_write_fd = os.pipe()
+        os.write(status_write_fd, _packed_supervisor_status(hard_limit=1, hard_observed=987_654))
+        os.close(status_write_fd)
+        proc = subprocess.Popen(
+            ("/bin/true",),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        proc.wait(timeout=5)
+        runtime = process_module._RunningProcess(
+            proc=proc,
+            started=time.monotonic(),
+            process_group_id=None,
+            status_read_fd=status_read_fd,
+        )
+        runtime.resource_guard = guard
+        process_module._cleanup_process(runtime, abnormal=False)
+        assert guard.collected is True
+        assert runtime.resource_guard is None
+    finally:
+        guard.close()
+        process_module._close_fd(status_read_fd)
+        owner.kill()
+        owner.wait()
+    _assert_linux_fd_baseline(baseline)
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux post-spawn cleanup invariant")
 @pytest.mark.parametrize("failing_thread", ["agent-bench-descendants", "agent-bench-stderr"])
 def test_linux_partial_thread_start_failure_reaps_process_and_closes_fds(
