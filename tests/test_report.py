@@ -27,10 +27,16 @@ from pathlib import Path
 import pytest
 from conftest import StubAdapters, _iid  # shared offline stub scaffolding (tests/conftest.py)
 
-from measure_twice.adapters.base import ModelCallResult
+from measure_twice.adapters.base import UNRESOLVED_MODEL_ID, ModelCallResult
+from measure_twice.adapters.claude_cli import SubprocessResult
 from measure_twice.cli import CliDeps, _local_endpoint_unreachable, main
 from measure_twice.config import ENV_VAR, RunConfig
+from measure_twice.model_sweep_execution import canonical_sha256
 from measure_twice.report import (
+    LEGACY_UNSEALED,
+    NOT_ROUTING_ELIGIBLE,
+    PRELIMINARY_SEAL_IDENTITY_OK,
+    UNVERIFIED_LEGACY,
     ReportError,
     build_comparison,
     build_run_report,
@@ -428,3 +434,335 @@ def test_cli_report_compare_mismatch_exits_nonzero(
     rc = main(["report", r1.run_id, "--compare", r3.run_id, "--out", str(out)])
     assert rc == 1
     assert "mismatch" in capsys.readouterr().err
+
+
+# --- Step 57: execution receipt + per-alias resolved identity in reports -------------------
+
+
+def _strip_execution_receipt(out_dir: Path, run_id: str) -> None:
+    """Turn a stored sealed run into a LEGACY (unsealed) run by dropping its execution receipt.
+
+    The rows — and therefore the official scores — are left byte-for-byte untouched; only the
+    additive manifest receipt key is removed, exactly as a pre-Step-56 manifest looks.
+    """
+    manifest_path = out_dir / "runs" / run_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["execution_receipt"]
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def _unresolved_claude_stdout(text: str) -> SubprocessResult:
+    """A success envelope whose ambiguous ``modelUsage`` yields no concrete provider identity."""
+    body = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": text,
+            "modelUsage": {"model-a": {"inputTokens": 1}, "model-b": {"inputTokens": 1}},
+        }
+    )
+    return SubprocessResult(0, body, "")
+
+
+def test_report_surfaces_execution_receipt_and_identity(tmp_path: Path) -> None:
+    """A sealed run names provider, requested, resolved, and receipt hashes."""
+    suite = _verdict_suite()
+    result = _run_scored(
+        suite,
+        out_dir=tmp_path,
+        roster=["haiku"],
+        claude=lambda p: "pass" if _iid(p) == "i1" else "flag",
+    )
+    report = build_run_report(result.run_id, tmp_path)
+
+    assert report.sealed is True
+    assert report.execution is not None
+    haiku = {m.model: m for m in report.models}["haiku"]
+    assert haiku.provider == "claude-cli"
+    assert haiku.requested_model == "haiku"
+    assert haiku.resolved_identities == ("claude-x",)  # the stub's concrete provider identity
+    assert haiku.identity_unresolved is False
+    assert haiku.routing_eligible is None
+    assert haiku.eligibility == PRELIMINARY_SEAL_IDENTITY_OK
+    assert haiku.suite_score == 100.0  # official score is untouched by the seal evidence
+
+    md = render_run_report(report)
+    for token in (
+        report.execution.execution_profile_sha256,
+        report.execution.provider_profile_sha256,
+        report.execution.context_profile_sha256,
+        report.execution.receipt_sha256,
+        "claude-cli",
+        "claude-x",
+        PRELIMINARY_SEAL_IDENTITY_OK,
+        "Execution receipt",
+    ):
+        assert token in md
+
+
+def test_markdown_escapes_malicious_claude_runtime_metadata(tmp_path: Path) -> None:
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
+    manifest_path = tmp_path / "runs" / result.run_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    receipt = manifest["execution_receipt"]
+    receipt["claude_cli"]["executable"] = "claude`<img src=x onerror=alert(1)>"
+    receipt["claude_cli"]["version"] = "v`<script>alert(1)</script>"
+    receipt["receipt_sha256"] = canonical_sha256(
+        {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    markdown = render_run_report(build_run_report(result.run_id, tmp_path))
+    cli_line = next(line for line in markdown.splitlines() if line.startswith("- **Claude CLI:**"))
+    assert "<img" not in cli_line and "<script>" not in cli_line
+    assert "&lt;img src=x onerror=alert(1)&gt;" in cli_line
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in cli_line
+    assert "``claude`" in cli_line and "`` (version ``v`" in cli_line
+
+
+def test_report_legacy_run_marked_unsealed_without_changing_scores(tmp_path: Path) -> None:
+    """A legacy manifest is unsealed and ineligible, while scores remain unchanged."""
+    suite = _verdict_suite()
+    result = _run_scored(
+        suite,
+        out_dir=tmp_path,
+        roster=["haiku"],
+        claude=lambda p: "pass" if _iid(p) == "i1" else "flag",
+    )
+    sealed_score = {
+        m.model: m.suite_score for m in build_run_report(result.run_id, tmp_path).models
+    }
+    _strip_execution_receipt(tmp_path, result.run_id)
+
+    report = build_run_report(result.run_id, tmp_path)
+    assert report.sealed is False
+    assert report.execution is None
+    haiku = {m.model: m for m in report.models}["haiku"]
+    assert haiku.provider is None
+    assert haiku.requested_model is None
+    assert haiku.stored_identities == ("claude-x",)
+    assert haiku.resolved_identities == ()
+    assert haiku.identity_provenance == UNVERIFIED_LEGACY
+    assert haiku.routing_eligible is False
+    assert haiku.eligibility == NOT_ROUTING_ELIGIBLE
+    # The official score is identical to the sealed reading.
+    assert haiku.suite_score == sealed_score["haiku"] == 100.0
+
+    md = render_run_report(report)
+    assert LEGACY_UNSEALED in md
+    assert NOT_ROUTING_ELIGIBLE in md
+    assert "100.0" in md  # score still rendered, unchanged
+
+
+def test_report_unresolved_identity_marked_distinctly(tmp_path: Path) -> None:
+    """A sealed arm with no concrete provider identity is flagged unresolved + not eligible."""
+    suite = _verdict_suite()
+    result = _run_scored(
+        suite,
+        out_dir=tmp_path,
+        roster=["haiku"],
+        claude=lambda p: _unresolved_claude_stdout("pass" if _iid(p) == "i1" else "flag"),
+    )
+    report = build_run_report(result.run_id, tmp_path)
+    assert report.sealed is True
+    haiku = {m.model: m for m in report.models}["haiku"]
+    assert haiku.identity_unresolved is True
+    assert UNRESOLVED_MODEL_ID in haiku.stored_identities
+    assert haiku.resolved_identities == ()
+    assert haiku.routing_eligible is False
+
+    md = render_run_report(report)
+    assert UNRESOLVED_MODEL_ID in md
+    assert NOT_ROUTING_ELIGIBLE in md
+
+
+def test_mixed_identity_set_is_ineligible_and_markdown_escapes_provider_text(
+    tmp_path: Path,
+) -> None:
+    suite = _verdict_suite()
+    result = _run_scored(suite, out_dir=tmp_path, roster=["haiku"])
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["model_id_resolved"] = "claude|<script>\nprobe"
+    rows[1]["model_id_resolved"] = UNRESOLVED_MODEL_ID
+    rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    report = build_run_report(result.run_id, tmp_path)
+    haiku = report.models[0]
+    assert haiku.stored_identities == (UNRESOLVED_MODEL_ID, "claude|<script>\nprobe")
+    assert haiku.resolved_identities == ()
+    assert haiku.identity_unresolved is True
+    assert haiku.routing_eligible is False
+    md = render_run_report(report)
+    assert "claude\\|&lt;script&gt;<br>probe" in md
+    assert "<script>" not in md
+    assert NOT_ROUTING_ELIGIBLE in md
+
+
+def test_local_provider_identity_cannot_embed_markdown_image(tmp_path: Path) -> None:
+    suite = _verdict_suite()
+    identity = "![badge](https://attacker.example/pixel)"
+    base_factory = StubAdapters(
+        local=lambda p: "pass" if _iid(p) == "i1" else "flag"
+    ).local_factory()
+
+    def malicious_factory():
+        transport = base_factory()
+
+        def wrapped(url, data, timeout):
+            payload = json.loads(transport(url, data, timeout))
+            payload["model"] = identity
+            return json.dumps(payload)
+
+        return wrapped
+
+    result = run(
+        suite=suite,
+        config=RunConfig(),
+        out_dir=tmp_path,
+        roster=["general-35b"],
+        samples_per_cell=1,
+        scorer=make_deterministic_scorer(suite.scoring),
+        local_transport_factory=malicious_factory,
+    )
+    clean = _run_scored(suite, out_dir=tmp_path, roster=["general-35b"])
+    report = build_run_report(result.run_id, tmp_path)
+    assert report.models[0].resolved_identities == (identity,)
+    escaped = r"\!\[badge\]\(https://attacker.example/pixel\)"
+    assert escaped.replace("\\", "") == identity
+    for rendered in (
+        render_run_report(report),
+        render_comparison(build_comparison([result.run_id, clean.run_id], tmp_path)),
+    ):
+        identity_line = next(
+            line
+            for line in rendered.splitlines()
+            if line.startswith("| general-35b | local-openai |")
+        )
+        assert identity_line.count(escaped) == 2  # resolved and stored identity columns
+        assert "![badge](" not in identity_line
+
+
+def test_markdown_shows_concrete_and_unresolved_identities_in_same_arm(tmp_path: Path) -> None:
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["model_id_resolved"] = UNRESOLVED_MODEL_ID
+    rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    report = build_run_report(result.run_id, tmp_path)
+    model = report.models[0]
+    assert model.resolved_identities == ("claude-x",)
+    assert model.identity_unresolved is True
+    identity_line = next(
+        line
+        for line in render_run_report(report).splitlines()
+        if line.startswith("| haiku | claude-cli |")
+    )
+    assert "claude-x" in identity_line
+    assert UNRESOLVED_MODEL_ID in identity_line
+    assert NOT_ROUTING_ELIGIBLE in identity_line
+    assert "| claude-x | UNRESOLVED_PROVIDER_IDENTITY, claude-x |" in identity_line
+    assert "| Resolved identity | Stored identity |" in render_run_report(report)
+
+
+def test_report_keeps_distinct_resolved_identity_per_alias(tmp_path: Path) -> None:
+    aliases = ("haiku", "sonnet", "opus")
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=list(aliases))
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["model_id_resolved"] = f"claude-{row['model']}-report"
+    rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    report = build_run_report(result.run_id, tmp_path)
+    assert {model.model: model.resolved_identities for model in report.models} == {
+        alias: (f"claude-{alias}-report",) for alias in aliases
+    }
+    markdown = render_run_report(report)
+    for alias in aliases:
+        assert f"| {alias} | claude-cli | {alias} | claude-{alias}-report |" in markdown
+    assert {
+        row["model"]: row["resolved_identities"]
+        for row in map(json.loads, run_report_jsonl(report).splitlines())
+    } == {alias: [f"claude-{alias}-report"] for alias in aliases}
+
+
+def test_legacy_requested_alias_fallback_is_explicitly_unverified(tmp_path: Path) -> None:
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
+    _strip_execution_receipt(tmp_path, result.run_id)
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["model_id_resolved"] = "haiku"  # historical fallback from the requested alias
+    rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    model = build_run_report(result.run_id, tmp_path).models[0]
+    assert model.stored_identities == ("haiku",)
+    assert model.resolved_identities == ()
+    assert model.identity_provenance == UNVERIFIED_LEGACY
+    assert model.identity_unresolved is True
+    assert model.routing_eligible is False
+
+
+@pytest.mark.parametrize("bad_identity", ["haiku", "   "])
+def test_malformed_or_alias_only_identity_never_gets_preliminary_status(
+    tmp_path: Path, bad_identity: object
+) -> None:
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
+    before_score = build_run_report(result.run_id, tmp_path).models[0].suite_score
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["model_id_resolved"] = bad_identity
+    rows_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    model = build_run_report(result.run_id, tmp_path).models[0]
+    assert model.resolved_identities == ()
+    assert model.identity_unresolved is True
+    assert model.identity_provenance == "PROVIDER_IDENTITY_UNRESOLVED"
+    assert model.routing_eligible is False
+    assert model.eligibility == NOT_ROUTING_ELIGIBLE
+    assert model.suite_score == before_score
+
+
+def test_nonstring_identity_fails_report_loud_without_editing_store(tmp_path: Path) -> None:
+    result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
+    rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["model_id_resolved"] = 123
+    changed = "\n".join(json.dumps(row) for row in rows) + "\n"
+    rows_path.write_text(changed, encoding="utf-8")
+    with pytest.raises(ReportError, match="model_id_resolved must be a string"):
+        build_run_report(result.run_id, tmp_path)
+    assert rows_path.read_text(encoding="utf-8") == changed
+
+
+def test_jsonl_export_carries_execution_and_identity(tmp_path: Path) -> None:
+    """Per-model JSONL carries additive seal and identity fields."""
+    suite = _verdict_suite()
+    result = _run_scored(
+        suite,
+        out_dir=tmp_path,
+        roster=["haiku"],
+        claude=lambda p: "pass" if _iid(p) == "i1" else "flag",
+    )
+    sealed_line = json.loads(run_report_jsonl(build_run_report(result.run_id, tmp_path)))
+    assert sealed_line["sealed"] is True
+    assert sealed_line["provider"] == "claude-cli"
+    assert sealed_line["requested_model"] == "haiku"
+    assert sealed_line["resolved_identities"] == ["claude-x"]
+    assert sealed_line["identity_unresolved"] is False
+    assert sealed_line["routing_eligible"] is None
+    assert sealed_line["eligibility"] == PRELIMINARY_SEAL_IDENTITY_OK
+    assert len(sealed_line["receipt_sha256"]) == 64
+
+    _strip_execution_receipt(tmp_path, result.run_id)
+    legacy_line = json.loads(run_report_jsonl(build_run_report(result.run_id, tmp_path)))
+    assert legacy_line["sealed"] is False
+    assert legacy_line["provider"] is None
+    assert legacy_line["receipt_sha256"] is None
+    assert legacy_line["routing_eligible"] is False
+    assert legacy_line["stored_identities"] == ["claude-x"]
+    assert legacy_line["resolved_identities"] == []
+    assert legacy_line["identity_provenance"] == UNVERIFIED_LEGACY
+    assert legacy_line["suite_score"] == sealed_line["suite_score"]  # score never changed

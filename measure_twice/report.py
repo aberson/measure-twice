@@ -16,11 +16,9 @@ Deferred (plan §3, not Step 7): the "latest-per-(suite_hash, model) by manifest
 (``--compare``), which the Step-7 done-when needs; latest-per resolution is more natural once
 Phase C has accumulated many runs.
 
-Cross-run comparison (``mt report --compare``) compares runs BY EQUAL SUITE HASH only (plan §3: "a
-changed hash = a different instrument; cross-run comparisons require equal hashes"). Comparing runs
-with mismatched ``suite_hash`` is a fail-loud :class:`ReportError` naming the mismatch — never a
-silent comparison across two different instruments (``measurement-validity.md`` § match measurement
-scope to decision scope).
+Cross-run comparison (``mt report --compare``) requires equal suite and execution/receipt hashes.
+Legacy and sealed runs cannot be compared. Each allowed comparison prints the execution and
+identity evidence for every run beside the unchanged official scores.
 
 Run-store access reuses the runner's OWN readers (``_resolve_run_dir`` traversal guard,
 ``_read_manifest``, ``_read_rows`` torn-line tolerance) so the run-store layout has ONE owner
@@ -34,25 +32,49 @@ path-traversal-guarded exactly as ``mt score`` is. Every run-store fault the run
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from html import escape as html_escape
 from pathlib import Path
+from typing import Final
 
 from measure_twice import runner
+from measure_twice.adapters.base import UNRESOLVED_MODEL_ID
+from measure_twice.model_sweep_execution import is_concrete_provider_identity
 from measure_twice.runner import NO_RESPONSE_SCORER, RunError, RunRow
 from measure_twice.scoring.deterministic import PARSE_FAIL_MARKER, suite_score
 
 __all__ = [
+    "LEGACY_UNSEALED",
+    "NOT_ROUTING_ELIGIBLE",
+    "PRELIMINARY_SEAL_IDENTITY_OK",
+    "UNRESOLVED_IDENTITY",
+    "UNVERIFIED_LEGACY",
     "ComparisonReport",
+    "ExecutionEvidence",
     "ModelReport",
     "ReportError",
     "RunReport",
     "build_comparison",
+    "build_execution_evidence",
     "build_run_report",
     "render_comparison",
     "render_run_report",
     "run_report_jsonl",
 ]
+
+# Visible status labels for the execution seal (plan §6.4). A legacy run — a manifest with NO
+# execution receipt — is marked LEGACY_UNSEALED and NOT_ROUTING_ELIGIBLE without ever touching its
+# official scores. An arm whose concrete provider identity was never observed is marked
+# UNRESOLVED_IDENTITY (a requested alias is never silently substituted — plan §6.3). These are
+# additive report annotations; Step 59 owns the constant-control routing verdict, this step only
+# gates on the seal and on identity evidence.
+LEGACY_UNSEALED: Final[str] = "LEGACY_UNSEALED"
+PRELIMINARY_SEAL_IDENTITY_OK: Final[str] = "PRELIMINARY_SEAL_IDENTITY_OK"
+NOT_ROUTING_ELIGIBLE: Final[str] = "NOT_ROUTING_ELIGIBLE"
+UNVERIFIED_LEGACY: Final[str] = "UNVERIFIED_LEGACY"
+UNRESOLVED_IDENTITY: Final[str] = UNRESOLVED_MODEL_ID
 
 
 class ReportError(ValueError):
@@ -67,6 +89,36 @@ class ReportError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionEvidence:
+    """The additive execution receipt surfaced in every report (plan §6.3/§6.4).
+
+    Built from the manifest's ``execution_receipt`` — ``None`` in :class:`RunReport` marks a legacy
+    (unsealed) run. It names the profile identity, the three static hashes plus the receipt self
+    hash, the sealing mode, and the doctor-validated Claude executable path/version (``None`` for a
+    receipt whose selected bindings are all non-Claude). ``bindings`` is the per-alias
+    provider/requested-model contract the run committed to; reports read it to name provider and
+    requested identity beside the observed resolved identity.
+    """
+
+    profile_id: str
+    sealing_mode: str
+    execution_profile_sha256: str
+    provider_profile_sha256: str
+    context_profile_sha256: str
+    receipt_sha256: str
+    claude_executable: str | None
+    claude_version: str | None
+    bindings: tuple[tuple[str, str, str], ...]
+
+    def binding_for(self, alias: str) -> tuple[str, str] | None:
+        """``(provider, requested_model)`` for ``alias``, or ``None`` if the receipt omits it."""
+        for b_alias, provider, requested in self.bindings:
+            if b_alias == alias:
+                return (provider, requested)
+        return None
+
+
+@dataclass(frozen=True, slots=True)
 class ModelReport:
     """Per-model roll-up for one run: the 0-100 suite score plus the countable failure signals.
 
@@ -75,6 +127,13 @@ class ModelReport:
     error/defer row has ``score=None`` and is excluded). It is ``None`` only when the model produced
     no numeric score at all (every cell errored/deferred, or the run was collected-but-unscored).
     ``n_no_response`` / ``n_parse_fail`` / ``n_error`` are the first-class signal counts.
+
+    Identity/seal evidence (plan §6.3/§6.4, additive — the score is never changed): ``provider`` and
+    ``requested_model`` come from the receipt. ``stored_identities`` preserves row values, while
+    ``resolved_identities`` contains only identities backed by a sealed, bound provider. Historical
+    rows may hold requested-alias fallbacks and are marked ``UNVERIFIED_LEGACY``. A sealed arm with
+    complete identity evidence receives only a preliminary status. Step 59 owns positive routing
+    eligibility after calibration controls.
     """
 
     model: str
@@ -85,6 +144,20 @@ class ModelReport:
     n_no_response: int
     n_parse_fail: int
     n_error: int
+    provider: str | None
+    requested_model: str | None
+    stored_identities: tuple[str, ...]
+    resolved_identities: tuple[str, ...]
+    identity_provenance: str
+    identity_unresolved: bool
+    routing_eligible: bool | None
+
+    @property
+    def eligibility(self) -> str:
+        """The preliminary status; only Step 59 can assign positive routing eligibility."""
+        return (
+            PRELIMINARY_SEAL_IDENTITY_OK if self.routing_eligible is None else NOT_ROUTING_ELIGIBLE
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +170,17 @@ class RunReport:
     started_utc: str
     roster: list[str]
     models: list[ModelReport]
+    execution: ExecutionEvidence | None
+
+    @property
+    def sealed(self) -> bool:
+        """True when the run carries an execution receipt (a sealed, non-legacy run)."""
+        return self.execution is not None
+
+    @property
+    def seal_status(self) -> str:
+        """The run-level seal label: the sealing mode, or :data:`LEGACY_UNSEALED`."""
+        return LEGACY_UNSEALED if self.execution is None else self.execution.sealing_mode
 
     @property
     def total_parse_fail(self) -> int:
@@ -117,11 +201,11 @@ class RunReport:
 
 @dataclass(frozen=True, slots=True)
 class ComparisonReport:
-    """A cross-run comparison over runs sharing ONE ``suite_hash`` (fail-loud on any mismatch).
+    """A cross-run comparison over runs sharing suite and execution hashes.
 
     ``runs`` are the per-run reports in the caller's order (primary first); ``models`` is the sorted
     union of every model that appears in any run — so the rendered table is deterministic regardless
-    of per-run roster order. ``suite_hash`` is the single shared instrument identity.
+    of per-run roster order.
     """
 
     suite: str
@@ -174,9 +258,78 @@ def _manifest_roster(manifest: Mapping[str, object]) -> list[str]:
 # --- Per-model roll-up -------------------------------------------------------------------
 
 
-def _model_report(model: str, rows: Sequence[RunRow]) -> ModelReport:
-    """Roll one model's rows into a :class:`ModelReport` (numeric-score mean + signal counts)."""
+def build_execution_evidence(manifest: Mapping[str, object]) -> ExecutionEvidence | None:
+    """Read the manifest's additive execution receipt, or ``None`` for a legacy (unsealed) run.
+
+    Delegates to the runner's own receipt reader (one owner of the receipt shape) and re-faces its
+    ``RunError`` as :class:`ReportError`, so a corrupt receipt fails loud rather than rendering a
+    report that silently omits the seal. A manifest with no receipt key is a readable legacy run
+    (plan §6.4), returned as ``None`` — never an error.
+    """
+    try:
+        receipt = runner._read_execution_receipt(manifest)
+    except RunError as exc:
+        raise ReportError(str(exc)) from exc
+    if receipt is None:
+        return None
+    return ExecutionEvidence(
+        profile_id=receipt.profile_id,
+        sealing_mode=receipt.sealing_mode,
+        execution_profile_sha256=receipt.execution_profile_sha256,
+        provider_profile_sha256=receipt.provider_profile_sha256,
+        context_profile_sha256=receipt.context_profile_sha256,
+        receipt_sha256=receipt.receipt_sha256,
+        claude_executable=None if receipt.claude_cli is None else receipt.claude_cli.executable,
+        claude_version=None if receipt.claude_cli is None else receipt.claude_cli.version,
+        bindings=tuple((b.alias, b.provider, b.requested_model) for b in receipt.bindings),
+    )
+
+
+def _model_report(
+    model: str, rows: Sequence[RunRow], execution: ExecutionEvidence | None
+) -> ModelReport:
+    """Roll one model's rows into a :class:`ModelReport` (numeric-score mean + signal counts).
+
+    Identity/seal evidence (plan §6.3/§6.4) is folded in additively: the receipt binding names this
+    alias's provider/requested identity, and the rows' ``model_id_resolved`` values give the
+    observed resolved-identity set. A requested alias is NEVER substituted for an absent concrete
+    identity — an unobserved identity is recorded as :data:`UNRESOLVED_IDENTITY`. The suite score is
+    computed exactly as before and is never touched by any of this.
+    """
     scores = [row.score for row in rows if row.score is not None]
+    binding = execution.binding_for(model) if execution is not None else None
+    raw_identities: list[object] = [row.model_id_resolved for row in rows]
+    stored = sorted({_stored_identity(value) for value in raw_identities})
+    resolved = (
+        sorted(
+            {
+                str(value)
+                for value in raw_identities
+                if is_concrete_provider_identity(value, binding[0])
+            }
+        )
+        if binding is not None
+        else []
+    )
+    identity_unresolved = not resolved or (
+        binding is not None
+        and any(not is_concrete_provider_identity(value, binding[0]) for value in raw_identities)
+    )
+    provider = None if binding is None else binding[0]
+    requested_model = None if binding is None else binding[1]
+    preliminary = execution is not None and binding is not None and not identity_unresolved
+    routing_eligible: bool | None = None if preliminary else False
+    identity_provenance = (
+        UNVERIFIED_LEGACY
+        if execution is None
+        else (
+            "UNBOUND_RECEIPT_IDENTITY"
+            if binding is None
+            else (
+                "PROVIDER_CONFIRMED" if not identity_unresolved else "PROVIDER_IDENTITY_UNRESOLVED"
+            )
+        )
+    )
     return ModelReport(
         model=model,
         n_cells=len(rows),
@@ -185,6 +338,13 @@ def _model_report(model: str, rows: Sequence[RunRow]) -> ModelReport:
         # suite_score fails loud on an empty sequence (Step-5 contract), so guard: no numeric score
         # for the model -> None (rendered "n/a"), never a fabricated 0 or a crash.
         suite_score=suite_score(scores) if scores else None,
+        provider=provider,
+        requested_model=requested_model,
+        stored_identities=tuple(stored),
+        resolved_identities=tuple(resolved),
+        identity_provenance=identity_provenance,
+        identity_unresolved=identity_unresolved,
+        routing_eligible=routing_eligible,
         n_no_response=sum(1 for row in rows if row.scorer == NO_RESPONSE_SCORER),
         # A parse-fail is recorded via the SINGLE canonical marker, regardless of which scorer wrote
         # it: the verdict scorer AND the rubric run-scorer both set ``parsed=PARSE_FAIL_MARKER,
@@ -210,6 +370,7 @@ def build_run_report(run_id: str, out_dir: str | Path = "data") -> RunReport:
     """
     manifest, rows = _open_run_store(run_id, out_dir)
     roster = _manifest_roster(manifest)
+    execution = build_execution_evidence(manifest)
 
     rows_by_model: dict[str, list[RunRow]] = {}
     for row in rows:
@@ -220,7 +381,9 @@ def build_run_report(run_id: str, out_dir: str | Path = "data") -> RunReport:
         if model not in ordered_models:
             ordered_models.append(model)
 
-    models = [_model_report(model, rows_by_model.get(model, [])) for model in ordered_models]
+    models = [
+        _model_report(model, rows_by_model.get(model, []), execution) for model in ordered_models
+    ]
     return RunReport(
         run_id=_manifest_str(manifest, "run_id"),
         suite=_manifest_str(manifest, "suite"),
@@ -228,18 +391,12 @@ def build_run_report(run_id: str, out_dir: str | Path = "data") -> RunReport:
         started_utc=_manifest_str(manifest, "started_utc"),
         roster=roster,
         models=models,
+        execution=execution,
     )
 
 
 def build_comparison(run_ids: Sequence[str], out_dir: str | Path = "data") -> ComparisonReport:
-    """Build a cross-run comparison over ``run_ids`` — FAIL LOUD if their ``suite_hash`` differ.
-
-    Every run must measure the SAME instrument: a differing ``suite_hash`` means a different suite
-    content (plan §3), so comparing scores across them is comparing apples to oranges — it raises
-    :class:`ReportError` naming the first mismatching run and both hashes rather than silently
-    tabulating across instruments. The models axis is the sorted union across runs, so the table is
-    deterministic regardless of per-run roster order.
-    """
+    """Compare runs with equal suite and execution receipts; reject every mismatch."""
     if not run_ids:
         raise ReportError("build_comparison requires at least one run id")
     reports = [build_run_report(run_id, out_dir) for run_id in run_ids]
@@ -251,6 +408,24 @@ def build_comparison(run_ids: Sequence[str], out_dir: str | Path = "data") -> Co
                 f"{base.run_id} has {base.suite_hash} but {report.run_id} has {report.suite_hash}; "
                 "a changed suite hash is a DIFFERENT instrument (plan §3)"
             )
+        base_receipt = base.execution
+        other_receipt = report.execution
+        if (base_receipt is None) != (other_receipt is None):
+            raise ReportError(
+                f"cannot compare sealed and legacy-unsealed runs: {base.run_id} vs {report.run_id}"
+            )
+        if base_receipt is not None and other_receipt is not None:
+            for field in (
+                "execution_profile_sha256",
+                "provider_profile_sha256",
+                "context_profile_sha256",
+                "receipt_sha256",
+            ):
+                if getattr(base_receipt, field) != getattr(other_receipt, field):
+                    raise ReportError(
+                        f"cannot compare runs with different {field}: "
+                        f"{base.run_id} vs {report.run_id}"
+                    )
     models = sorted({m.model for report in reports for m in report.models})
     return ComparisonReport(
         suite=base.suite, suite_hash=base.suite_hash, runs=reports, models=models
@@ -265,6 +440,91 @@ def _fmt_score(score: float | None) -> str:
     return "n/a" if score is None else f"{score:.1f}"
 
 
+def _stored_identity(value: object) -> str:
+    """Keep blank historical strings visible; reject a corrupt non-string run store."""
+    if not isinstance(value, str):
+        raise ReportError("model_id_resolved must be a string (corrupt run store)")
+    return value if value.strip() else "(blank identity)"
+
+
+def _fmt_identities(values: tuple[str, ...]) -> str:
+    """Show an identity set, escaping untrusted Markdown text."""
+    return ", ".join(_md_cell(value) for value in values) if values else "(none)"
+
+
+def _md_cell(value: str) -> str:
+    """Escape arbitrary provider text in a Markdown table cell."""
+    return (
+        html_escape(value, quote=True)
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("`", "\\`")
+        .replace("!", "\\!")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("(", "\\(")
+        .replace(")", "\\)")
+        .replace("\r", " ")
+        .replace("\n", "<br>")
+    )
+
+
+def _md_code(value: str) -> str:
+    """Render untrusted receipt text as one escaped inline code span."""
+    safe = html_escape(value, quote=True).replace("\r", " ").replace("\n", " ")
+    longest = max((len(run) for run in re.findall(r"`+", safe)), default=0)
+    fence = "`" * (longest + 1)
+    if safe.startswith("`") or safe.endswith("`"):
+        safe = f" {safe} "
+    return f"{fence}{safe}{fence}"
+
+
+def _execution_lines(report: RunReport) -> list[str]:
+    """The execution-receipt + per-alias identity section (plan §6.3/§6.4); scores untouched."""
+    lines = ["## Execution receipt & identity", ""]
+    evidence = report.execution
+    if evidence is None:
+        lines += [
+            f"- **Seal:** `{LEGACY_UNSEALED}` — this run carries no execution receipt.",
+            f"- **Routing:** `{NOT_ROUTING_ELIGIBLE}` for every arm; official scores below are "
+            "shown unchanged for reference only and are not comparable to sealed runs.",
+            "",
+        ]
+    else:
+        cli = (
+            "(no Claude bindings)"
+            if evidence.claude_executable is None
+            else f"{_md_code(evidence.claude_executable)} "
+            f"(version {_md_code(evidence.claude_version or '')})"
+        )
+        lines += [
+            f"- **Seal:** `{evidence.sealing_mode}` — profile `{evidence.profile_id}`",
+            f"- **Execution-profile hash:** `{evidence.execution_profile_sha256}`",
+            f"- **Provider-profile hash:** `{evidence.provider_profile_sha256}`",
+            f"- **Context-profile hash:** `{evidence.context_profile_sha256}`",
+            f"- **Receipt hash:** `{evidence.receipt_sha256}`",
+            f"- **Claude CLI:** {cli}",
+            "- **Routing:** preliminary seal and identity evidence only; "
+            "Step 59 must assess validity.",
+            "",
+        ]
+    lines += [
+        "| Model | Provider | Requested | Resolved identity | Stored identity | "
+        "Provenance | Status |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for model in report.models:
+        lines.append(
+            f"| {_md_cell(model.model)} | {_md_cell(model.provider or '(legacy)')} | "
+            f"{_md_cell(model.requested_model or '(legacy)')} | "
+            f"{_fmt_identities(model.resolved_identities)} | "
+            f"{_fmt_identities(model.stored_identities)} | "
+            f"{model.identity_provenance} | {model.eligibility} |"
+        )
+    lines.append("")
+    return lines
+
+
 def render_run_report(report: RunReport) -> str:
     """Render a :class:`RunReport` to deterministic markdown (no timestamp-of-render, reproducible).
 
@@ -277,6 +537,12 @@ def render_run_report(report: RunReport) -> str:
         f"- **Suite:** {report.suite} (`{report.suite_hash}`)",
         f"- **Roster:** {', '.join(report.roster) if report.roster else '(none)'}",
         f"- **Started (UTC):** {report.started_utc}",
+        f"- **Seal:** `{report.seal_status}`",
+        "",
+    ]
+    lines += _execution_lines(report)
+    lines += [
+        "## Scores",
         "",
         "| Model | Score (0-100) | Items | Scored | No-response | Parse-fail | Error/defer |",
         "|---|---|---|---|---|---|---|",
@@ -305,7 +571,7 @@ def render_comparison(comparison: ComparisonReport) -> str:
         "# measure-twice cross-run comparison",
         "",
         f"- **Suite:** {comparison.suite} (`{comparison.suite_hash}`)",
-        f"- **Runs compared:** {len(comparison.runs)} (equal suite hash)",
+        f"- **Runs compared:** {len(comparison.runs)} (equal suite and execution hashes)",
         "",
         header,
         divider,
@@ -317,6 +583,9 @@ def render_comparison(comparison: ComparisonReport) -> str:
         ]
         lines.append(f"| {model} | " + " | ".join(cells) + " |")
     lines.append("")
+    for run in comparison.runs:
+        lines += [f"## Run {run.run_id}", "", f"- **Seal:** `{run.seal_status}`", ""]
+        lines += _execution_lines(run)
     return "\n".join(lines)
 
 
@@ -326,6 +595,7 @@ def run_report_jsonl(report: RunReport) -> str:
     A minimal, machine-readable sibling of the markdown table (same numbers, one JSON object per
     model), for piping a run's per-model roll-up into downstream tooling. Deterministic + ASCII.
     """
+    evidence = report.execution
     return "\n".join(
         json.dumps(
             {
@@ -340,6 +610,32 @@ def run_report_jsonl(report: RunReport) -> str:
                 "n_no_response": model.n_no_response,
                 "n_parse_fail": model.n_parse_fail,
                 "n_error": model.n_error,
+                # Additive execution/identity evidence (plan §6.3/§6.4). Legacy runs carry null
+                # provider/requested/hashes and are marked unsealed + not routing-eligible; scores
+                # above are unchanged.
+                "sealed": report.sealed,
+                "seal_status": report.seal_status,
+                "provider": model.provider,
+                "requested_model": model.requested_model,
+                "stored_identities": list(model.stored_identities),
+                "resolved_identities": list(model.resolved_identities),
+                "identity_provenance": model.identity_provenance,
+                "identity_unresolved": model.identity_unresolved,
+                "routing_eligible": model.routing_eligible,
+                "eligibility": model.eligibility,
+                "profile_id": None if evidence is None else evidence.profile_id,
+                "execution_profile_sha256": (
+                    None if evidence is None else evidence.execution_profile_sha256
+                ),
+                "provider_profile_sha256": (
+                    None if evidence is None else evidence.provider_profile_sha256
+                ),
+                "context_profile_sha256": (
+                    None if evidence is None else evidence.context_profile_sha256
+                ),
+                "receipt_sha256": None if evidence is None else evidence.receipt_sha256,
+                "claude_executable": None if evidence is None else evidence.claude_executable,
+                "claude_version": None if evidence is None else evidence.claude_version,
             },
             ensure_ascii=True,
             sort_keys=True,

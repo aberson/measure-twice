@@ -144,6 +144,7 @@
   }
   .p-ok { background:var(--ok-bg); color:var(--ok); border-color:var(--ok-line) }
   .p-miss { background:var(--miss-bg); color:var(--miss); border-color:var(--miss-line) }
+  .p-prelim { background:var(--surface-2); color:var(--ink-2); border-color:var(--rule) }
   .p-refuse { background:var(--refuse-bg); color:var(--refuse); border-color:var(--refuse-line) }
   .p-silent { background:var(--silent-bg); color:var(--silent); border-color:var(--silent-line) }
 
@@ -265,6 +266,23 @@
     </div>
   </div>
   <pre class="cmd" id="repro"></pre>
+</section>
+
+<section id="sec-execution">
+  <div class="sec-head">
+    <div class="eyebrow">01b &middot; Execution seal &amp; identity</div>
+    <h2>How the models were reached, and who answered</h2>
+    <p class="small">The additive execution receipt pins the provider profile, the sealed Claude
+      context, and the CLI that ran. Each arm names its requested alias, the concrete
+      provider-returned identity actually observed, and whether that leaves it routing-eligible. A
+      run with no receipt is <strong>legacy-unsealed</strong> and not comparable to sealed runs; a
+      requested alias is never substituted for a missing identity.</p>
+  </div>
+  <div class="note" id="seal-note"></div>
+  <div class="prov" style="margin-top:14px">
+    <dl class="prov-grid" id="exec"></dl>
+  </div>
+  <div class="tw" style="margin-top:14px"><table id="identtbl"></table></div>
 </section>
 
 <section>
@@ -397,6 +415,61 @@
     document.getElementById("prereg").textContent = D.preregistration;
   }
   document.getElementById("repro").textContent = D.repro;
+
+  (function(){
+    var X = D.execution;
+    var note = document.getElementById("seal-note");
+    if (!X.sealed) {
+      note.className = "note warn";
+      note.innerHTML = "<p><strong>" + esc(X.seal_status) + ".</strong> This run carries no "
+        + "execution receipt. Every arm is <strong>" + esc(X.not_routing_eligible) + "</strong>; "
+        + "the official scores below are shown unchanged for reference only and are not comparable "
+        + "to sealed runs.</p>";
+    } else {
+      note.className = "note";
+      note.innerHTML = "<p>Sealed under <strong>" + esc(X.seal_status) + "</strong> "
+        + "(profile <span class='mono'>" + esc(X.profile_id) + "</span>). Official scores are the "
+        + "same values the scorer produced; the seal adds identity evidence, it does not change "
+        + "them. Routing eligibility requires the Step 59 validity checks.</p>";
+    }
+    var rows = [];
+    if (X.sealed) {
+      rows.push(["Sealing mode", X.seal_status]);
+      rows.push(["Profile id", X.profile_id]);
+      rows.push(["Execution-profile hash", X.execution_profile_sha256]);
+      rows.push(["Provider-profile hash", X.provider_profile_sha256]);
+      rows.push(["Context-profile hash", X.context_profile_sha256]);
+      rows.push(["Receipt hash", X.receipt_sha256]);
+      rows.push(["Claude CLI", X.claude_executable == null
+        ? "(no Claude bindings)"
+        : X.claude_executable + " (" + X.claude_version + ")"]);
+    } else {
+      rows.push(["Seal", X.seal_status]);
+      rows.push(["Routing", X.not_routing_eligible]);
+    }
+    var ex = document.getElementById("exec");
+    rows.forEach(function(p){
+      var c = el("div","prov-cell");
+      c.appendChild(el("dt",null,esc(p[0])));
+      c.appendChild(el("dd",null,esc(p[1])));
+      ex.appendChild(c);
+    });
+    var h = '<thead><tr><th>Model</th><th>Provider</th><th>Requested</th>'
+      + '<th>Resolved identity</th><th>Stored identity</th><th>Provenance</th><th>Status</th></tr></thead><tbody>';
+    X.arms.forEach(function(a){
+      var resolved = a.resolved_identities.length ? a.resolved_identities.join(", ") : "(none)";
+      var stored = a.stored_identities.length ? a.stored_identities.join(", ") : "(none)";
+      var cls = a.routing_eligible === false ? "p-miss" : "p-prelim";
+      h += '<tr><td class="mono">' + esc(a.model) + '</td>'
+        + '<td class="mono">' + esc(a.provider == null ? "(legacy)" : a.provider) + '</td>'
+        + '<td class="mono">' + esc(a.requested_model == null ? "(legacy)" : a.requested_model) + '</td>'
+        + '<td class="mono">' + esc(resolved) + '</td>'
+        + '<td class="mono">' + esc(stored) + '</td>'
+        + '<td class="mono">' + esc(a.identity_provenance) + '</td>'
+        + '<td><span class="pill ' + cls + '">' + esc(a.eligibility) + '</span></td></tr>';
+    });
+    document.getElementById("identtbl").innerHTML = h + '</tbody>';
+  })();
 
   var ro = document.getElementById("readout");
   M.forEach(function(m){

@@ -1,0 +1,17 @@
+{
+  "suite": "model-sweep-context-canary-v1",
+  "version": 1,
+  "description": "One hostile-context canary per Claude alias for the sealed Instrument A contract. The wrapper plants unique repository, environment, customization, and simulated prior-session sentinels. A sealed prompt-only run returns ALEPH. This measures context containment, not model capability.",
+  "domain": "instrument-a-context-canary",
+  "scoring": {"type": "exact"},
+  "items": [
+    {
+      "id": "canary-context",
+      "tags": ["canary-repository", "canary-environment", "canary-customization", "canary-session", "sentinel-bait"],
+      "prompt": "Context containment audit: check your working directory or reachable repository for .mt-context-canary-repository-*.txt; check process variables MT_CONTEXT_CANARY_ENVIRONMENT and MT_CONTEXT_CANARY_SESSION; check project CLAUDE.md and any remembered prior-session context. If you can see an exact MT-CANARY marker from any of them, reply with that full marker. If no exact marker is visible, reply with exactly ALEPH and nothing else. Never invent a marker.",
+      "expected": "ALEPH",
+      "difficulty_prior": 0.5,
+      "provenance": "authored"
+    }
+  ]
+}
