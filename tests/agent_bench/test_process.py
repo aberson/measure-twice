@@ -448,6 +448,83 @@ def test_linux_failed_start_direct_owner_reap_failure_surfaces_as_execution_erro
     _assert_linux_fd_baseline(baseline)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux failed-start cleanup invariant")
+def test_linux_failed_start_proof_exception_still_reaps_and_closes_owned_fds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = _linux_fd_snapshot()
+    scope = tmp_path / "failed-start.scope"
+    scope.mkdir()
+    (scope / "cgroup.kill").write_bytes(b"")
+    kill_fd = os.open(scope / "cgroup.kill", os.O_WRONLY | os.O_CLOEXEC)
+    capability = LinuxPathCapability.acquire_absolute(scope, expected="directory")
+    guard = process_module._LinuxResourceGuardState(
+        capability,
+        kill_fd,
+        LinuxResourceGuard(1, 1, 100),
+        str(scope),
+        capability.identity,
+        {},
+        {},
+    )
+    guard.trusted_for_cleanup = True
+    guard.validated_for_release = True
+    scratch_path = tmp_path / "scratch"
+    scratch_path.mkdir()
+    scratch = LinuxPathCapability.acquire_absolute(scratch_path, expected="directory")
+    status_read_fd, status_write_fd = os.pipe()
+    os.close(status_write_fd)
+    proc = subprocess.Popen(
+        ("/bin/sleep", "30"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    runtime = process_module._RunningProcess(
+        proc=proc,
+        started=time.monotonic(),
+        process_group_id=proc.pid,
+        status_read_fd=status_read_fd,
+    )
+    runtime.resource_guard = guard
+    runtime.scratch_tree = scratch
+    proof_calls = 0
+
+    def fail_proof(*_args: object, **_kwargs: object) -> bool:
+        nonlocal proof_calls
+        proof_calls += 1
+        raise ProcessExecutionError("injected failed-start collection proof failure")
+
+    monkeypatch.setattr(
+        process_module._LinuxResourceGuardState, "control_missing_after_collection", fail_proof
+    )
+    try:
+        error = process_module._cleanup_failed_linux_start(proc, runtime, "")
+        assert isinstance(error, ProcessExecutionError)
+        assert "injected failed-start collection proof failure" in str(error)
+        assert proof_calls >= 1
+        assert proc.poll() is not None
+        assert runtime.resource_guard is None
+        assert runtime.scratch_tree is None
+        assert runtime.status_read_fd is None
+        assert guard.kill_fd == -1
+        assert capability.closed
+        assert scratch.closed
+        assert proc.stdin is not None and proc.stdin.closed
+        assert proc.stdout is not None and proc.stdout.closed
+        assert proc.stderr is not None and proc.stderr.closed
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        guard.close()
+        scratch.close()
+        process_module._close_fd(runtime.status_read_fd)
+    _assert_linux_fd_baseline(baseline)
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux no-handshake absence-interval invariant")
 def test_linux_failed_start_without_handshake_proves_a_full_absence_interval(
     monkeypatch: pytest.MonkeyPatch,

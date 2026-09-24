@@ -362,10 +362,13 @@ def test_production_requires_eight_repetitions(tmp_path: Path) -> None:
     assert "exactly 8 repetitions" in rejected.stderr
 
 
-def test_verify_rejects_stale_isolation_source_and_edited_rate(tmp_path: Path) -> None:
+def test_verify_rejects_pytest_config_drift_and_edited_rate(tmp_path: Path) -> None:
     fixture_root = tmp_path / "reviewed-tree"
     source_files = [
         "scripts/soak-agent-bench-wsl.ps1",
+        "pyproject.toml",
+        "uv.lock",
+        "tests/conftest.py",
         "measure_twice/agent_bench/process.py",
         "measure_twice/agent_bench/isolation.py",
         "tests/agent_bench/test_process.py",
@@ -375,6 +378,14 @@ def test_verify_rejects_stale_isolation_source_and_edited_rate(tmp_path: Path) -
         destination = fixture_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(_REPO_ROOT / relative, destination)
+    git = shutil.which("git")
+    assert git is not None
+    subprocess.run(  # noqa: S603 - resolved git initializes an isolated fixture repo
+        [git, "init", "-q", str(fixture_root)], check=True, capture_output=True
+    )
+    subprocess.run(  # noqa: S603 - resolved git stages the fixture manifest
+        [git, "-C", str(fixture_root), "add", "."], check=True, capture_output=True
+    )
 
     fixture_script = fixture_root / "scripts" / "soak-agent-bench-wsl.ps1"
     completed, out_dir = _run_soak(
@@ -382,8 +393,11 @@ def test_verify_rejects_stale_isolation_source_and_edited_rate(tmp_path: Path) -
     )
     assert completed.returncode == 0, completed.stderr
 
-    isolation = fixture_root / "measure_twice" / "agent_bench" / "isolation.py"
-    isolation.write_text(isolation.read_text(encoding="utf-8") + "\n# drift\n", encoding="utf-8")
+    pyproject = fixture_root / "pyproject.toml"
+    original_pyproject = pyproject.read_text(encoding="utf-8")
+    changed_pyproject = original_pyproject.replace('addopts = "-q"', 'addopts = "-q -x"')
+    assert changed_pyproject != original_pyproject
+    pyproject.write_text(changed_pyproject, encoding="utf-8")
     stale, _ = _run_soak(
         tmp_path,
         plan=[f"{_HASH_A}|0"],
@@ -396,7 +410,7 @@ def test_verify_rejects_stale_isolation_source_and_edited_rate(tmp_path: Path) -
     assert "source-tree-sha256" in stale.stderr
 
     # Restore the producer so this second failure isolates the recorded rate.
-    shutil.copyfile(_REPO_ROOT / "measure_twice/agent_bench/isolation.py", isolation)
+    pyproject.write_text(original_pyproject, encoding="utf-8")
     verdict_path = out_dir / "verdict.txt"
     verdict_path.write_text(
         verdict_path.read_text(encoding="utf-8").replace(
@@ -436,7 +450,20 @@ def test_git_manifest_ignores_growing_qualification_evidence(tmp_path: Path) -> 
 
     def manifest_paths() -> list[str]:
         raw = subprocess.check_output(  # noqa: S603 - exact launcher manifest command
-            [git, "-C", str(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+            [
+                git,
+                "-C",
+                str(repo),
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                ".",
+                ":(exclude)data/qualification/**",
+                ":(exclude)docs/agent-benchmark/containment-soak-step63.md",
+            ]
         )
         return [part.decode("utf-8") for part in raw.split(b"\0") if part]
 
@@ -447,6 +474,14 @@ def test_git_manifest_ignores_growing_qualification_evidence(tmp_path: Path) -> 
     (evidence / "run-01.log").write_text("first\n", encoding="utf-8")
     after_first = manifest_paths()
     (evidence / "run-02.log").write_text("second\n", encoding="utf-8")
+    finding = repo / "docs" / "agent-benchmark" / "containment-soak-step63.md"
+    finding.parent.mkdir(parents=True)
+    finding.write_text("post-soak note\n", encoding="utf-8")
+    subprocess.run(  # noqa: S603 - force-stage artifacts to test tracked exclusions
+        [git, "-C", str(repo), "add", "-f", str(evidence / "run-01.log"), str(finding)],
+        check=True,
+        capture_output=True,
+    )
     after_second = manifest_paths()
     assert before == after_first == after_second
     assert all("qualification" not in path for path in after_second)

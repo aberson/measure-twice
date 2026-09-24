@@ -9,7 +9,8 @@ Set-StrictMode -Version Latest
 function Get-GitManifestBytes {
     param(
         [Parameter(Mandatory = $true)][string]$GitExecutable,
-        [Parameter(Mandatory = $true)][string]$Root
+        [Parameter(Mandatory = $true)][string]$Root,
+        [switch]$ExcludeFindings
     )
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -18,6 +19,9 @@ function Get-GitManifestBytes {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $arguments = @("-C", $Root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    if ($ExcludeFindings) {
+        $arguments += @("--", ".", ":(exclude)data/qualification/**", ":(exclude)docs/agent-benchmark/containment-soak-step63.md")
+    }
     if ($null -ne $startInfo.PSObject.Properties["ArgumentList"]) {
         foreach ($argument in $arguments) {
             [void]$startInfo.ArgumentList.Add($argument)
@@ -26,6 +30,9 @@ function Get-GitManifestBytes {
     else {
         $quotedRoot = $Root.Replace('"', '\"')
         $startInfo.Arguments = "-C `"$quotedRoot`" ls-files -z --cached --others --exclude-standard"
+        if ($ExcludeFindings) {
+            $startInfo.Arguments += " -- . :(exclude)data/qualification/** :(exclude)docs/agent-benchmark/containment-soak-step63.md"
+        }
     }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
@@ -82,7 +89,7 @@ $runnerFile = Join-Path ([System.IO.Path]::GetTempPath()) "measure-twice-$([guid
 try {
     [System.IO.File]::WriteAllBytes(
         $projectManifest,
-        (Get-GitManifestBytes -GitExecutable $gitCommand.Source -Root $projectRoot)
+        (Get-GitManifestBytes -GitExecutable $gitCommand.Source -Root $projectRoot -ExcludeFindings)
     )
     [System.IO.File]::WriteAllBytes(
         $switchboardManifest,

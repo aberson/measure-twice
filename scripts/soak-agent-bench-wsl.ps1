@@ -21,7 +21,7 @@ Set-StrictMode -Version Latest
 $HASH_PATTERN = 'staged-tree-sha256:\s*([0-9a-f]{64})'
 $SKIP_PATTERN = '(?m)^selected-skips:\s*(\d+)\s*$'
 $STEP63_PREREG = "The reviewed containment repair will pass 8/8 independent WSL-ext4 gate invocations with zero selected skips and no live-identity or retained-FD escape; any lower pass rate returns the work to Step 62 and blocks Step 27."
-$PRODUCER_VERSION = "step62-soak-v3"
+$PRODUCER_VERSION = "step62-soak-v4"
 
 function Get-StagedTreeHash {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
@@ -49,27 +49,56 @@ function Get-FileSha256 {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-function Get-SourceTreeSha256 {
-    param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+function Get-GateSourceSha256 {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [switch]$ExcludeFindings
+    )
 
-    $relativeRoots = @("measure_twice/agent_bench", "tests/agent_bench")
-    $records = @()
-    foreach ($relativeRoot in $relativeRoots) {
-        $directory = Join-Path $ProjectRoot $relativeRoot
-        if (-not (Test-Path -LiteralPath $directory)) {
-            throw "containment source directory is absent: $directory"
-        }
-        foreach ($file in @(Get-ChildItem -LiteralPath $directory -Recurse -File)) {
-            if ($file.Extension -notin @(".py", ".json")) { continue }
-            $relative = $file.FullName.Substring($ProjectRoot.Length + 1).Replace('\', '/')
-            $records += "$relative`:$(Get-FileSha256 -Path $file.FullName)"
+    # Mirror the launcher's Git manifest, then hash each staged input's path and bytes.
+    $git = (Get-Command git -ErrorAction Stop).Source
+    $arguments = @("-C", $Root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    if ($ExcludeFindings) {
+        $arguments += @("--", ".", ":(exclude)data/qualification/**", ":(exclude)docs/agent-benchmark/containment-soak-step63.md")
+    }
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $git
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    if ($null -ne $startInfo.PSObject.Properties["ArgumentList"]) {
+        foreach ($argument in $arguments) { [void]$startInfo.ArgumentList.Add($argument) }
+    }
+    else {
+        $quotedRoot = $Root.Replace('"', '\"')
+        $startInfo.Arguments = "-C `"$quotedRoot`" ls-files -z --cached --others --exclude-standard"
+        if ($ExcludeFindings) {
+            $startInfo.Arguments += " -- . :(exclude)data/qualification/** :(exclude)docs/agent-benchmark/containment-soak-step63.md"
         }
     }
-    if ($records.Count -eq 0) { throw "containment source tree is empty" }
-    $body = (@($records | Sort-Object) -join "`n") + "`n"
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    [void]$process.Start()
+    $manifest = [System.IO.MemoryStream]::new()
+    $process.StandardOutput.BaseStream.CopyTo($manifest)
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0) { throw "source manifest failed: $stderr" }
+    [string[]]$paths = @([System.Text.Encoding]::UTF8.GetString($manifest.ToArray()).Split([char]0) |
+        Where-Object { $_ -ne "" })
+    [Array]::Sort($paths, [StringComparer]::Ordinal)
+    if ($paths.Count -eq 0) { throw "gate source manifest is empty: $Root" }
+    $body = [System.Text.StringBuilder]::new()
+    foreach ($relative in $paths) {
+        $source = Join-Path $Root $relative
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "staged source is absent: $source"
+        }
+        [void]$body.Append("$relative`0$(Get-FileSha256 -Path $source)`n")
+    }
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body.ToString())
         return [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
     }
     finally { $sha.Dispose() }
@@ -148,7 +177,10 @@ if (-not (Test-Path -LiteralPath $GateScript)) {
 }
 $soakHash = Get-FileSha256 -Path $PSCommandPath
 $gateHash = Get-FileSha256 -Path $GateScript
-$sourceTreeHash = Get-SourceTreeSha256 -ProjectRoot $projectRoot
+$sourceTreeHash = Get-GateSourceSha256 -Root $projectRoot -ExcludeFindings
+$switchboardHash = if ($production) {
+    Get-GateSourceSha256 -Root (Join-Path (Split-Path -Parent $projectRoot) "switchboard")
+} else { "fixture" }
 $expectedPrereg = if ($production) { $STEP63_PREREG } else { $Preregister }
 
 if ([string]::IsNullOrWhiteSpace($Out)) {
@@ -197,6 +229,7 @@ if ($VerifyOnly) {
         "soak-script-sha256" = $soakHash
         "gate-script-sha256" = $gateHash
         "source-tree-sha256" = $sourceTreeHash
+        "switchboard-tree-sha256" = $switchboardHash
         "gate-script" = $GateScript
     }
     foreach ($key in $bindings.Keys) {
@@ -330,6 +363,7 @@ $headerLines = @(
     "soak-script-sha256: $soakHash",
     "gate-script-sha256: $gateHash",
     "source-tree-sha256: $sourceTreeHash",
+    "switchboard-tree-sha256: $switchboardHash",
     "started-utc: $([DateTime]::UtcNow.ToString('o'))"
 )
 [System.IO.File]::WriteAllText($headerPath, ($headerLines -join "`n") + "`n")
