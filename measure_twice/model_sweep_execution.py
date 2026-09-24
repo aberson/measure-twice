@@ -399,7 +399,10 @@ class GeminiContextProfile:
                 "execution profile.gemini.thinking_level must be one of "
                 f"{sorted(GEMINI_THINKING_LEVELS)!r}, got {self.thinking_level!r}"
             )
-        _require_finite_positive_number(self.timeout_s, label="execution profile.gemini.timeout_s")
+        seconds = _require_finite_positive_number(
+            self.timeout_s, label="execution profile.gemini.timeout_s"
+        )
+        object.__setattr__(self, "timeout_s", seconds)
 
     @classmethod
     def from_mapping(cls, value: object) -> GeminiContextProfile:
@@ -434,10 +437,6 @@ class GeminiContextProfile:
             "thinking_level": self.thinking_level,
             "timeout_s": self.timeout_s,
         }
-
-    @property
-    def sha256(self) -> str:
-        return canonical_sha256(self.to_mapping())
 
 
 # The default sample Gemini request settings (plan §6 D2: 4096 output tokens, low thinking, 120s).
@@ -524,13 +523,13 @@ class ModelSweepExecutionProfile:
         raw_models = clean["models"]
         if not isinstance(raw_models, list):
             raise ExecutionProfileError("execution profile.models must be a list")
-        raw_gemini = clean.get("gemini")
+        gemini = GeminiContextProfile.from_mapping(clean["gemini"]) if "gemini" in clean else None
         return cls(
             schema_version=cast("int", clean["schema_version"]),
             id=cast("str", clean["id"]),
             models=tuple(ModelBinding.from_mapping(model) for model in raw_models),
             claude=ClaudeContextProfile.from_mapping(clean["claude"]),
-            gemini=None if raw_gemini is None else GeminiContextProfile.from_mapping(raw_gemini),
+            gemini=gemini,
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -761,7 +760,7 @@ class ExecutionReceipt:
         if not isinstance(raw_bindings, list):
             raise ExecutionProfileError("execution receipt.bindings must be a list")
         raw_cli = clean["claude_cli"]
-        raw_gemini = clean.get("gemini")
+        gemini = GeminiContextProfile.from_mapping(clean["gemini"]) if "gemini" in clean else None
         receipt = cls(
             schema_version=cast("int", clean["schema_version"]),
             profile_id=cast("str", clean["profile_id"]),
@@ -771,7 +770,7 @@ class ExecutionReceipt:
             bindings=tuple(ModelBinding.from_mapping(binding) for binding in raw_bindings),
             sealing_mode=cast("str", clean["sealing_mode"]),
             claude_cli=(None if raw_cli is None else ClaudeRuntimeEvidence.from_mapping(raw_cli)),
-            gemini=(None if raw_gemini is None else GeminiContextProfile.from_mapping(raw_gemini)),
+            gemini=gemini,
         )
         supplied_hash = clean["receipt_sha256"]
         if not isinstance(supplied_hash, str) or supplied_hash != receipt.receipt_sha256:

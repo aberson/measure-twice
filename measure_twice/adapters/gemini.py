@@ -92,6 +92,7 @@ _BLOCK_FINISH_REASONS: Final[frozenset[str]] = frozenset(
 _PROMPT_BLOCK_REASONS: Final[frozenset[str]] = frozenset(
     {"SAFETY", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY"}
 )
+_PROMPT_NO_BLOCK_REASON: Final[str] = "BLOCK_REASON_UNSPECIFIED"
 
 # A transport: given the POST url, JSON body bytes, the API key, and a timeout (seconds), return the
 # decoded ``2xx`` response-body text. It may raise ``TimeoutError`` / ``urllib.error.URLError`` /
@@ -236,13 +237,21 @@ def _resolved_model(payload: Mapping[str, object]) -> str:
     return version if isinstance(version, str) and version.strip() else UNRESOLVED_MODEL_ID
 
 
-def _block_reason(payload: Mapping[str, object]) -> str | None:
-    """A documented prompt block reason, or None for absent/invalid feedback."""
-    feedback = payload.get("promptFeedback")
+def _block_reason(payload: Mapping[str, object]) -> tuple[bool, str | None]:
+    """Return validity and a documented prompt block reason, if one is present."""
+    if "promptFeedback" not in payload:
+        return (True, None)
+    feedback = payload["promptFeedback"]
     if not isinstance(feedback, dict):
-        return None
-    reason = feedback.get("blockReason")
-    return reason if isinstance(reason, str) and reason in _PROMPT_BLOCK_REASONS else None
+        return (False, None)
+    if "blockReason" not in feedback:
+        return (True, None)
+    reason = feedback["blockReason"]
+    if reason == _PROMPT_NO_BLOCK_REASON:
+        return (True, None)
+    if isinstance(reason, str) and reason in _PROMPT_BLOCK_REASONS:
+        return (True, reason)
+    return (False, None)
 
 
 def _extract_answer(content: object) -> tuple[bool, str]:
@@ -250,7 +259,7 @@ def _extract_answer(content: object) -> tuple[bool, str]:
 
     A ``thought`` part (``thought: true``) is excluded from the scored answer. A non-thought part
     under this text-only contract MUST carry string ``text``; a part that is not a dict, a non-bool
-    ``thought``, or a non-thought part without ``text`` (an unsupported content type such as a
+    ``thought``, or any part without ``text`` (an unsupported content type such as a
     function call or inline data) is malformed -> the caller maps it to ``bad_envelope`` (plan §6
     D4). Missing ``content`` or ``parts`` is also a malformed candidate structure.
     """
@@ -270,11 +279,11 @@ def _extract_answer(content: object) -> tuple[bool, str]:
         thought = part.get("thought")
         if thought is not None and not isinstance(thought, bool):
             return (False, "")
-        if thought is True:
-            continue  # exclude reasoning from the scored answer
         text = part.get("text")
         if not isinstance(text, str):
             return (False, "")
+        if thought is True:
+            continue  # exclude validated reasoning text from the scored answer
         pieces.append(text)
     return (True, "".join(pieces))
 
@@ -298,13 +307,16 @@ def _classify_body(raw_body: str, elapsed: float) -> ModelCallResult:
             reason_class=RC_BAD_ENVELOPE, resolved_model=resolved, elapsed_s=elapsed
         )
 
+    valid_feedback, block = _block_reason(payload)
+    if not valid_feedback:
+        return ModelCallResult.error(
+            reason_class=RC_BAD_ENVELOPE, resolved_model=resolved, elapsed_s=elapsed
+        )
+    if block is not None:
+        return ModelCallResult.no_response_result(resolved_model=resolved, elapsed_s=elapsed)
     candidates = payload.get("candidates")
-    block = _block_reason(payload)
     if not isinstance(candidates, list) or len(candidates) != 1:
-        # Missing/invalid candidate structure. A documented prompt block is a measured no-response;
-        # anything else is a malformed envelope (plan §6 D4).
-        if block is not None:
-            return ModelCallResult.no_response_result(resolved_model=resolved, elapsed_s=elapsed)
+        # Without a prompt block, missing/invalid candidate structure is malformed (plan §6 D4).
         return ModelCallResult.error(
             reason_class=RC_BAD_ENVELOPE, resolved_model=resolved, elapsed_s=elapsed
         )
@@ -348,7 +360,6 @@ def gemini_generate(
     requested_model: str,
     context: GeminiContextProfile,
     api_key: str,
-    timeout: float | None = None,
     transport_factory: GeminiTransportFactory | None = None,
 ) -> ModelCallResult:
     """Call the Gemini generateContent endpoint once and return a :class:`ModelCallResult`.
@@ -360,7 +371,6 @@ def gemini_generate(
         context: the Gemini request contract (max output tokens, thinking level, timeout, endpoint
             selector). ``context.timeout_s`` is the default per-call timeout.
         api_key: the runtime credential, sent ONLY in the ``x-goog-api-key`` header. Never stored.
-        timeout: per-call timeout override in seconds; defaults to ``context.timeout_s``.
         transport_factory: the DI seam. ``None`` -> the real ``urllib`` transport; tests inject a
             stub factory returning a fake transport with canned response bytes.
 
@@ -374,7 +384,7 @@ def gemini_generate(
         )
     url = _endpoint(requested_model)
     body = _build_request_body(prompt, context)
-    eff_timeout = timeout if timeout is not None else context.timeout_s
+    eff_timeout = context.timeout_s
     factory = transport_factory if transport_factory is not None else _default_transport_factory
     transport = factory()
 

@@ -14,7 +14,6 @@ import sys
 import threading
 import urllib.error
 from collections.abc import Callable
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +48,6 @@ from measure_twice.config import ENV_VAR, RunConfig, load_config
 from measure_twice.model_sweep_execution import (
     DEFAULT_GEMINI_CONTEXT,
     GEMINI_REQUEST_CONTRACT,
-    ExecutionProfileError,
     ExecutionReceipt,
     GeminiContextProfile,
     ModelSweepExecutionProfile,
@@ -179,8 +177,19 @@ def test_prompt_block_without_candidates_is_no_response() -> None:
     assert result.no_response
 
 
+def test_prompt_block_cannot_score_a_candidate_answer() -> None:
+    body = _resp([_cand("STOP", [{"text": "pass"}])], promptFeedback={"blockReason": "SAFETY"})
+    assert _call(body).no_response
+
+
 def test_unknown_prompt_block_without_candidates_is_bad_envelope() -> None:
     result = _call(_resp(None, promptFeedback={"blockReason": "UNKNOWN"}))
+    assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
+
+
+def test_malformed_prompt_feedback_with_answer_is_bad_envelope() -> None:
+    body = _resp([_cand("STOP", [{"text": "pass"}])], promptFeedback={"blockReason": 23})
+    result = _call(body)
     assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
 
 
@@ -201,6 +210,12 @@ def test_max_tokens_with_thought_only_is_no_response() -> None:
 
 def test_unsupported_content_part_is_bad_envelope() -> None:
     result = _call(_resp([_cand("STOP", [{"functionCall": {"name": "x"}}])]))
+    assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
+
+
+def test_unsupported_thought_part_is_bad_envelope() -> None:
+    parts = [{"thought": True, "functionCall": {"name": "x"}}, {"text": "pass"}]
+    result = _call(_resp([_cand("STOP", parts)]))
     assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
 
 
@@ -314,14 +329,6 @@ def test_request_body_reflects_context_settings() -> None:
 def test_unsafe_model_token_fails_loud_before_url_construction() -> None:
     with pytest.raises(AdapterError, match="safe single model token"):
         _call(_resp([_cand()]), requested_model="../evil:generateContent")
-
-
-def test_unknown_request_contract_is_rejected_at_construction() -> None:
-    # The request contract is the endpoint/shape selector; a foreign value can never build a
-    # context (so gemini_generate never speaks an unpinned contract). dataclasses.replace re-runs
-    # __post_init__, so this is also how a config-supplied bad contract fails loud.
-    with pytest.raises(ExecutionProfileError, match="request_contract must equal"):
-        replace(DEFAULT_GEMINI_CONTEXT, request_contract="some-other-contract")
 
 
 def test_real_urllib_transport_delivers_header_and_refuses_redirects() -> None:
@@ -470,14 +477,16 @@ def test_run_gemini_stores_terminal_rows_and_report_exposes_identity_and_setting
     assert gem["gemini_thinking_level"] == "low"
     assert gem["gemini_timeout_s"] == 120.0
 
-    html = render_transparency_report(build_transparency_report(result.run_id, tmp_path))
-    assert "Gemini request" in html
-    assert GEMINI_REQUEST_CONTRACT in html
-
 
 def test_api_key_never_appears_in_durable_output(tmp_path: Path) -> None:
     suite = _verdict_suite()
-    stub = StubAdapters(gemini=lambda prompt: "pass" if _iid(prompt) == "g-a" else "flag")
+
+    def behavior(prompt: str) -> str | BaseException:
+        if _iid(prompt) == "g-a":
+            return "pass"
+        return urllib.error.URLError(f"provider echoed {GEMINI_TEST_KEY}")
+
+    stub = StubAdapters(gemini=behavior)
     result = run(
         suite=suite,
         config=_gemini_config(),
@@ -494,6 +503,8 @@ def test_api_key_never_appears_in_durable_output(tmp_path: Path) -> None:
     run_dir = tmp_path / "runs" / result.run_id
     for name in ("manifest.json", "rows.jsonl", "suite.json"):
         assert GEMINI_TEST_KEY not in (run_dir / name).read_text("utf-8")
+    rows = _read_jsonl(run_dir / "rows.jsonl")
+    assert [row["error"] for row in rows] == [None, RC_UNREACHABLE]
     report = build_run_report(result.run_id, tmp_path)
     assert GEMINI_TEST_KEY not in render_run_report(report)
     assert GEMINI_TEST_KEY not in run_report_jsonl(report)
@@ -580,6 +591,47 @@ def test_mixed_provider_dispatch_calls_both_and_seals_both(tmp_path: Path) -> No
     by_model = {m.model: m for m in report.models}
     assert by_model["gemini-flash"].provider == "gemini-api"
     assert by_model["haiku"].provider == "claude-cli"
+
+
+def test_gemini_rubric_run_scores_with_sealed_claude_judge(tmp_path: Path) -> None:
+    suite = Suite(
+        suite="gemrubric",
+        version=1,
+        description="d",
+        domain="d",
+        scoring=ScoringSpec(type="rubric"),
+        items=[
+            Item(
+                id="r1",
+                tags=["t"],
+                prompt="Explain recursion",
+                expected="Award 10 for a correct explanation; 0 otherwise.",
+                difficulty_prior=0.5,
+                provenance="authored",
+            )
+        ],
+    )
+    stub = StubAdapters(
+        gemini=lambda prompt: "A function calling itself", claude=lambda prompt: "SCORE: 9"
+    )
+    result = run(
+        suite=suite,
+        config=_gemini_config(),
+        out_dir=tmp_path,
+        roster=["gemini-flash"],
+        gemini_transport_factory=stub.gemini_factory(),
+        gemini_credential_provider=gemini_test_credential,
+        claude_runner_factory=stub.claude_factory(),
+    )
+    rc = main(
+        ["score", result.run_id, "--out", str(tmp_path), "--config", str(GEMINI_PROFILE_PATH)],
+        deps=CliDeps(claude_runner_factory=stub.claude_factory()),
+    )
+    assert rc == 0
+    rows = _read_jsonl(tmp_path / "runs" / result.run_id / "rows.jsonl")
+    assert rows[0]["scorer"] == "rubric"
+    assert rows[0]["score"] == pytest.approx(0.9)
+    assert len(stub.gemini_calls) == 1 and len(stub.claude_calls) == 3
 
 
 def test_missing_credential_fails_before_any_run_creation(

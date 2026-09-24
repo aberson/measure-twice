@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -82,6 +83,34 @@ def test_gemini_context_validation(mutate: dict[str, object], message: str) -> N
     payload.update(mutate)
     with pytest.raises(ExecutionProfileError, match=message):
         GeminiContextProfile.from_mapping(payload)
+
+
+def test_gemini_context_normalizes_integral_timeout_for_receipt_roundtrip() -> None:
+    profile = load_config(str(ROOT / "profiles" / "model-sweep-gemini-v1.json")).execution_profile
+    context = replace(DEFAULT_GEMINI_CONTEXT, timeout_s=120)
+    assert context.timeout_s == 120.0
+    direct = replace(profile, gemini=context)
+    assert ModelSweepExecutionProfile.from_mapping(direct.to_mapping()).sha256 == direct.sha256
+    receipt = ExecutionReceipt.create(
+        direct, [direct.binding_for("gemini-flash")], claude_executable=None, claude_version=None
+    )
+    assert ExecutionReceipt.from_mapping(receipt.to_mapping()) == receipt
+
+
+def test_explicit_null_gemini_block_is_rejected_in_profile_and_receipt() -> None:
+    mapping = _profile_mapping()
+    mapping["gemini"] = None
+    with pytest.raises(ExecutionProfileError, match="gemini must be a JSON object"):
+        ModelSweepExecutionProfile.from_mapping(mapping)
+
+    binding = DEFAULT_EXECUTION_PROFILE.binding_for("general-35b")
+    receipt = ExecutionReceipt.create(
+        DEFAULT_EXECUTION_PROFILE, [binding], claude_executable=None, claude_version=None
+    )
+    wire = receipt.to_mapping()
+    wire["gemini"] = None
+    with pytest.raises(ExecutionProfileError, match="gemini must be a JSON object"):
+        ExecutionReceipt.from_mapping(wire)
 
 
 def test_legacy_receipt_without_gemini_key_parses_and_hashes_unchanged() -> None:
