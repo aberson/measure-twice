@@ -214,6 +214,12 @@ def test_unsupported_content_part_is_bad_envelope() -> None:
     assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
 
 
+def test_text_combined_with_unsupported_part_data_is_bad_envelope() -> None:
+    part = {"text": "pass", "functionCall": {"name": "x"}}
+    result = _call(_resp([_cand("STOP", [part])]))
+    assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
+
+
 def test_unsupported_thought_part_is_bad_envelope() -> None:
     parts = [{"thought": True, "functionCall": {"name": "x"}}, {"text": "pass"}]
     result = _call(_resp([_cand("STOP", parts)]))

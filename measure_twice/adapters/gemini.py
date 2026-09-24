@@ -93,6 +93,20 @@ _PROMPT_BLOCK_REASONS: Final[frozenset[str]] = frozenset(
     {"SAFETY", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY"}
 )
 _PROMPT_NO_BLOCK_REASON: Final[str] = "BLOCK_REASON_UNSPECIFIED"
+# Part.data is a oneof in the Gemini response schema. This adapter consumes text only; any of
+# these alternate data fields is unsupported even when a malformed response also supplies text.
+_NON_TEXT_PART_DATA_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "inlineData",
+        "functionCall",
+        "functionResponse",
+        "fileData",
+        "executableCode",
+        "codeExecutionResult",
+        "toolCall",
+        "toolResponse",
+    }
+)
 
 # A transport: given the POST url, JSON body bytes, the API key, and a timeout (seconds), return the
 # decoded ``2xx`` response-body text. It may raise ``TimeoutError`` / ``urllib.error.URLError`` /
@@ -259,9 +273,9 @@ def _extract_answer(content: object) -> tuple[bool, str]:
 
     A ``thought`` part (``thought: true``) is excluded from the scored answer. A non-thought part
     under this text-only contract MUST carry string ``text``; a part that is not a dict, a non-bool
-    ``thought``, or any part without ``text`` (an unsupported content type such as a
-    function call or inline data) is malformed -> the caller maps it to ``bad_envelope`` (plan §6
-    D4). Missing ``content`` or ``parts`` is also a malformed candidate structure.
+    ``thought``, any part without ``text``, or a part mixing text with another Part.data type
+    (such as a function call or inline data) is malformed -> the caller maps it to
+    ``bad_envelope`` (plan §6 D4). Missing ``content`` or ``parts`` is also malformed.
     """
     if content is None:
         return (False, "")
@@ -275,6 +289,8 @@ def _extract_answer(content: object) -> tuple[bool, str]:
     pieces: list[str] = []
     for part in parts:
         if not isinstance(part, dict):
+            return (False, "")
+        if _NON_TEXT_PART_DATA_FIELDS.intersection(part):
             return (False, "")
         thought = part.get("thought")
         if "thought" in part and not isinstance(thought, bool):
