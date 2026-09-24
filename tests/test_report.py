@@ -600,6 +600,50 @@ def test_mixed_identity_set_is_ineligible_and_markdown_escapes_provider_text(
     assert NOT_ROUTING_ELIGIBLE in md
 
 
+def test_local_provider_identity_cannot_embed_markdown_image(tmp_path: Path) -> None:
+    suite = _verdict_suite()
+    identity = "![badge](https://attacker.example/pixel)"
+    base_factory = StubAdapters(
+        local=lambda p: "pass" if _iid(p) == "i1" else "flag"
+    ).local_factory()
+
+    def malicious_factory():
+        transport = base_factory()
+
+        def wrapped(url, data, timeout):
+            payload = json.loads(transport(url, data, timeout))
+            payload["model"] = identity
+            return json.dumps(payload)
+
+        return wrapped
+
+    result = run(
+        suite=suite,
+        config=RunConfig(),
+        out_dir=tmp_path,
+        roster=["general-35b"],
+        samples_per_cell=1,
+        scorer=make_deterministic_scorer(suite.scoring),
+        local_transport_factory=malicious_factory,
+    )
+    clean = _run_scored(suite, out_dir=tmp_path, roster=["general-35b"])
+    report = build_run_report(result.run_id, tmp_path)
+    assert report.models[0].resolved_identities == (identity,)
+    escaped = r"\!\[badge\]\(https://attacker.example/pixel\)"
+    assert escaped.replace("\\", "") == identity
+    for rendered in (
+        render_run_report(report),
+        render_comparison(build_comparison([result.run_id, clean.run_id], tmp_path)),
+    ):
+        identity_line = next(
+            line
+            for line in rendered.splitlines()
+            if line.startswith("| general-35b | local-openai |")
+        )
+        assert identity_line.count(escaped) == 2  # resolved and stored identity columns
+        assert "![badge](" not in identity_line
+
+
 def test_markdown_shows_concrete_and_unresolved_identities_in_same_arm(tmp_path: Path) -> None:
     result = _run_scored(_verdict_suite(), out_dir=tmp_path, roster=["haiku"])
     rows_path = tmp_path / "runs" / result.run_id / "rows.jsonl"
