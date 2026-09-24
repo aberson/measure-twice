@@ -124,11 +124,11 @@ if ($VerifyOnly) {
     elseif (-not [string]::IsNullOrWhiteSpace($Preregister) -and $headerPrereg -ne $Preregister) {
         $failures += "preregistration sentence does not match the expected one (stale)"
     }
-    if (-not [string]::IsNullOrWhiteSpace($Preregister)) {
-        # Cross-check the run-time expectation against the recorded count.
-        if ($headerReps -ne [string]$Repetitions) {
-            $failures += "expected $Repetitions repetitions but the header records $headerReps"
-        }
+    if ($headerReps -ne [string]$Repetitions) {
+        $failures += "expected $Repetitions repetitions but the header records $headerReps"
+    }
+    if ((Read-HeaderValue -Path $verdictPath -Key "preregistration") -ne $headerPrereg) {
+        $failures += "header and verdict preregistrations disagree"
     }
     if ($headerReps -ne $verdictReps) {
         $failures += "header repetitions ($headerReps) and verdict repetitions ($verdictReps) disagree"
@@ -142,22 +142,45 @@ if ($VerifyOnly) {
 
     $logs = Get-RunLogPaths -Directory $Out
     $expectedCount = 0
-    if ([int]::TryParse($verdictReps, [ref]$expectedCount)) {
+    if ([int]::TryParse($verdictReps, [ref]$expectedCount) -and $expectedCount -gt 0) {
         if ($logs.Count -ne $expectedCount) {
             $failures += "expected $expectedCount run logs but found $($logs.Count)"
         }
     }
     else {
-        $failures += "verdict repetitions is not an integer: '$verdictReps'"
+        $failures += "verdict repetitions is not a positive integer: '$verdictReps'"
     }
-    foreach ($log in $logs) {
-        $logHash = Get-StagedTreeHash -Text ([System.IO.File]::ReadAllText($log))
+    $verifiedPasses = 0
+    for ($index = 1; $index -le $expectedCount; $index++) {
+        $log = New-RunLogPath -Directory $Out -Index $index
+        if (-not (Test-Path -LiteralPath $log)) {
+            $failures += "run log is absent: $log"
+            continue
+        }
+        $logText = [System.IO.File]::ReadAllText($log)
+        $logHash = Get-StagedTreeHash -Text $logText
         if ($logHash -eq "") {
             $failures += "run log carries no staged-tree hash: $log"
         }
         elseif ($verdictHash -match '^[0-9a-f]{64}$' -and $logHash -ne $verdictHash) {
             $failures += "run log staged-tree hash drifted from the verdict (stale): $log"
         }
+        $logExit = [regex]::Match($logText, '^=== run (\d+) exit (-?\d+) ===')
+        $recordedExit = Read-HeaderValue -Path $verdictPath -Key ("run-{0:D2}-exit" -f $index)
+        if (-not $logExit.Success -or $logExit.Groups[1].Value -ne [string]$index -or
+            $logExit.Groups[2].Value -ne "0" -or $recordedExit -ne "0") {
+            $failures += "run $index has a missing, mismatched, or nonzero gate exit"
+        }
+        else {
+            $verifiedPasses += 1
+        }
+    }
+    if ((Read-HeaderValue -Path $verdictPath -Key "pass-count") -ne [string]$expectedCount -or
+        $verifiedPasses -ne $expectedCount) {
+        $failures += "pass count does not match every recorded gate exit"
+    }
+    if ((Read-HeaderValue -Path $verdictPath -Key "hash-consistent") -ne "True") {
+        $failures += "verdict does not assert a consistent staged-tree hash"
     }
 
     if ($failures.Count -gt 0) {
@@ -179,6 +202,9 @@ $powershell = Get-Command powershell.exe -ErrorAction Stop
 if (-not (Test-Path -LiteralPath $Out)) {
     $null = New-Item -ItemType Directory -Path $Out -Force
 }
+elseif (@(Get-ChildItem -LiteralPath $Out -Force).Count -ne 0) {
+    throw "-Out must be empty for a new soak; existing evidence cannot be overwritten: $Out"
+}
 
 # Write the preregistration to the evidence header BEFORE run 1: the claim precedes any data.
 $headerLines = @(
@@ -197,9 +223,11 @@ for ($index = 1; $index -le $Repetitions; $index++) {
     $logPath = New-RunLogPath -Directory $Out -Index $index
     $stdoutPath = "$logPath.stdout"
     $stderrPath = "$logPath.stderr"
+    $quotedGateScript = '"' + $GateScript.Replace('"', '\"') + '"'
+    $quotedDistribution = '"' + $Distribution.Replace('"', '\"') + '"'
     $gateArgs = @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $GateScript,
-        "-Distribution", $Distribution
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $quotedGateScript,
+        "-Distribution", $quotedDistribution
     )
     # Foreground child process (never backgrounded): captures the exact exit code without the
     # gate's own `exit` terminating this wrapper, and preserves the full run log as evidence.

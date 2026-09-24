@@ -189,6 +189,35 @@ def test_verify_only_detects_a_stale_run_log(tmp_path: Path) -> None:
     assert "stale" in verify.stderr.lower()
 
 
+def test_verify_only_rejects_forged_pass_with_a_failed_run(tmp_path: Path) -> None:
+    plan = [f"{_HASH_A}|0" for _ in range(8)]
+    plan[6] = f"{_HASH_A}|2"
+    completed, out_dir = _run_soak(tmp_path, plan=plan, repetitions=8)
+    assert completed.returncode != 0
+
+    verdict_path = out_dir / "verdict.txt"
+    verdict_path.write_text(
+        verdict_path.read_text(encoding="utf-8").replace("verdict: FAIL", "verdict: PASS"),
+        encoding="utf-8",
+    )
+    verify, _ = _run_soak(tmp_path, plan=plan, repetitions=8, out=out_dir, verify_only=True)
+    assert verify.returncode != 0
+    assert "nonzero gate exit" in verify.stderr.lower()
+
+
+def test_soak_preserves_existing_evidence_and_quotes_gate_path(tmp_path: Path) -> None:
+    spaced = tmp_path / "gate path with spaces"
+    spaced.mkdir()
+    plan = [f"{_HASH_A}|0"]
+    completed, out_dir = _run_soak(spaced, plan=plan, repetitions=1)
+    assert completed.returncode == 0, completed.stderr
+    original_header = (out_dir / "evidence-header.txt").read_bytes()
+
+    rerun, _ = _run_soak(spaced, plan=plan, repetitions=1, out=out_dir)
+    assert rerun.returncode != 0
+    assert (out_dir / "evidence-header.txt").read_bytes() == original_header
+
+
 def test_verify_only_fails_closed_on_absent_evidence(tmp_path: Path) -> None:
     empty = tmp_path / "empty-evidence"
     empty.mkdir()
