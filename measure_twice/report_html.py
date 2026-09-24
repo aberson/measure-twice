@@ -586,6 +586,14 @@ def _execution_payload(report: TransparencyReport) -> dict[str, object]:
         "receipt_sha256": None if evidence is None else evidence.receipt_sha256,
         "claude_executable": None if evidence is None else evidence.claude_executable,
         "claude_version": None if evidence is None else evidence.claude_version,
+        # Gemini request settings (plan §6 D2), null unless the run selected a Gemini binding. The
+        # template renders a "Gemini request" seal row only when the contract is present.
+        "gemini_request_contract": (None if evidence is None else evidence.gemini_request_contract),
+        "gemini_max_output_tokens": (
+            None if evidence is None else evidence.gemini_max_output_tokens
+        ),
+        "gemini_thinking_level": None if evidence is None else evidence.gemini_thinking_level,
+        "gemini_timeout_s": None if evidence is None else evidence.gemini_timeout_s,
         "arms": arms,
     }
 

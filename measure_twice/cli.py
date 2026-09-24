@@ -39,6 +39,7 @@ from pathlib import Path
 
 from measure_twice import __version__, runner
 from measure_twice.adapters.claude_cli import BudgetExhaustedError, CallBudget, RunnerFactory
+from measure_twice.adapters.gemini import GeminiCredentialProvider, GeminiTransportFactory
 from measure_twice.adapters.local import TransportFactory
 from measure_twice.agent_bench import AgentCliDeps
 from measure_twice.agent_bench.cli import register_agent_cli
@@ -88,6 +89,9 @@ _SMOKE_SUITE_PATH = Path(__file__).resolve().parent.parent / "suites" / "smoke.j
 # The single claude tier / single local model ``mt smoke`` sweeps (1 model x 2 items = 2 calls).
 _SMOKE_CLAUDE_MODEL = "haiku"
 _SMOKE_LOCAL_MODEL = "general-35b"
+# ``mt smoke --gemini`` sweeps this alias; it exists only in the committed Gemini execution profile,
+# so the mode needs `--config profiles/model-sweep-gemini-v1.json` (else the alias fails to bind).
+_SMOKE_GEMINI_MODEL = "gemini-flash"
 
 # The tracked evidence ledger is separate from gitignored run/report output.  Keep this a relative
 # CLI default so an operator can point ``mt`` at an alternate project checkout by changing cwd.
@@ -124,10 +128,17 @@ class CliDeps:
     k=3 median judge pass, and a stub ``judge_caller`` (returning canned judge outputs) drives it
     with ZERO live ``claude`` calls. Production leaves it ``None`` and builds the real
     ``claude_call``-backed caller from the resolved config.
+
+    ``gemini_transport_factory`` / ``gemini_credential_provider`` are the Gemini DI seams for
+    ``mt run`` and ``mt smoke --gemini``: tests inject a stub transport (canned response bytes) and
+    a test credential provider so the whole path runs offline without reading real credentials.
+    Production leaves both ``None`` (real ``urllib`` transport + real environment key resolution).
     """
 
     local_transport_factory: TransportFactory | None = None
     claude_runner_factory: RunnerFactory | None = None
+    gemini_transport_factory: GeminiTransportFactory | None = None
+    gemini_credential_provider: GeminiCredentialProvider | None = None
     scorer: Scorer | None = None
     judge_caller: JudgeCaller | None = None
     agent: AgentCliDeps = field(default_factory=AgentCliDeps)
@@ -216,6 +227,8 @@ def _handle_run(args: argparse.Namespace, deps: CliDeps) -> int:
             scorer=scorer,
             local_transport_factory=deps.local_transport_factory,
             claude_runner_factory=deps.claude_runner_factory,
+            gemini_transport_factory=deps.gemini_transport_factory,
+            gemini_credential_provider=deps.gemini_credential_provider,
         )
     except RunError as exc:
         print(f"run: {exc}", file=sys.stderr)
@@ -501,7 +514,12 @@ def _handle_smoke(args: argparse.Namespace, deps: CliDeps) -> int:
     factory is injected (the DI seam) — so the smoke WIRING is fully offline-testable with ZERO live
     calls, while production runs the real preflight + real adapters.
     """
-    mode = "local" if args.local else "claude"
+    if args.gemini:
+        mode = "gemini"
+    elif args.local:
+        mode = "local"
+    else:
+        mode = "claude"
     try:
         config = load_config(args.config)
         suite = load_suite(args.suite)
@@ -518,6 +536,11 @@ def _handle_smoke(args: argparse.Namespace, deps: CliDeps) -> int:
                 file=sys.stderr,
             )
             return 1
+    elif mode == "gemini":
+        # No network probe: the runner's credential preflight (plan §6 D3) is the fail-loud gate,
+        # and the offline seam supplies a test credential/transport. The Gemini alias lives only in
+        # the committed Gemini profile, so a missing `--config` surfaces as an unbound-alias error.
+        roster = [_SMOKE_GEMINI_MODEL]
     else:
         roster = [_SMOKE_LOCAL_MODEL]
         if deps.local_transport_factory is None:
@@ -545,6 +568,8 @@ def _handle_smoke(args: argparse.Namespace, deps: CliDeps) -> int:
             scorer=scorer,
             local_transport_factory=deps.local_transport_factory,
             claude_runner_factory=deps.claude_runner_factory,
+            gemini_transport_factory=deps.gemini_transport_factory,
+            gemini_credential_provider=deps.gemini_credential_provider,
         )
     except RunError as exc:
         print(f"smoke: {exc}", file=sys.stderr)
@@ -773,7 +798,8 @@ def _build_parser(
         description="Run the 2-item smoke suite end-to-end (suite -> runner -> scorer -> report) "
         "with one REAL request per item. Exit 0 iff a scored report is produced with zero parse "
         "failures/errors/no-response. --claude (default) sweeps haiku; --local sweeps the "
-        "operator-started local endpoint (never auto-spawned).",
+        "operator-started local endpoint (never auto-spawned); --gemini sweeps the Gemini Flash "
+        "model and needs `--config profiles/model-sweep-gemini-v1.json` plus GOOGLE_API_KEY.",
     )
     smoke_mode = smoke_parser.add_mutually_exclusive_group()
     smoke_mode.add_argument(
@@ -785,6 +811,12 @@ def _build_parser(
         "--local",
         action="store_true",
         help="sweep the smoke suite against the operator-started local endpoint",
+    )
+    smoke_mode.add_argument(
+        "--gemini",
+        action="store_true",
+        help="sweep the smoke suite against gemini-flash via the Gemini Developer API "
+        "(needs --config profiles/model-sweep-gemini-v1.json and a GOOGLE_API_KEY/GEMINI_API_KEY)",
     )
     smoke_parser.add_argument(
         "--suite",

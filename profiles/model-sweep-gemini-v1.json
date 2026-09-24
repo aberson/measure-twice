@@ -1,0 +1,95 @@
+{
+  "roster": [
+    "gemini-flash"
+  ],
+  "local_base_url": "http://localhost:8080/v1",
+  "local_max_tokens": 2000,
+  "local_timeout_s": 120.0,
+  "claude_pool": 2,
+  "samples_per_cell": 1,
+  "judges": [
+    "sonnet"
+  ],
+  "max_calls": 500,
+  "execution_profile": {
+    "schema_version": 1,
+    "id": "model-sweep-gemini-v1",
+    "models": [
+      {
+        "alias": "general-35b",
+        "provider": "local-openai",
+        "requested_model": "general-35b"
+      },
+      {
+        "alias": "coder-30b",
+        "provider": "local-openai",
+        "requested_model": "coder-30b"
+      },
+      {
+        "alias": "haiku",
+        "provider": "claude-cli",
+        "requested_model": "haiku"
+      },
+      {
+        "alias": "sonnet",
+        "provider": "claude-cli",
+        "requested_model": "sonnet"
+      },
+      {
+        "alias": "opus",
+        "provider": "claude-cli",
+        "requested_model": "opus"
+      },
+      {
+        "alias": "fable",
+        "provider": "claude-cli",
+        "requested_model": "fable"
+      },
+      {
+        "alias": "gemini-flash",
+        "provider": "gemini-api",
+        "requested_model": "gemini-3.8-flash"
+      }
+    ],
+    "claude": {
+      "executable": "claude",
+      "sealing_mode": "prompt-only-v1",
+      "argv_template": [
+        "-p",
+        "--model",
+        "{requested_model}",
+        "--output-format",
+        "json",
+        "--safe-mode",
+        "--tools",
+        "",
+        "--disable-slash-commands",
+        "--no-chrome",
+        "--no-session-persistence"
+      ],
+      "environment_allowlist": [
+        "APPDATA",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "COMSPEC",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USERPROFILE",
+        "WINDIR"
+      ]
+    },
+    "gemini": {
+      "request_contract": "generate-content-text-v1",
+      "max_output_tokens": 4096,
+      "thinking_level": "low",
+      "timeout_s": 120.0
+    }
+  }
+}

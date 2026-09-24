@@ -89,6 +89,7 @@ unmeasured routing policies.
 |---|---|
 | `mt validate suites/smoke.json` | Check a suite and print its item hash, without calling a model. |
 | `mt smoke --claude` / `mt smoke --local` | Exercise the run → score → report path with two real calls. |
+| `mt smoke --gemini --config profiles/model-sweep-gemini-v1.json` | Same two-call smoke against the Gemini Flash API (needs `GOOGLE_API_KEY`). |
 | `mt run --suite <path> --models <csv>` | Sweep a suite across a selected roster. |
 | `mt report <run_id> --html` | Inspect every item and response in a scored verdict run. |
 | `mt report <run_id> --compare <other_run_id>` | Compare stored runs with matching suite hashes. |
@@ -234,10 +235,23 @@ recorded in the run manifest.
 
 Every roster and judge alias requires an explicit provider and requested-model binding in the
 execution profile. Claude bindings use the authenticated `claude` CLI; `local-openai` bindings use
-the local endpoint. Unknown names fail before run creation. The committed
+the local endpoint; `gemini-api` bindings call the Gemini Developer API over HTTPS. Unknown names
+fail before run creation. The committed
 [execution profile](profiles/model-sweep-execution-v1.json) includes the default aliases and
 `fable`; extend its `execution_profile.models` list to add a model. See
 [config.py](measure_twice/config.py) for the accepted fields.
+
+**Gemini (optional third provider).** The committed
+[Gemini profile](profiles/model-sweep-gemini-v1.json) adds the `gemini-flash` alias
+(`gemini-3.8-flash`) plus a `gemini` request contract — `maxOutputTokens 4096`, `thinkingLevel low`,
+`timeout_s 120` — pinned into the execution/receipt identity so a changed setting rejects resume.
+Provide the key through the OS environment (`GOOGLE_API_KEY`, else `GEMINI_API_KEY`); it is read at
+run time, sent only in the `x-goog-api-key` header, and never written to any config, receipt, report,
+or log. A missing or blank key fails before the run is created. Smoke it end to end with
+`uv run mt smoke --gemini --config profiles/model-sweep-gemini-v1.json`, then
+`uv run mt report <run_id> --html`. The two-call smoke is pipeline verification only — it does not
+establish routing eligibility or model quality, and the default five-model calibration roster is
+unchanged.
 
 Claude calls run from empty temporary directories under the frozen prompt-only environment.
 Ambient proxy and CA overrides (including HTTP(S)_PROXY and NODE_EXTRA_CA_CERTS) are excluded;

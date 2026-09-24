@@ -287,7 +287,28 @@ def test_nested_execution_profile_is_strictly_parsed(tmp_path: Path) -> None:
     path = tmp_path / "bad-profile.json"
     _write_json(path, {"execution_profile": profile})
 
-    with pytest.raises(ConfigError, match="execution profile keys must be exactly"):
+    # The profile schema now allows an optional 'gemini' key, so an unknown key is rejected with
+    # the "keys must include ... and allow only ..." message rather than "keys must be exactly".
+    with pytest.raises(ConfigError, match="execution profile keys must include"):
+        load_config(str(path))
+
+
+def test_committed_gemini_profile_config_loads_settings_without_credentials() -> None:
+    profile_path = Path(__file__).resolve().parents[1] / "profiles" / "model-sweep-gemini-v1.json"
+    config = load_config(str(profile_path))
+    # The optional Gemini request settings are read into the profile; no credential is accepted.
+    assert config.execution_profile.gemini is not None
+    assert config.execution_profile.gemini.max_output_tokens == 4096
+    assert config.roster == ["gemini-flash"]
+    # A config file can never carry an API key: it is not an allowed top-level config field.
+    assert "google_api_key" not in ALLOWED_CONFIG_FIELDS
+    assert "gemini_api_key" not in ALLOWED_CONFIG_FIELDS
+
+
+def test_config_rejects_a_credential_shaped_key(tmp_path: Path) -> None:
+    path = tmp_path / "cred.json"
+    _write_json(path, {"google_api_key": "should-not-be-here"})
+    with pytest.raises(ConfigError, match="unknown config key"):
         load_config(str(path))
 
 

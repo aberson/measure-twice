@@ -10,10 +10,13 @@ import pytest
 from measure_twice.config import load_config
 from measure_twice.model_sweep_execution import (
     DEFAULT_EXECUTION_PROFILE,
+    DEFAULT_GEMINI_CONTEXT,
     PROVIDER_CLAUDE,
+    PROVIDER_GEMINI,
     PROVIDER_LOCAL,
     ExecutionProfileError,
     ExecutionReceipt,
+    GeminiContextProfile,
     ModelBinding,
     ModelSweepExecutionProfile,
 )
@@ -37,6 +40,91 @@ def test_committed_execution_profile_matches_defaults_and_frozen_hashes() -> Non
     assert profile.sha256 == PROFILE_SHA256
     assert profile.provider_profile_sha256 == PROVIDER_PROFILE_SHA256
     assert profile.claude.sha256 == CONTEXT_PROFILE_SHA256
+    # Additive compatibility (plan §6 D5): a Gemini-free profile serializes with NO gemini key and
+    # its shared context-hash owner is EXACTLY the Claude context hash, so old hashes are unchanged.
+    assert "gemini" not in profile.to_mapping()
+    assert profile.gemini is None
+    assert profile.context_profile_sha256 == CONTEXT_PROFILE_SHA256
+
+
+def test_gemini_context_present_iff_gemini_binding() -> None:
+    mapping = _profile_mapping()
+    models = mapping["models"]
+    assert isinstance(models, list)
+    # A Gemini binding without a gemini context is rejected.
+    models.append(
+        {"alias": "gf", "provider": PROVIDER_GEMINI, "requested_model": "gemini-3.8-flash"}
+    )
+    with pytest.raises(ExecutionProfileError, match="must define a 'gemini' context"):
+        ModelSweepExecutionProfile.from_mapping(mapping)
+    # A gemini context with no Gemini binding is equally rejected.
+    orphan = _profile_mapping()
+    orphan["gemini"] = DEFAULT_GEMINI_CONTEXT.to_mapping()
+    with pytest.raises(ExecutionProfileError, match="binds no 'gemini-api' model"):
+        ModelSweepExecutionProfile.from_mapping(orphan)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        ({"request_contract": "other"}, "request_contract must equal"),
+        ({"max_output_tokens": 0}, "max_output_tokens must be an int"),
+        ({"max_output_tokens": True}, "max_output_tokens must be an integer"),
+        ({"thinking_level": "extreme"}, "thinking_level must be one of"),
+        ({"timeout_s": 0}, "timeout_s must be a finite positive"),
+        ({"timeout_s": "soon"}, "timeout_s must be a number"),
+    ],
+)
+def test_gemini_context_validation(mutate: dict[str, object], message: str) -> None:
+    payload = DEFAULT_GEMINI_CONTEXT.to_mapping()
+    payload.update(mutate)
+    with pytest.raises(ExecutionProfileError, match=message):
+        GeminiContextProfile.from_mapping(payload)
+
+
+def test_legacy_receipt_without_gemini_key_parses_and_hashes_unchanged() -> None:
+    binding = DEFAULT_EXECUTION_PROFILE.binding_for("sonnet")
+    receipt = ExecutionReceipt.create(
+        DEFAULT_EXECUTION_PROFILE, [binding], claude_executable="claude", claude_version="1.0.0"
+    )
+    wire = receipt.to_mapping()
+    # A Claude-only receipt omits the optional gemini key entirely (byte/hash stability, §6 D5).
+    assert "gemini" not in wire
+    assert receipt.gemini is None
+    assert ExecutionReceipt.from_mapping(wire) == receipt
+
+
+def test_receipt_gemini_biconditional_rejects_mismatch() -> None:
+    profile = load_config(str(ROOT / "profiles" / "model-sweep-gemini-v1.json")).execution_profile
+    gemini_binding = profile.binding_for("gemini-flash")
+    local_binding = profile.binding_for("general-35b")
+    # Selecting a Gemini binding requires the gemini block ...
+    with pytest.raises(ExecutionProfileError, match="gemini must be present exactly when"):
+        ExecutionReceipt(
+            schema_version=1,
+            profile_id=profile.id,
+            execution_profile_sha256=profile.sha256,
+            provider_profile_sha256=profile.provider_profile_sha256,
+            context_profile_sha256=profile.context_profile_sha256,
+            bindings=(gemini_binding,),
+            sealing_mode=profile.claude.sealing_mode,
+            claude_cli=None,
+            gemini=None,
+        )
+    # ... and a gemini block with no Gemini binding selected is equally rejected (local-only here,
+    # so the Claude-CLI biconditional is satisfied and the Gemini one is what fires).
+    with pytest.raises(ExecutionProfileError, match="gemini must be present exactly when"):
+        ExecutionReceipt(
+            schema_version=1,
+            profile_id=profile.id,
+            execution_profile_sha256=profile.sha256,
+            provider_profile_sha256=profile.provider_profile_sha256,
+            context_profile_sha256=profile.context_profile_sha256,
+            bindings=(local_binding,),
+            sealing_mode=profile.claude.sealing_mode,
+            claude_cli=None,
+            gemini=DEFAULT_GEMINI_CONTEXT,
+        )
 
 
 def test_profile_dispatches_only_by_explicit_provider_binding() -> None:
@@ -108,7 +196,9 @@ def test_claude_binding_rejects_hostile_requested_model_tokens(requested_model: 
 @pytest.mark.parametrize(
     ("path", "message"),
     [
-        (("extra",), "keys must be exactly"),
+        # The top-level profile schema now permits an optional 'gemini' key, so its unknown-key
+        # message names the allowed set; the leaf schemas remain strict-exact.
+        (("extra",), "keys must include"),
         (("models", 0, "extra"), "keys must be exactly"),
         (("claude", "extra"), "keys must be exactly"),
     ],

@@ -443,6 +443,12 @@
       rows.push(["Claude CLI", X.claude_executable == null
         ? "(no Claude bindings)"
         : X.claude_executable + " (" + X.claude_version + ")"]);
+      if (X.gemini_request_contract != null) {
+        rows.push(["Gemini request", X.gemini_request_contract
+          + " (maxOutputTokens " + X.gemini_max_output_tokens
+          + ", thinking " + X.gemini_thinking_level
+          + ", timeout " + X.gemini_timeout_s + "s)"]);
+      }
     } else {
       rows.push(["Seal", X.seal_status]);
       rows.push(["Routing", X.not_routing_eligible]);
