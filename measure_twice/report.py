@@ -276,9 +276,7 @@ def build_execution_evidence(manifest: Mapping[str, object]) -> ExecutionEvidenc
         receipt_sha256=receipt.receipt_sha256,
         claude_executable=None if receipt.claude_cli is None else receipt.claude_cli.executable,
         claude_version=None if receipt.claude_cli is None else receipt.claude_cli.version,
-        bindings=tuple(
-            (b.alias, b.provider, b.requested_model) for b in receipt.bindings
-        ),
+        bindings=tuple((b.alias, b.provider, b.requested_model) for b in receipt.bindings),
     )
 
 
@@ -294,7 +292,7 @@ def _model_report(
     computed exactly as before and is never touched by any of this.
     """
     scores = [row.score for row in rows if row.score is not None]
-    resolved = sorted({row.model_id_resolved for row in rows if row.model_id_resolved})
+    resolved = sorted({row.model_id_resolved or UNRESOLVED_IDENTITY for row in rows})
     concrete = [value for value in resolved if value != UNRESOLVED_IDENTITY]
     identity_unresolved = (UNRESOLVED_IDENTITY in resolved) or not concrete
     binding = execution.binding_for(model) if execution is not None else None
@@ -302,9 +300,7 @@ def _model_report(
     requested_model = None if binding is None else binding[1]
     # Coarse seal gate ONLY (Step 59 owns the constant-control verdict): a legacy run, an alias the
     # receipt never bound, or an unresolved identity is not routing-eligible.
-    routing_eligible = (
-        execution is not None and binding is not None and not identity_unresolved
-    )
+    routing_eligible = execution is not None and binding is not None and not identity_unresolved
     return ModelReport(
         model=model,
         n_cells=len(rows),

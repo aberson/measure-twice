@@ -464,7 +464,7 @@ def _unresolved_claude_stdout(text: str) -> SubprocessResult:
 
 
 def test_report_surfaces_execution_receipt_and_identity(tmp_path: Path) -> None:
-    """A sealed run names provider / requested / resolved and the receipt hashes; scores unchanged."""
+    """A sealed run names provider, requested, resolved, and receipt hashes."""
     suite = _verdict_suite()
     result = _run_scored(
         suite,
@@ -499,7 +499,7 @@ def test_report_surfaces_execution_receipt_and_identity(tmp_path: Path) -> None:
 
 
 def test_report_legacy_run_marked_unsealed_without_changing_scores(tmp_path: Path) -> None:
-    """A legacy manifest (no receipt) is LEGACY_UNSEALED + NOT_ROUTING_ELIGIBLE; scores unchanged."""
+    """A legacy manifest is unsealed and ineligible, while scores remain unchanged."""
     suite = _verdict_suite()
     result = _run_scored(
         suite,
@@ -507,7 +507,9 @@ def test_report_legacy_run_marked_unsealed_without_changing_scores(tmp_path: Pat
         roster=["haiku"],
         claude=lambda p: "pass" if _iid(p) == "i1" else "flag",
     )
-    sealed_score = {m.model: m.suite_score for m in build_run_report(result.run_id, tmp_path).models}
+    sealed_score = {
+        m.model: m.suite_score for m in build_run_report(result.run_id, tmp_path).models
+    }
     _strip_execution_receipt(tmp_path, result.run_id)
 
     report = build_run_report(result.run_id, tmp_path)
@@ -518,7 +520,7 @@ def test_report_legacy_run_marked_unsealed_without_changing_scores(tmp_path: Pat
     assert haiku.requested_model is None
     assert haiku.routing_eligible is False
     assert haiku.eligibility == NOT_ROUTING_ELIGIBLE
-    # The official score is identical to the sealed reading — the seal label never rescored anything.
+    # The official score is identical to the sealed reading.
     assert haiku.suite_score == sealed_score["haiku"] == 100.0
 
     md = render_run_report(report)
@@ -549,7 +551,7 @@ def test_report_unresolved_identity_marked_distinctly(tmp_path: Path) -> None:
 
 
 def test_jsonl_export_carries_execution_and_identity(tmp_path: Path) -> None:
-    """The per-model JSONL sibling carries the additive seal + identity fields (sealed and legacy)."""
+    """Per-model JSONL carries additive seal and identity fields."""
     suite = _verdict_suite()
     result = _run_scored(
         suite,

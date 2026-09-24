@@ -30,7 +30,12 @@ from measure_twice.adapters.base import UNRESOLVED_MODEL_ID
 from measure_twice.adapters.claude_cli import SubprocessResult
 from measure_twice.cli import main
 from measure_twice.config import RunConfig
-from measure_twice.report import LEGACY_UNSEALED, NOT_ROUTING_ELIGIBLE, ReportError, build_run_report
+from measure_twice.report import (
+    LEGACY_UNSEALED,
+    NOT_ROUTING_ELIGIBLE,
+    ReportError,
+    build_run_report,
+)
 from measure_twice.report_html import (
     OUTCOME_CORRECT,
     OUTCOME_NO_VERDICT,

@@ -568,9 +568,7 @@ def _execution_payload(report: TransparencyReport) -> dict[str, object]:
             "routing_eligible": model.routing_eligible,
             "eligibility": model.eligibility,
         }
-        for name, model in (
-            (name, report.identity_by_model[name]) for name in report.models
-        )
+        for name, model in ((name, report.identity_by_model[name]) for name in report.models)
     ]
     return {
         "sealed": evidence is not None,
@@ -581,9 +579,7 @@ def _execution_payload(report: TransparencyReport) -> dict[str, object]:
         "execution_profile_sha256": (
             None if evidence is None else evidence.execution_profile_sha256
         ),
-        "provider_profile_sha256": (
-            None if evidence is None else evidence.provider_profile_sha256
-        ),
+        "provider_profile_sha256": (None if evidence is None else evidence.provider_profile_sha256),
         "context_profile_sha256": None if evidence is None else evidence.context_profile_sha256,
         "receipt_sha256": None if evidence is None else evidence.receipt_sha256,
         "claude_executable": None if evidence is None else evidence.claude_executable,
