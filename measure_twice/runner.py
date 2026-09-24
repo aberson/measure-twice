@@ -72,6 +72,7 @@ from measure_twice.adapters.gemini import (
     GeminiTransportFactory,
     gemini_generate,
     resolve_gemini_credential,
+    validate_gemini_credential,
 )
 from measure_twice.adapters.local import TransportFactory, local_chat
 from measure_twice.config import ConfigError, RunConfig, _validate_name_list
@@ -802,7 +803,7 @@ def _preflight_gemini_credential(provider: GeminiCredentialProvider | None) -> s
     """
     resolver = provider if provider is not None else resolve_gemini_credential
     try:
-        return resolver()
+        return validate_gemini_credential(resolver())
     except GeminiCredentialError as exc:
         raise RunError(f"Gemini credential preflight failed: {exc}") from exc
 

@@ -489,6 +489,8 @@ def _smoke_gate(mode: str, report: RunReport, result: runner.RunResult) -> int:
         problems.append(f"{report.total_parse_fail} parse failure(s)")
     if report.total_scored == 0:
         problems.append("no scored rows (empty report)")
+    if mode == "gemini" and any(model.identity_unresolved for model in report.models):
+        problems.append("Gemini provider identity unresolved")
     if problems:
         print(f"smoke [{mode}]: FAIL - " + "; ".join(problems), file=sys.stderr)
         return 1

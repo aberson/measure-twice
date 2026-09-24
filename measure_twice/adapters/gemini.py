@@ -68,6 +68,7 @@ __all__ = [
     "GeminiTransportFactory",
     "gemini_generate",
     "resolve_gemini_credential",
+    "validate_gemini_credential",
 ]
 
 # The fixed, code-owned origin + path template. Selected by ``request_contract`` (plan §6 D2), never
@@ -87,6 +88,9 @@ _FINISH_MAX_TOKENS: Final[str] = "MAX_TOKENS"
 # Documented safety/recitation blocks -> the no-response state (a measured empty answer, not text).
 _BLOCK_FINISH_REASONS: Final[frozenset[str]] = frozenset(
     {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY"}
+)
+_PROMPT_BLOCK_REASONS: Final[frozenset[str]] = frozenset(
+    {"SAFETY", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY"}
 )
 
 # A transport: given the POST url, JSON body bytes, the API key, and a timeout (seconds), return the
@@ -109,6 +113,16 @@ class GeminiCredentialError(ValueError):
     """
 
 
+def validate_gemini_credential(value: object) -> str:
+    """Require a printable ASCII header token without revealing its value in an error."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise GeminiCredentialError("Gemini API key is missing or blank")
+    if any(not 33 <= ord(character) <= 126 for character in value):
+        raise GeminiCredentialError("Gemini API key contains invalid header characters")
+    return value
+
+
 def resolve_gemini_credential() -> str:
     """Read the API key from ``GOOGLE_API_KEY`` then ``GEMINI_API_KEY`` (Google's precedence).
 
@@ -124,11 +138,10 @@ def resolve_gemini_credential() -> str:
             raise GeminiCredentialError(
                 f"{name} is set but blank; refusing to silently fall back to another variable"
             )
-        if any(ch in value for ch in "\r\n\x00"):
-            raise GeminiCredentialError(
-                f"{name} contains control characters and is not a usable header value"
-            )
-        return value
+        try:
+            return validate_gemini_credential(value)
+        except GeminiCredentialError as exc:
+            raise GeminiCredentialError(f"{name} contains invalid header characters") from exc
     raise GeminiCredentialError(
         "no Gemini API key found; set GOOGLE_API_KEY (preferred) or GEMINI_API_KEY in the "
         "environment before running a Gemini sweep"
@@ -224,12 +237,12 @@ def _resolved_model(payload: Mapping[str, object]) -> str:
 
 
 def _block_reason(payload: Mapping[str, object]) -> str | None:
-    """A non-blank ``promptFeedback.blockReason`` string, or None."""
+    """A documented prompt block reason, or None for absent/invalid feedback."""
     feedback = payload.get("promptFeedback")
     if not isinstance(feedback, dict):
         return None
     reason = feedback.get("blockReason")
-    return reason if isinstance(reason, str) and reason.strip() else None
+    return reason if isinstance(reason, str) and reason in _PROMPT_BLOCK_REASONS else None
 
 
 def _extract_answer(content: object) -> tuple[bool, str]:
@@ -301,6 +314,10 @@ def _classify_body(raw_body: str, elapsed: float) -> ModelCallResult:
     # A candidate-level safety/recitation block is a no-response (typically carries no content).
     if finish in _BLOCK_FINISH_REASONS:
         return ModelCallResult.no_response_result(resolved_model=resolved, elapsed_s=elapsed)
+    if finish not in {_FINISH_STOP, _FINISH_MAX_TOKENS}:
+        return ModelCallResult.error(
+            reason_class=RC_BAD_ENVELOPE, resolved_model=resolved, elapsed_s=elapsed
+        )
 
     parts_ok, answer = _extract_answer(candidate.get("content"))
     if not parts_ok:
@@ -315,11 +332,6 @@ def _classify_body(raw_body: str, elapsed: float) -> ModelCallResult:
     if finish == _FINISH_MAX_TOKENS:
         return ModelCallResult.error(
             reason_class=RC_TRUNCATED, resolved_model=resolved, elapsed_s=elapsed
-        )
-    if finish != _FINISH_STOP:
-        # An unexpected or missing finish reason on a non-empty answer is a contract violation.
-        return ModelCallResult.error(
-            reason_class=RC_BAD_ENVELOPE, resolved_model=resolved, elapsed_s=elapsed
         )
     return ModelCallResult.success(response_raw=answer, resolved_model=resolved, elapsed_s=elapsed)
 

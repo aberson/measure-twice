@@ -178,6 +178,11 @@ def test_prompt_block_without_candidates_is_no_response() -> None:
     assert result.no_response
 
 
+def test_unknown_prompt_block_without_candidates_is_bad_envelope() -> None:
+    result = _call(_resp(None, promptFeedback={"blockReason": "UNKNOWN"}))
+    assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
+
+
 def test_candidate_safety_finish_is_no_response() -> None:
     assert _call(_resp([_cand("SAFETY", None)])).no_response
 
@@ -200,6 +205,11 @@ def test_unsupported_content_part_is_bad_envelope() -> None:
 
 def test_unexpected_finish_reason_on_text_is_bad_envelope() -> None:
     result = _call(_resp([_cand("WEIRD_REASON", [{"text": "hello"}])]))
+    assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
+
+
+def test_unexpected_finish_reason_on_empty_answer_is_bad_envelope() -> None:
+    result = _call(_resp([_cand("WEIRD_REASON", [])]))
     assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
 
 
@@ -356,6 +366,9 @@ def test_resolve_credential_precedence_and_blank_winner(monkeypatch: pytest.Monk
     with pytest.raises(GeminiCredentialError) as exc_info:
         resolve_gemini_credential()  # blank winner fails, does NOT fall back to GEMINI_API_KEY
     assert "second" not in str(exc_info.value)  # never echoes a value
+    monkeypatch.setenv("GOOGLE_API_KEY", "bad\x01")
+    with pytest.raises(GeminiCredentialError, match="invalid header characters"):
+        resolve_gemini_credential()
 
 
 # --- committed profile + additive receipt compatibility ------------------------------------
@@ -494,6 +507,34 @@ def test_smoke_gemini_end_to_end_passes_offline(
     assert len(stub.gemini_calls) == 2
 
 
+def test_smoke_gemini_fails_without_concrete_identity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def unresolved_answer(prompt: str) -> dict[str, object]:
+        return {
+            "candidates": [
+                {
+                    "finishReason": "STOP",
+                    "content": {"parts": [{"text": prompt.strip().split()[-1]}]},
+                }
+            ]
+        }
+
+    stub = StubAdapters(gemini=unresolved_answer)
+    deps = CliDeps(
+        gemini_transport_factory=stub.gemini_factory(),
+        gemini_credential_provider=gemini_test_credential,
+    )
+    rc = main(
+        ["smoke", "--gemini", "--config", str(GEMINI_PROFILE_PATH), "--out", str(tmp_path)],
+        deps=deps,
+    )
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Gemini provider identity unresolved" in captured.err
+    assert len(stub.gemini_calls) == 2
+
+
 def test_mixed_provider_dispatch_calls_both_and_seals_both(tmp_path: Path) -> None:
     suite = _verdict_suite(("g-a",))
     stub = StubAdapters(gemini=lambda prompt: "pass", claude=lambda prompt: "pass")
@@ -539,6 +580,22 @@ def test_missing_credential_fails_before_any_run_creation(
         )
     assert not (tmp_path / "runs").exists()  # failed BEFORE run creation (plan §6 D3)
     assert stub.gemini_calls == []  # no model call happened
+
+
+def test_invalid_injected_credential_fails_before_any_run_creation(tmp_path: Path) -> None:
+    stub = StubAdapters(gemini=lambda prompt: "pass")
+    with pytest.raises(RunError, match="Gemini credential preflight failed"):
+        run(
+            suite=_verdict_suite(),
+            config=_gemini_config(),
+            out_dir=tmp_path,
+            roster=["gemini-flash"],
+            samples_per_cell=1,
+            gemini_transport_factory=stub.gemini_factory(),
+            gemini_credential_provider=lambda: "bad\x7f",
+        )
+    assert not (tmp_path / "runs").exists()
+    assert stub.gemini_calls == []
 
 
 def test_budget_abort_then_resume_never_recalls_completed_cells(tmp_path: Path) -> None:

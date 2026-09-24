@@ -386,7 +386,10 @@ class GeminiContextProfile:
         _require_positive_int(
             self.max_output_tokens, label="execution profile.gemini.max_output_tokens"
         )
-        if self.thinking_level not in GEMINI_THINKING_LEVELS:
+        if (
+            not isinstance(self.thinking_level, str)
+            or self.thinking_level not in GEMINI_THINKING_LEVELS
+        ):
             raise ExecutionProfileError(
                 "execution profile.gemini.thinking_level must be one of "
                 f"{sorted(GEMINI_THINKING_LEVELS)!r}, got {self.thinking_level!r}"
