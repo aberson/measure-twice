@@ -14,6 +14,7 @@ import sys
 import threading
 import urllib.error
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -443,23 +444,33 @@ def test_run_gemini_stores_terminal_rows_and_report_exposes_identity_and_setting
     tmp_path: Path,
 ) -> None:
     suite = _verdict_suite()
+    suite_path = tmp_path / "suite.json"
+    suite_path.write_text(json.dumps(asdict(suite)), encoding="utf-8")
     stub = StubAdapters(gemini=lambda prompt: "pass" if _iid(prompt) == "g-a" else "flag")
-    result = run(
-        suite=suite,
-        config=_gemini_config(),
-        out_dir=tmp_path,
-        roster=["gemini-flash"],
-        samples_per_cell=1,
-        scorer=make_deterministic_scorer(suite.scoring),
-        gemini_transport_factory=stub.gemini_factory(),
-        gemini_credential_provider=gemini_test_credential,
+    rc = main(
+        [
+            "run",
+            "--suite",
+            str(suite_path),
+            "--models",
+            "gemini-flash",
+            "--config",
+            str(GEMINI_PROFILE_PATH),
+            "--out",
+            str(tmp_path),
+        ],
+        deps=CliDeps(
+            gemini_transport_factory=stub.gemini_factory(),
+            gemini_credential_provider=gemini_test_credential,
+        ),
     )
-    assert result.cells_completed == 2 and not result.aborted
-    rows = _read_jsonl(tmp_path / "runs" / result.run_id / "rows.jsonl")
+    assert rc == 0 and len(stub.gemini_calls) == 2
+    (run_dir,) = (tmp_path / "runs").iterdir()
+    rows = _read_jsonl(run_dir / "rows.jsonl")
     assert {r["model_id_resolved"] for r in rows} == {"gemini-x"}
     assert [r["score"] for r in rows] == [1.0, 1.0]
 
-    report = build_run_report(result.run_id, tmp_path)
+    report = build_run_report(run_dir.name, tmp_path)
     arm = {m.model: m for m in report.models}["gemini-flash"]
     assert arm.provider == "gemini-api"
     assert arm.requested_model == GEMINI_MODEL
