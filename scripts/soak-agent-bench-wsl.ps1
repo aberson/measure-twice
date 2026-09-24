@@ -18,8 +18,10 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$HASH_PATTERN = 'staged-tree-sha256:\s*([0-9a-f]{64})'
-$SWITCHBOARD_HASH_PATTERN = 'staged-switchboard-sha256:\s*([0-9a-f]{64})'
+$HASH_PATTERN = '(?m)^staged-tree-sha256: *([0-9a-f]{64}) *\r?$'
+$SWITCHBOARD_HASH_PATTERN = '(?m)^staged-switchboard-sha256: *([0-9a-f]{64}) *\r?$'
+$HASH_MARKER_PATTERN = '(?m)^[ \t]*staged-tree-sha256:'
+$SWITCHBOARD_MARKER_PATTERN = '(?m)^[ \t]*staged-switchboard-sha256:'
 $SKIP_PATTERN = '(?m)^selected-skips:\s*(\d+|unknown)\s*$'
 $STEP63_PREREG = "The reviewed containment repair will pass 8/8 independent WSL-ext4 gate invocations with zero selected skips and no live-identity or retained-FD escape; any lower pass rate returns the work to Step 62 and blocks Step 27."
 $PRODUCER_VERSION = "step62-soak-v5"
@@ -27,11 +29,13 @@ $PRODUCER_VERSION = "step62-soak-v5"
 function Get-StagedTreeHash {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
-        [Parameter(Mandatory = $true)][string]$Pattern
+        [Parameter(Mandatory = $true)][string]$Pattern,
+        [Parameter(Mandatory = $true)][string]$MarkerPattern
     )
 
     $first = [regex]::Match($Text, $Pattern)
-    if ($first.Success -and -not $first.NextMatch().Success) {
+    if ($first.Success -and -not $first.NextMatch().Success -and
+        [regex]::Matches($Text, $MarkerPattern).Count -eq 1) {
         return $first.Groups[1].Value
     }
     return ""
@@ -301,8 +305,8 @@ if ($VerifyOnly) {
             (Get-FileSha256 -Path $log)) {
             $failures += "run $index log was edited after the run"
         }
-        $logHash = Get-StagedTreeHash -Text $logText -Pattern $HASH_PATTERN
-        $logSwitchboardHash = Get-StagedTreeHash -Text $logText -Pattern $SWITCHBOARD_HASH_PATTERN
+        $logHash = Get-StagedTreeHash -Text $logText -Pattern $HASH_PATTERN -MarkerPattern $HASH_MARKER_PATTERN
+        $logSwitchboardHash = Get-StagedTreeHash -Text $logText -Pattern $SWITCHBOARD_HASH_PATTERN -MarkerPattern $SWITCHBOARD_MARKER_PATTERN
         if ($logHash -eq "") {
             $failures += "run log must carry exactly one staged-tree hash: $log"
         }
@@ -449,8 +453,8 @@ for ($index = 1; $index -le $Repetitions; $index++) {
     }
 
     $exitCodes += $exitCode
-    $runHash = Get-StagedTreeHash -Text $stdoutText -Pattern $HASH_PATTERN
-    $runSwitchboardHash = Get-StagedTreeHash -Text $stdoutText -Pattern $SWITCHBOARD_HASH_PATTERN
+    $runHash = Get-StagedTreeHash -Text $stdoutText -Pattern $HASH_PATTERN -MarkerPattern $HASH_MARKER_PATTERN
+    $runSwitchboardHash = Get-StagedTreeHash -Text $stdoutText -Pattern $SWITCHBOARD_HASH_PATTERN -MarkerPattern $SWITCHBOARD_MARKER_PATTERN
     $hashes += $runHash
     $switchboardHashes += $runSwitchboardHash
     $skips += $skipCount

@@ -65,11 +65,24 @@ $switchboardHash = $switchboardMatch.Groups[1].Value
 if ($parts.Count -ge 4 -and $parts[3] -ne "") { $switchboardHash = $parts[3] }
 $exitCode = [int]$parts[1]
 $skipCount = if ($parts.Count -ge 3) { $parts[2] } else { "0" }
+$hashMode = if ($parts.Count -ge 5) { $parts[4] } else { "" }
 if ($hashValue -ne "") {
-    Write-Output ("staged-tree-sha256: " + $hashValue)
+    if ($hashMode -eq "wrong-prefix") {
+        Write-Output ("not-staged-tree-sha256: " + $hashValue)
+    }
+    else {
+        Write-Output ("staged-tree-sha256: " + $hashValue)
+    }
+    if ($hashMode -eq "malformed-extra") { Write-Output "staged-tree-sha256: malformed" }
     Write-Output ("staged-root: /tmp/fake-" + $index + " (fake ext4; removed on exit)")
 }
-Write-Output ("staged-switchboard-sha256: " + $switchboardHash)
+if ($hashMode -eq "wrong-prefix") {
+    Write-Output ("not-staged-switchboard-sha256: " + $switchboardHash)
+}
+else {
+    Write-Output ("staged-switchboard-sha256: " + $switchboardHash)
+}
+if ($hashMode -eq "malformed-extra") { Write-Output "staged-switchboard-sha256: malformed" }
 Write-Output ("fake gate index " + $index + " exit " + $exitCode)
 Write-Output ("selected-skips: " + $skipCount)
 if ($exitCode -ne 0) {
@@ -400,6 +413,14 @@ def test_zero_gate_exit_without_staged_hash_is_not_a_pass(tmp_path: Path) -> Non
     assert "a passing run produced no staged-tree hash" in completed.stderr
     assert "verdict: FAIL" in (out_dir / "verdict.txt").read_text(encoding="utf-8")
     assert len(list(out_dir.glob("run-*.log"))) == 8
+
+
+@pytest.mark.parametrize("hash_mode", ["wrong-prefix", "malformed-extra"])
+def test_zero_exit_rejects_untrusted_hash_lines(tmp_path: Path, hash_mode: str) -> None:
+    completed, out_dir = _run_soak(tmp_path, plan=[f"{_HASH_A}|0|0||{hash_mode}"], repetitions=1)
+    assert completed.returncode != 0
+    assert "containment_gate_rate=0/1" in completed.stdout
+    assert "verdict: FAIL" in (out_dir / "verdict.txt").read_text(encoding="utf-8")
 
 
 def test_production_requires_eight_repetitions(tmp_path: Path) -> None:
