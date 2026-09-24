@@ -537,9 +537,16 @@ def default_judge_caller(
                     if candidate.cli_version is None
                     else ClaudeRuntimeEvidence(candidate.executable, candidate.cli_version)
                 )
+                # Compare the SHARED context-hash owner on both sides (plan §6): the receipt's
+                # context_profile_sha256 is composite when a Gemini binding was in the roster, so
+                # comparing the Claude-only ``candidate.context.sha256`` against it would falsely
+                # abort a mixed rubric run. ``config.execution_profile.context_profile_sha256`` is
+                # the same composite-aware owner and equals the Claude context hash for Claude-only
+                # profiles, so this preserves the drift check without the false positive.
                 if (
                     evidence != execution_receipt.claude_cli
-                    or candidate.context.sha256 != execution_receipt.context_profile_sha256
+                    or config.execution_profile.context_profile_sha256
+                    != execution_receipt.context_profile_sha256
                 ):
                     raise ScoringError(
                         "Claude judge runtime differs from the stored sealed contract; "

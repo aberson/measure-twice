@@ -109,6 +109,12 @@ class ExecutionEvidence:
     claude_executable: str | None
     claude_version: str | None
     bindings: tuple[tuple[str, str, str], ...]
+    # Gemini request settings (plan §6 D2), present only when the run selected a Gemini binding —
+    # all None for a Gemini-free receipt. Recorded execution metadata, NOT a qualification signal.
+    gemini_request_contract: str | None = None
+    gemini_max_output_tokens: int | None = None
+    gemini_thinking_level: str | None = None
+    gemini_timeout_s: float | None = None
 
     def binding_for(self, alias: str) -> tuple[str, str] | None:
         """``(provider, requested_model)`` for ``alias``, or ``None`` if the receipt omits it."""
@@ -282,6 +288,12 @@ def build_execution_evidence(manifest: Mapping[str, object]) -> ExecutionEvidenc
         claude_executable=None if receipt.claude_cli is None else receipt.claude_cli.executable,
         claude_version=None if receipt.claude_cli is None else receipt.claude_cli.version,
         bindings=tuple((b.alias, b.provider, b.requested_model) for b in receipt.bindings),
+        gemini_request_contract=None if receipt.gemini is None else receipt.gemini.request_contract,
+        gemini_max_output_tokens=(
+            None if receipt.gemini is None else receipt.gemini.max_output_tokens
+        ),
+        gemini_thinking_level=None if receipt.gemini is None else receipt.gemini.thinking_level,
+        gemini_timeout_s=None if receipt.gemini is None else receipt.gemini.timeout_s,
     )
 
 
@@ -504,6 +516,17 @@ def _execution_lines(report: RunReport) -> list[str]:
             f"- **Context-profile hash:** `{evidence.context_profile_sha256}`",
             f"- **Receipt hash:** `{evidence.receipt_sha256}`",
             f"- **Claude CLI:** {cli}",
+        ]
+        # Only emitted for a run that selected a Gemini binding, so a Gemini-free report renders
+        # byte-for-byte as before (plan §6 D2 request-setting reporting; additive, score untouched).
+        if evidence.gemini_request_contract is not None:
+            lines.append(
+                f"- **Gemini request:** `{evidence.gemini_request_contract}` "
+                f"(maxOutputTokens {evidence.gemini_max_output_tokens}, "
+                f"thinking {evidence.gemini_thinking_level}, "
+                f"timeout {evidence.gemini_timeout_s}s)"
+            )
+        lines += [
             "- **Routing:** preliminary seal and identity evidence only; "
             "Step 59 must assess validity.",
             "",
@@ -636,6 +659,17 @@ def run_report_jsonl(report: RunReport) -> str:
                 "receipt_sha256": None if evidence is None else evidence.receipt_sha256,
                 "claude_executable": None if evidence is None else evidence.claude_executable,
                 "claude_version": None if evidence is None else evidence.claude_version,
+                # Gemini request settings, null unless a Gemini binding was selected (plan §6 D2).
+                "gemini_request_contract": (
+                    None if evidence is None else evidence.gemini_request_contract
+                ),
+                "gemini_max_output_tokens": (
+                    None if evidence is None else evidence.gemini_max_output_tokens
+                ),
+                "gemini_thinking_level": (
+                    None if evidence is None else evidence.gemini_thinking_level
+                ),
+                "gemini_timeout_s": None if evidence is None else evidence.gemini_timeout_s,
             },
             ensure_ascii=True,
             sort_keys=True,

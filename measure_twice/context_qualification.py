@@ -197,8 +197,11 @@ def evaluate(
         receipt.provider_profile_sha256 == profile.provider_profile_sha256,
         "provider profile hash mismatch",
     )
+    # Compare against the shared context-hash owner (plan §6): equals the Claude context hash for
+    # this Claude-only canary profile, and stays correct if a profile ever carries a Gemini context.
     _require(
-        receipt.context_profile_sha256 == profile.claude.sha256, "context profile hash mismatch"
+        receipt.context_profile_sha256 == profile.context_profile_sha256,
+        "context profile hash mismatch",
     )
 
     sentinels = index.get("sentinels")

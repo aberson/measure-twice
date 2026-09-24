@@ -27,12 +27,16 @@ from html import unescape as html_unescape
 from pathlib import Path
 
 import pytest
-from conftest import StubAdapters, _iid  # shared offline stub scaffolding (tests/conftest.py)
+from conftest import (
+    StubAdapters,
+    _iid,
+    gemini_test_credential,
+)  # shared offline stub scaffolding (tests/conftest.py)
 
 from measure_twice.adapters.base import UNRESOLVED_MODEL_ID
 from measure_twice.adapters.claude_cli import SubprocessResult
 from measure_twice.cli import main
-from measure_twice.config import RunConfig
+from measure_twice.config import RunConfig, load_config
 from measure_twice.report import (
     LEGACY_UNSEALED,
     NOT_ROUTING_ELIGIBLE,
@@ -560,7 +564,7 @@ def test_browser_renders_receipt_and_identity_for_all_seal_states(tmp_path: Path
     });
     document.body.appendChild(probe);
     </script>"""
-    for state in ("sealed", "unresolved", "legacy"):
+    for state in ("sealed", "unresolved", "legacy", "gemini"):
         case_dir = tmp_path / state
         case_dir.mkdir()
         answer = (
@@ -568,7 +572,22 @@ def test_browser_renders_receipt_and_identity_for_all_seal_states(tmp_path: Path
             if state == "unresolved"
             else (lambda prompt: _ANSWERS[_iid(prompt)])
         )
-        result = _sweep(_taxonomy_suite(), out_dir=case_dir, answer=answer)
+        if state == "gemini":
+            suite = _taxonomy_suite()
+            stub = StubAdapters(gemini=lambda prompt: _ANSWERS[_iid(prompt)])
+            result = run(
+                suite=suite,
+                config=load_config(
+                    str(Path(__file__).resolve().parents[1] / "profiles/model-sweep-gemini-v1.json")
+                ),
+                out_dir=case_dir,
+                roster=["gemini-flash"],
+                scorer=make_deterministic_scorer(suite.scoring),
+                gemini_transport_factory=stub.gemini_factory(),
+                gemini_credential_provider=gemini_test_credential,
+            )
+        else:
+            result = _sweep(_taxonomy_suite(), out_dir=case_dir, answer=answer)
         if state == "legacy":
             _strip_execution_receipt(case_dir, result.run_id)
         report = build_transparency_report(result.run_id, case_dir)
@@ -605,6 +624,10 @@ def test_browser_renders_receipt_and_identity_for_all_seal_states(tmp_path: Path
             if state == "unresolved":
                 assert UNRESOLVED_MODEL_ID in visible["identity"]
                 assert NOT_ROUTING_ELIGIBLE in visible["identity"]
+            elif state == "gemini":
+                assert "Gemini request" in visible["receipt"]
+                assert "generate-content-text-v1" in visible["receipt"]
+                assert "gemini-x" in visible["identity"]
             else:
                 assert "claude-x" in visible["identity"]
                 assert "PRELIMINARY_SEAL_IDENTITY_OK" in visible["identity"]

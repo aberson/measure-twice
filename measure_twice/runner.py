@@ -66,13 +66,23 @@ from measure_twice.adapters.claude_cli import (
     claude_call_batch,
     doctor_claude_runtime,
 )
+from measure_twice.adapters.gemini import (
+    GeminiCredentialError,
+    GeminiCredentialProvider,
+    GeminiTransportFactory,
+    gemini_generate,
+    resolve_gemini_credential,
+    validate_gemini_credential,
+)
 from measure_twice.adapters.local import TransportFactory, local_chat
 from measure_twice.config import ConfigError, RunConfig, _validate_name_list
 from measure_twice.model_sweep_execution import (
     PROVIDER_CLAUDE,
+    PROVIDER_GEMINI,
     PROVIDER_LOCAL,
     ExecutionProfileError,
     ExecutionReceipt,
+    GeminiContextProfile,
     ModelBinding,
 )
 from measure_twice.suite import Item, Suite, SuiteError
@@ -573,6 +583,43 @@ def _sweep_claude(
     return written, False
 
 
+def _sweep_gemini(
+    fh: IO[str],
+    run_id: str,
+    pending: Sequence[_Cell],
+    *,
+    context: GeminiContextProfile,
+    api_key: str,
+    budget: CallBudget,
+    scorer: Scorer,
+    transport_factory: GeminiTransportFactory | None,
+) -> tuple[int, bool]:
+    """Call Gemini cells SEQUENTIALLY (one non-streaming REST request per cell), no implicit retry.
+
+    Mirrors :func:`_sweep_local`: the runner consumes the shared budget here (``gemini_generate``
+    does not touch it), so a spent budget aborts cleanly BEFORE the next call and every appended row
+    persists for ``--resume``. The resolved ``api_key`` is passed straight through to the adapter's
+    header — it is never stored on a row, the receipt, or the manifest. Returns
+    ``(rows_written, aborted)``.
+    """
+    written = 0
+    for cell in pending:
+        try:
+            budget.consume()
+        except BudgetExhaustedError:
+            return written, True
+        result = gemini_generate(
+            cell.item.prompt,
+            requested_model=cell.binding.requested_model,
+            context=context,
+            api_key=api_key,
+            transport_factory=transport_factory,
+        )
+        _append_row(fh, _build_row(run_id, cell, result, scorer))
+        written += 1
+    return written, False
+
+
 def _resolve_run_dir(out_path: Path, run_id: str) -> Path:
     """Validate an INCOMING (untrusted) run_id and resolve its dir with a containment check.
 
@@ -733,6 +780,34 @@ def _has_pending_claude(
     )
 
 
+def _has_pending_gemini(
+    bindings: Sequence[ModelBinding],
+    suite: Suite,
+    samples: int,
+    done_keys: set[tuple[str, str, int]],
+) -> bool:
+    return any(
+        binding.provider == PROVIDER_GEMINI
+        and bool(_pending_cells(binding, suite, samples, done_keys))
+        for binding in bindings
+    )
+
+
+def _preflight_gemini_credential(provider: GeminiCredentialProvider | None) -> str:
+    """Resolve the Gemini API credential before any run-store mutation, translating to RunError.
+
+    Called only when a pending Gemini call exists (fresh Gemini binding, or a resume with pending
+    Gemini cells). A missing/blank credential must fail BEFORE run creation, torn-tail repair, or
+    any row append (plan §6 D3). The default reads the environment; an injected offline provider
+    supplies a test credential without touching real environment variables.
+    """
+    resolver = provider if provider is not None else resolve_gemini_credential
+    try:
+        return validate_gemini_credential(resolver())
+    except GeminiCredentialError as exc:
+        raise RunError(f"Gemini credential preflight failed: {exc}") from exc
+
+
 def _validate_legacy_resume(
     bindings: Sequence[ModelBinding],
     suite: Suite,
@@ -784,6 +859,8 @@ def run(
     scorer: Scorer = collect_only_scorer,
     local_transport_factory: TransportFactory | None = None,
     claude_runner_factory: RunnerFactory | None = None,
+    gemini_transport_factory: GeminiTransportFactory | None = None,
+    gemini_credential_provider: GeminiCredentialProvider | None = None,
 ) -> RunResult:
     """Sweep ``suite x roster x samples`` and write the run store; return a :class:`RunResult`.
 
@@ -802,6 +879,7 @@ def run(
 
     if resume is not None:
         claude_runtime: ClaudeRuntime | None = None
+        gemini_key: str | None = None
         run_id = resume
         # Validate the untrusted incoming run_id + containment BEFORE any path join (BLOCK 4).
         run_dir = _resolve_run_dir(out_path, run_id)
@@ -847,6 +925,10 @@ def run(
                         "cannot resume: current Claude executable/version or execution receipt "
                         "differs from the stored sealed contract"
                     )
+            # Resolve the Gemini credential only when Gemini cells remain (plan §6 D3): a resume
+            # that finishes only local/Claude cells must not require a Gemini key.
+            if _has_pending_gemini(bindings, suite, eff_samples, done_keys):
+                gemini_key = _preflight_gemini_credential(gemini_credential_provider)
         # Contract validation/rejection intentionally precedes this first resume mutation.
         if torn:
             _rewrite_rows(run_dir, existing_rows)
@@ -869,6 +951,11 @@ def run(
             _execution_bindings(config, suite, eff_roster, eff_judges),
             runner_factory=claude_runner_factory,
         )
+        # A fresh run has every cell pending, so a Gemini binding in the roster means a real Gemini
+        # call is scheduled: resolve (and fail loud on) its credential BEFORE run creation (§6 D3).
+        gemini_key = None
+        if any(binding.provider == PROVIDER_GEMINI for binding in bindings):
+            gemini_key = _preflight_gemini_credential(gemini_credential_provider)
         # All validation, provider binding, executable resolution, and CLI doctoring is complete
         # before the run id/directory exists.
         run_id = _mint_run_id()
@@ -895,6 +982,9 @@ def run(
     budget = CallBudget(eff_max_calls)
     done_keys = {row.cell_key for row in existing_rows}
     cells_total = len(eff_roster) * len(suite.items) * eff_samples
+    # The Gemini request contract is bound to the profile and required whenever a Gemini binding
+    # exists (profile invariant); pull it once for dispatch.
+    gemini_context = config.execution_profile.gemini
 
     cells_written = 0
     aborted = False
@@ -927,6 +1017,23 @@ def run(
                         budget=budget,
                         scorer=scorer,
                         transport_factory=local_transport_factory,
+                    )
+                elif binding.provider == PROVIDER_GEMINI:
+                    if gemini_key is None or gemini_context is None:
+                        # Unreachable: the preflight resolves a key whenever a Gemini cell is
+                        # pending, and the profile invariant guarantees the context. Fail closed.
+                        raise RunError(
+                            "Gemini cells reached scheduling without a resolved credential/context"
+                        )
+                    written, aborted = _sweep_gemini(
+                        fh,
+                        run_id,
+                        pending,
+                        context=gemini_context,
+                        api_key=gemini_key,
+                        budget=budget,
+                        scorer=scorer,
+                        transport_factory=gemini_transport_factory,
                     )
                 else:  # strict profile validation makes this unreachable; keep dispatch closed.
                     raise RunError(f"unsupported provider at dispatch: {binding.provider!r}")

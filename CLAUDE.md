@@ -25,6 +25,7 @@ uv run ruff check .
 uv run mypy --strict measure_twice
 uv run mt validate suites/smoke.json
 uv run mt smoke --claude
+uv run mt smoke --gemini --config profiles/model-sweep-gemini-v1.json   # Gemini API (needs GOOGLE_API_KEY)
 uv run mt run --suite suites/tier-judging-v0.json --models general-35b,haiku,sonnet
 uv run mt report <run_id>
 uv run mt report <run_id> --html   # item-level page: every item, raw response, scorer reason
