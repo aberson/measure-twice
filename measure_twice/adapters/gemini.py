@@ -14,7 +14,7 @@ the key is never re-sent to a redirect target.
 
 Outcome classification (plan §6 D4), all decided from a ``2xx`` JSON body while retaining the
 provider ``modelVersion`` as soon as it is observed:
-  * prompt blocked (``promptFeedback.blockReason``) with no valid candidate -> no-response state
+  * prompt blocked (``promptFeedback.blockReason``)                      -> no-response state
   * candidate ``finishReason`` a documented safety/recitation block          -> no-response state
   * empty / whitespace / thought-only answer text                           -> no-response state
   * ``finishReason == "MAX_TOKENS"`` with a partial answer                   -> ``truncated``
@@ -277,7 +277,7 @@ def _extract_answer(content: object) -> tuple[bool, str]:
         if not isinstance(part, dict):
             return (False, "")
         thought = part.get("thought")
-        if thought is not None and not isinstance(thought, bool):
+        if "thought" in part and not isinstance(thought, bool):
             return (False, "")
         text = part.get("text")
         if not isinstance(text, str):

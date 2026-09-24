@@ -219,6 +219,11 @@ def test_unsupported_thought_part_is_bad_envelope() -> None:
     assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
 
 
+def test_null_thought_flag_is_bad_envelope() -> None:
+    result = _call(_resp([_cand("STOP", [{"text": "pass", "thought": None}])]))
+    assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
+
+
 def test_unexpected_finish_reason_on_text_is_bad_envelope() -> None:
     result = _call(_resp([_cand("WEIRD_REASON", [{"text": "hello"}])]))
     assert result.is_error and result.reason_class == RC_BAD_ENVELOPE
