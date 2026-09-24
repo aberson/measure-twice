@@ -190,6 +190,19 @@ def test_qualification_rejects_bad_fake_live_evidence(tmp_path: Path, mode: str)
     assert not list(tmp_path.glob(".mt-context-canary-*"))
 
 
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell 5.1 wrapper runs on Windows")
+def test_qualification_refuses_to_overwrite_failed_attempt(tmp_path: Path) -> None:
+    fake = _fake_command(tmp_path)
+    first = _wrapper(tmp_path, fake, mode="incomplete")
+    assert first.returncode != 0
+    index_path = tmp_path / "out" / "index.json"
+    before = index_path.read_bytes()
+    second = _wrapper(tmp_path, fake)
+    assert second.returncode != 0
+    assert "already has qualification evidence" in second.stderr
+    assert index_path.read_bytes() == before
+
+
 def test_verifier_rejects_missing_index(tmp_path: Path) -> None:
     with pytest.raises(QualificationError, match="index missing"):
         evaluate(tmp_path / "index.json", tmp_path, verify_only=True)

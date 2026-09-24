@@ -112,7 +112,15 @@ if (-not (Test-Path -LiteralPath $Suite)) { Fail-Closed "suite not found: $Suite
 $Profile = [System.IO.Path]::GetFullPath($Profile)
 $Suite = [System.IO.Path]::GetFullPath($Suite)
 
-New-Item -ItemType Directory -Force -Path $outFull | Out-Null
+# One qualification attempt owns one output directory. A second run must use a fresh -Out path;
+# otherwise a failed 3/3 result could be replaced with a favorable rerun.
+if (Test-Path -LiteralPath $outFull) {
+    if (@(Get-ChildItem -LiteralPath $outFull -Force).Count -gt 0) {
+        Fail-Closed "output directory already has qualification evidence; choose a fresh -Out"
+    }
+} else {
+    New-Item -ItemType Directory -Path $outFull | Out-Null
+}
 
 $repoRoot = (Get-Location).Path
 $stamp = [guid]::NewGuid().ToString("N")
