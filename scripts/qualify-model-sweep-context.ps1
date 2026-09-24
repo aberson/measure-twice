@@ -5,11 +5,13 @@
     contract (first-measurement-validity plan, Steps 57/58).
 
 .DESCRIPTION
-    Plants a unique repository, environment, customization, and session sentinel; writes a concrete
+    Plants a unique repository, environment, customization, and simulated prior-session sentinel; writes a concrete
     qualification INDEX before AND after the model calls; embeds the EXACT Step 58 preregistration
     sentence before call 1; sweeps the three-alias hostile-context canary suite through the real
     `mt run` production entry point; then fails closed unless every arm returned without reproducing
-    any planted sentinel and every arm recorded a concrete provider-returned identity.
+    any planted sentinel and every arm recorded a concrete provider-returned identity. The session
+    marker is a simulated prior-session line in CLAUDE.md plus a process variable; this wrapper does
+    not seed a real Claude conversation.
 
     `-VerifyOnly` re-opens the stored index and run store and fails closed on an absent, stale, or
     edited receipt, a reproduced sentinel, or an unresolved identity, WITHOUT making any call.
@@ -50,6 +52,7 @@ function Write-Line([string]$Text) {
 }
 
 function Fail-Closed([string]$Message) {
+    $script:FailureReason = $Message
     [Console]::Error.WriteLine("qualify-model-sweep-context: $Message")
     exit 1
 }
@@ -72,7 +75,14 @@ function Invoke-EvidenceCheck([string]$IndexPath, [string]$OutPath, [bool]$Store
     $args = @("run", "--project", $projectRoot, "python", "-m", "measure_twice.context_qualification", "--index", $IndexPath, "--out", $OutPath)
     if ($Stored) { $args += "--verify-only" }
     $output = & uv @args
-    if ($LASTEXITCODE -ne 0) { Fail-Closed "stored run evidence did not verify" }
+    if ($LASTEXITCODE -ne 0) {
+        $detail = "stored run evidence did not verify"
+        try {
+            $failure = $output | ConvertFrom-Json
+            if ($failure.error) { $detail = "stored run evidence: $($failure.error)" }
+        } catch {}
+        Fail-Closed $detail
+    }
     if (@($output).Count -ne 1) { Fail-Closed "evidence verifier returned unexpected output" }
     return ($output | ConvertFrom-Json)
 }
@@ -133,6 +143,11 @@ $sentinels = [ordered]@{
 }
 $repoFile = Join-Path $canaryCwd ".mt-context-canary-repository-$stamp.txt"
 $custFile = Join-Path $canaryCwd "CLAUDE.md"
+$plantingDir = Join-Path $outFull "planting"
+$snapshotRepo = Join-Path $plantingDir "repository.txt"
+$snapshotCust = Join-Path $plantingDir "CLAUDE.md"
+$snapshotEnv = Join-Path $plantingDir "environment.json"
+$script:FailureReason = "qualification ended before PASS"
 
 $plantedEnvSaved = [Environment]::GetEnvironmentVariable($EnvSentinelName, "Process")
 $plantedSessionSaved = [Environment]::GetEnvironmentVariable($SessionSentinelName, "Process")
@@ -146,6 +161,13 @@ try {
     [System.IO.File]::WriteAllText($custFile, "Project instruction: $($sentinels.customization)`nPrior session memory: $($sentinels.session)`n")
     Set-Item -Path "Env:$EnvSentinelName" -Value $sentinels.environment
     Set-Item -Path "Env:$SessionSentinelName" -Value $sentinels.session
+    New-Item -ItemType Directory -Path $plantingDir | Out-Null
+    Copy-Item -LiteralPath $repoFile -Destination $snapshotRepo
+    Copy-Item -LiteralPath $custFile -Destination $snapshotCust
+    Write-JsonFile $snapshotEnv ([ordered]@{
+        environment = $sentinels.environment
+        session = $sentinels.session
+    })
 
     # INDEX BEFORE the calls: the exact preregistration, the sentinels, and IN_PROGRESS status.
     $beforeIndex = [ordered]@{
@@ -159,6 +181,11 @@ try {
         source_hashes    = [ordered]@{
             source_suite_sha256   = (Get-FileHash -LiteralPath $Suite -Algorithm SHA256).Hash.ToLowerInvariant()
             source_profile_sha256 = (Get-FileHash -LiteralPath $Profile -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        planting_hashes  = [ordered]@{
+            repository_sha256 = (Get-FileHash -LiteralPath $snapshotRepo -Algorithm SHA256).Hash.ToLowerInvariant()
+            customization_sha256 = (Get-FileHash -LiteralPath $snapshotCust -Algorithm SHA256).Hash.ToLowerInvariant()
+            environment_sha256 = (Get-FileHash -LiteralPath $snapshotEnv -Algorithm SHA256).Hash.ToLowerInvariant()
         }
         sentinels        = $sentinels
         started_utc      = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -186,16 +213,21 @@ try {
     $runOutput = & $MtCommand[0] @runArgs
     $runExit = $LASTEXITCODE
     foreach ($line in $runOutput) { Write-Line "mt: $line" }
-    if ($runExit -ne 0) { Fail-Closed "mt run exited with code $runExit" }
-
     $runId = $null
     foreach ($line in $runOutput) {
         $m = [regex]::Match([string]$line, "(run_\S+?):")
         if ($m.Success) { $runId = $m.Groups[1].Value; break }
     }
+    if ($null -ne $runId) {
+        $beforeIndex.run_id = $runId
+        Write-JsonFile $indexPath $beforeIndex
+    }
+    if ($runExit -ne 0) { Fail-Closed "mt run exited with code $runExit" }
     if ($null -eq $runId) { Fail-Closed "could not parse a run id from mt run output" }
-    $beforeIndex.run_id = $runId
-    Write-JsonFile $indexPath $beforeIndex
+    if ((Get-FileHash -LiteralPath $repoFile -Algorithm SHA256).Hash.ToLowerInvariant() -ne $beforeIndex.planting_hashes.repository_sha256 -or
+        (Get-FileHash -LiteralPath $custFile -Algorithm SHA256).Hash.ToLowerInvariant() -ne $beforeIndex.planting_hashes.customization_sha256) {
+        Fail-Closed "planted cwd evidence changed during the model sweep"
+    }
     $eval = Invoke-EvidenceCheck $indexPath $outFull $false
     $status = "PASS"
 
@@ -218,6 +250,7 @@ try {
         receipt          = $eval.receipt
         evidence_hashes  = $eval.evidence_hashes
         source_hashes    = $eval.source_hashes
+        planting_hashes  = $eval.planting_hashes
         reason           = ""
         started_utc      = $beforeIndex.started_utc
         finished_utc     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -227,6 +260,11 @@ try {
     Write-Line "qualification=$status passed=$($eval.passed) total=$($eval.total)"
     exit 0
 }
+catch {
+    $script:FailureReason = $_.Exception.Message
+    [Console]::Error.WriteLine("qualify-model-sweep-context: $script:FailureReason")
+    exit 1
+}
 finally {
     Set-Location -LiteralPath $repoRoot
     if (Test-Path -LiteralPath $indexPath) {
@@ -234,6 +272,7 @@ finally {
         if ($lastIndex.status -eq "IN_PROGRESS") {
             $lastIndex.status = "FAIL"
             $lastIndex | Add-Member -NotePropertyName qualification -NotePropertyValue "FAIL" -Force
+            $lastIndex | Add-Member -NotePropertyName reason -NotePropertyValue $script:FailureReason -Force
             $lastIndex | Add-Member -NotePropertyName finished_utc -NotePropertyValue ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")) -Force
             Write-JsonFile $indexPath $lastIndex
         }

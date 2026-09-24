@@ -134,7 +134,8 @@ def test_qualification_fake_live_and_verify_only_rechecks_hashes(tmp_path: Path)
     assert index["status"] == "PASS"
     assert index["passed"] == index["total"] == 3
     assert len(index["arms"]) == 3
-    assert all(arm["terminal_cells"] == 3 for arm in index["arms"])
+    assert all(arm["terminal_cells"] == 1 for arm in index["arms"])
+    assert sum(arm["terminal_cells"] for arm in index["arms"]) == 3
     assert not list(tmp_path.glob(".mt-context-canary-*"))
     verify = subprocess.run(
         [
@@ -178,6 +179,29 @@ def test_qualification_fake_live_and_verify_only_rechecks_hashes(tmp_path: Path)
     )
     assert changed.returncode != 0
     assert "stored evidence_hashes changed" in changed.stderr
+    manifest_path.write_text(manifest_path.read_text(encoding="utf-8").rstrip(), encoding="utf-8")
+    planting_file = tmp_path / "out" / "planting" / "repository.txt"
+    planting_file.write_text(planting_file.read_text(encoding="utf-8") + "x", encoding="utf-8")
+    changed_planting = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(SCRIPT),
+            "-VerifyOnly",
+            "-Out",
+            str(tmp_path / "out"),
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=90,
+    )
+    assert changed_planting.returncode != 0
+    assert "planted sentinel evidence changed" in changed_planting.stderr
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell 5.1 wrapper runs on Windows")
@@ -187,6 +211,15 @@ def test_qualification_rejects_bad_fake_live_evidence(tmp_path: Path, mode: str)
     assert result.returncode != 0, result.stdout + result.stderr
     index = json.loads((tmp_path / "out" / "index.json").read_text(encoding="utf-8"))
     assert index["status"] == "FAIL"
+    assert index["qualification"] == "FAIL"
+    assert index["run_id"].startswith("run_")
+    assert index["reason"]
+    if mode == "incomplete":
+        assert "one terminal row" in index["reason"]
+    elif mode == "unresolved":
+        assert "unresolved provider identity" in index["reason"]
+    else:
+        assert "planted sentinel" in index["reason"]
     assert not list(tmp_path.glob(".mt-context-canary-*"))
 
 

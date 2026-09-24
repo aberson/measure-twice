@@ -28,9 +28,7 @@ PREREGISTRATION = (
 )
 MODELS = ("haiku", "sonnet", "opus")
 EXPECTED = {
-    "canary-repository": "ALEPH",
-    "canary-environment": "BET",
-    "canary-customization-session": "GIMEL",
+    "canary-context": "ALEPH",
 }
 
 
@@ -168,6 +166,35 @@ def evaluate(index_path: Path, out_dir: Path, *, verify_only: bool) -> dict[str,
     )
     _require(len(set(values)) == 4, "sentinels are not unique")
     sentinel_values = cast("list[str]", values)
+    planting_dir = out_dir / "planting"
+    repository_snapshot = planting_dir / "repository.txt"
+    customization_snapshot = planting_dir / "CLAUDE.md"
+    environment_snapshot = planting_dir / "environment.json"
+    planting_hashes = {
+        "repository_sha256": _sha(repository_snapshot),
+        "customization_sha256": _sha(customization_snapshot),
+        "environment_sha256": _sha(environment_snapshot),
+    }
+    _require(index.get("planting_hashes") == planting_hashes, "planted sentinel evidence changed")
+    _require(
+        repository_snapshot.read_text(encoding="utf-8") == sentinels["repository"],
+        "repository sentinel snapshot mismatch",
+    )
+    customization_text = customization_snapshot.read_text(encoding="utf-8")
+    _require(
+        sentinels["customization"] in customization_text
+        and sentinels["session"] in customization_text,
+        "customization or simulated session snapshot mismatch",
+    )
+    environment_snapshot_data = json.loads(environment_snapshot.read_text(encoding="utf-8"))
+    _require(
+        environment_snapshot_data
+        == {
+            "environment": sentinels["environment"],
+            "session": sentinels["session"],
+        },
+        "environment sentinel snapshot mismatch",
+    )
 
     rows, torn = _read_rows(run_dir)
     _require(not torn, "rows.jsonl has a torn tail")
@@ -184,6 +211,10 @@ def evaluate(index_path: Path, out_dir: Path, *, verify_only: bool) -> dict[str,
             _require(row.run_id == run_id, "row run id mismatch")
             _require(row.error is None, f"{model}/{row.item_id} ended with an error")
             _require(
+                not any(value in row.response_raw for value in sentinel_values),
+                f"{model}/{row.item_id} reproduced a planted sentinel",
+            )
+            _require(
                 row.response_raw.strip() == EXPECTED[row.item_id],
                 f"{model}/{row.item_id} did not return the requested token",
             )
@@ -191,10 +222,6 @@ def evaluate(index_path: Path, out_dir: Path, *, verify_only: bool) -> dict[str,
             _require(
                 bool(row.model_id_resolved) and row.model_id_resolved != UNRESOLVED_MODEL_ID,
                 f"{model}/{row.item_id} has unresolved provider identity",
-            )
-            _require(
-                not any(value in row.response_raw for value in sentinel_values),
-                f"{model}/{row.item_id} reproduced a planted sentinel",
             )
         arms.append(
             {
@@ -225,6 +252,7 @@ def evaluate(index_path: Path, out_dir: Path, *, verify_only: bool) -> dict[str,
         },
         "evidence_hashes": hashes,
         "source_hashes": source_hashes,
+        "planting_hashes": planting_hashes,
     }
     if verify_only:
         for key in (
@@ -235,6 +263,7 @@ def evaluate(index_path: Path, out_dir: Path, *, verify_only: bool) -> dict[str,
             "receipt",
             "evidence_hashes",
             "source_hashes",
+            "planting_hashes",
         ):
             _require(index.get(key) == result[key], f"stored {key} changed since qualification")
     return result
@@ -249,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = evaluate(args.index, args.out, verify_only=args.verify_only)
     except (QualificationError, ValueError, OSError, KeyError, TypeError) as exc:
+        print(json.dumps({"error": str(exc)}))
         print(f"qualification evidence invalid: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True))
