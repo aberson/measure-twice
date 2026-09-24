@@ -161,6 +161,7 @@ if [ "$pytest_status" -ne 0 ]; then
     exit "$pytest_status"
 fi
 skipped=$(junit_skip_count "$junit_report")
+printf 'selected-skips: %s\n' "$skipped"
 if [ "$skipped" -ne 0 ]; then
     printf 'Linux isolation gate selected %s skipped test(s); skips are forbidden\n' "$skipped" >&2
     exit 3

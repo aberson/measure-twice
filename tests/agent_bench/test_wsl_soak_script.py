@@ -11,6 +11,7 @@ The result-driving .ps1 logic is anchored red-on-garbage here (the FAIL cases), 
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -50,11 +51,13 @@ $line = $plan[$index]
 $parts = $line.Split('|')
 $hashValue = $parts[0]
 $exitCode = [int]$parts[1]
+$skipCount = if ($parts.Count -ge 3) { [int]$parts[2] } else { 0 }
 if ($hashValue -ne "") {
     Write-Output ("staged-tree-sha256: " + $hashValue)
     Write-Output ("staged-root: /tmp/fake-" + $index + " (fake ext4; removed on exit)")
 }
 Write-Output ("fake gate index " + $index + " exit " + $exitCode)
+Write-Output ("selected-skips: " + $skipCount)
 if ($exitCode -ne 0) {
     [Console]::Error.WriteLine("fake gate simulated failure at index " + $index)
 }
@@ -243,6 +246,120 @@ def test_verify_only_fails_closed_on_absent_evidence(tmp_path: Path) -> None:
     )
     assert verify.returncode != 0
     assert "absent" in verify.stderr.lower()
+
+
+def test_default_verify_rejects_fixture_receipt_without_optional_arguments(tmp_path: Path) -> None:
+    plan = [f"{_HASH_A}|0" for _ in range(8)]
+    completed, out_dir = _run_soak(tmp_path, plan=plan, repetitions=8)
+    assert completed.returncode == 0, completed.stderr
+
+    verify = subprocess.run(  # noqa: S603 - resolved PowerShell running a repo script
+        [
+            _POWERSHELL,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(_SOAK_SCRIPT),
+            "-Out",
+            str(out_dir),
+            "-VerifyOnly",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert verify.returncode != 0
+    assert "stale" in verify.stderr.lower()
+
+
+def test_verify_rejects_changed_gate_and_edited_header(tmp_path: Path) -> None:
+    plan = [f"{_HASH_A}|0"]
+    completed, out_dir = _run_soak(tmp_path, plan=plan, repetitions=1)
+    assert completed.returncode == 0, completed.stderr
+
+    gate = tmp_path / "fake-gate.ps1"
+    gate.write_text(gate.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+    # _run_soak rewrites the fake gate; invoke the verifier directly to retain the drift.
+    args = [
+        _POWERSHELL,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(_SOAK_SCRIPT),
+        "-Repetitions",
+        "1",
+        "-Out",
+        str(out_dir),
+        "-Preregister",
+        _PREREG,
+        "-GateScript",
+        str(gate),
+        "-VerifyOnly",
+    ]
+    stale = subprocess.run(args, capture_output=True, text=True, timeout=30)  # noqa: S603
+    assert stale.returncode != 0
+    assert "gate-script-sha256" in stale.stderr
+
+    header_path = out_dir / "evidence-header.txt"
+    header_path.write_text(
+        header_path.read_text(encoding="utf-8") + "edited: yes\n", encoding="utf-8"
+    )
+    edited = subprocess.run(args, capture_output=True, text=True, timeout=30)  # noqa: S603
+    assert edited.returncode != 0
+    assert "header was edited" in edited.stderr
+
+
+def test_zero_gate_exit_with_selected_skip_is_not_a_pass(tmp_path: Path) -> None:
+    completed, out_dir = _run_soak(tmp_path, plan=[f"{_HASH_A}|0|1"], repetitions=1)
+    assert completed.returncode != 0
+    assert "containment_gate_rate=0/1" in completed.stdout
+    assert "run-01-selected-skips: 1" in (out_dir / "verdict.txt").read_text(encoding="utf-8")
+    assert (out_dir / "run-01.log").exists()
+
+
+def test_git_manifest_ignores_growing_qualification_evidence(tmp_path: Path) -> None:
+    """Use the launcher's real git manifest command and staged-tree hash algorithm."""
+
+    repo = tmp_path / "manifest-repo"
+    repo.mkdir()
+    git = shutil.which("git")
+    assert git is not None
+    subprocess.run(  # noqa: S603 - resolved git running against an isolated test repo
+        [git, "init", "-q", str(repo)], check=True, capture_output=True
+    )
+    shutil.copyfile(_REPO_ROOT / ".gitignore", repo / ".gitignore")
+    (repo / "source.txt").write_text("reviewed source\n", encoding="utf-8")
+    subprocess.run(  # noqa: S603 - resolved git running against an isolated test repo
+        [git, "-C", str(repo), "add", ".gitignore", "source.txt"],
+        check=True,
+        capture_output=True,
+    )
+
+    def staged_hash() -> tuple[str, list[str]]:
+        raw = subprocess.check_output(  # noqa: S603 - exact launcher manifest command
+            [git, "-C", str(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+        )
+        paths = [part.decode("utf-8") for part in raw.split(b"\0") if part]
+        digest = hashlib.sha256()
+        for path in sorted(paths):
+            digest.update(path.encode("utf-8") + b"\0")
+            digest.update(
+                hashlib.sha256((repo / path).read_bytes()).hexdigest().encode("ascii") + b"\n"
+            )
+        return digest.hexdigest(), paths
+
+    before, _ = staged_hash()
+    evidence = repo / "data" / "qualification" / "agent-bench-containment-step63"
+    evidence.mkdir(parents=True)
+    (evidence / "evidence-header.txt").write_text("preregistered\n", encoding="utf-8")
+    (evidence / "run-01.log").write_text("first\n", encoding="utf-8")
+    after_first, paths = staged_hash()
+    (evidence / "run-02.log").write_text("second\n", encoding="utf-8")
+    after_second, _ = staged_hash()
+    assert before == after_first == after_second
+    assert all("qualification" not in path for path in paths)
 
 
 def test_soak_script_is_ascii_only() -> None:

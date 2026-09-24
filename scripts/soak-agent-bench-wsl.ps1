@@ -19,6 +19,9 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $HASH_PATTERN = 'staged-tree-sha256:\s*([0-9a-f]{64})'
+$SKIP_PATTERN = '(?m)^selected-skips:\s*(\d+)\s*$'
+$STEP63_PREREG = "The reviewed containment repair will pass 8/8 independent WSL-ext4 gate invocations with zero selected skips and no live-identity or retained-FD escape; any lower pass rate returns the work to Step 62 and blocks Step 27."
+$PRODUCER_VERSION = "step62-soak-v2"
 
 function Get-StagedTreeHash {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
@@ -28,6 +31,22 @@ function Get-StagedTreeHash {
         return $first.Groups[1].Value
     }
     return ""
+}
+
+function Get-SelectedSkipCount {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+
+    $first = [regex]::Match($Text, $SKIP_PATTERN)
+    if ($first.Success -and -not $first.NextMatch().Success) {
+        return $first.Groups[1].Value
+    }
+    return ""
+}
+
+function Get-FileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
 function Read-HeaderValue {
@@ -83,9 +102,28 @@ function Format-Rate {
 }
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
-if ([string]::IsNullOrWhiteSpace($GateScript)) {
+$production = [string]::IsNullOrWhiteSpace($GateScript)
+if ($production) {
     $GateScript = Join-Path $scriptRoot "test-agent-bench-wsl.ps1"
+    if ([string]::IsNullOrWhiteSpace($Preregister)) {
+        if (-not $VerifyOnly) {
+            throw "-Preregister is required for a soak run (the claim is written before run 1)"
+        }
+    }
+    elseif ($Preregister -ne $STEP63_PREREG) {
+        throw "production preregistration does not match the frozen Step 63 claim"
+    }
 }
+$producerMode = if ($production) { "production" } else { "fixture" }
+$GateScript = [System.IO.Path]::GetFullPath($GateScript)
+$processSource = Join-Path (Split-Path -Parent $scriptRoot) "measure_twice/agent_bench/process.py"
+if (-not (Test-Path -LiteralPath $GateScript) -or -not (Test-Path -LiteralPath $processSource)) {
+    throw "gate script or containment source is absent"
+}
+$soakHash = Get-FileSha256 -Path $PSCommandPath
+$gateHash = Get-FileSha256 -Path $GateScript
+$processHash = Get-FileSha256 -Path $processSource
+$expectedPrereg = if ($production) { $STEP63_PREREG } else { $Preregister }
 
 if ([string]::IsNullOrWhiteSpace($Out)) {
     throw "-Out is required (the evidence directory for headers, per-run logs, and the verdict)"
@@ -121,8 +159,25 @@ if ($VerifyOnly) {
     if ([string]::IsNullOrWhiteSpace($headerPrereg)) {
         $failures += "preregistration sentence is absent from the evidence header"
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($Preregister) -and $headerPrereg -ne $Preregister) {
+    elseif ($headerPrereg -ne $expectedPrereg) {
         $failures += "preregistration sentence does not match the expected one (stale)"
+    }
+    $bindings = @{
+        "producer-mode" = $producerMode
+        "producer-version" = $PRODUCER_VERSION
+        "soak-script-sha256" = $soakHash
+        "gate-script-sha256" = $gateHash
+        "process-sha256" = $processHash
+        "gate-script" = $GateScript
+    }
+    foreach ($key in $bindings.Keys) {
+        if ((Read-HeaderValue -Path $headerPath -Key $key) -ne $bindings[$key]) {
+            $failures += "producer binding is absent or stale: $key"
+        }
+    }
+    if ((Read-HeaderValue -Path $verdictPath -Key "header-sha256") -ne
+        (Get-FileSha256 -Path $headerPath)) {
+        $failures += "evidence header was edited after the run"
     }
     if ($headerReps -ne [string]$Repetitions) {
         $failures += "expected $Repetitions repetitions but the header records $headerReps"
@@ -162,6 +217,10 @@ if ($VerifyOnly) {
             continue
         }
         $logText = [System.IO.File]::ReadAllText($log)
+        if ((Read-HeaderValue -Path $verdictPath -Key ("run-{0:D2}-log-sha256" -f $index)) -ne
+            (Get-FileSha256 -Path $log)) {
+            $failures += "run $index log was edited after the run"
+        }
         $logHash = Get-StagedTreeHash -Text $logText
         if ($logHash -eq "") {
             $failures += "run log must carry exactly one staged-tree hash: $log"
@@ -171,8 +230,26 @@ if ($VerifyOnly) {
         }
         $logExit = [regex]::Match($logText, '^=== run (\d+) exit (-?\d+) ===')
         $recordedExit = Read-HeaderValue -Path $verdictPath -Key ("run-{0:D2}-exit" -f $index)
+        $recordedSkip = Read-HeaderValue -Path $verdictPath -Key ("run-{0:D2}-selected-skips" -f $index)
+        $stdoutMatch = [regex]::Match($logText, '(?s)=== stdout ===\n(.*?)\n=== stderr ===')
+        $logSkip = if ($stdoutMatch.Success) { Get-SelectedSkipCount -Text $stdoutMatch.Groups[1].Value } else { "" }
+        $started = Read-HeaderValue -Path $verdictPath -Key ("run-{0:D2}-started-utc" -f $index)
+        $finished = Read-HeaderValue -Path $verdictPath -Key ("run-{0:D2}-finished-utc" -f $index)
+        $parsedStart = [DateTimeOffset]::MinValue
+        $parsedFinish = [DateTimeOffset]::MinValue
+        $timesValid = [DateTimeOffset]::TryParse($started, [ref]$parsedStart) -and
+            [DateTimeOffset]::TryParse($finished, [ref]$parsedFinish) -and
+            $parsedFinish -ge $parsedStart
+        if (-not $timesValid -or $logText -notmatch [regex]::Escape("run-started-utc: $started") -or
+            $logText -notmatch [regex]::Escape("run-finished-utc: $finished")) {
+            $failures += "run $index timestamps are absent or inconsistent"
+        }
+        if ($logSkip -ne "0" -or $recordedSkip -ne "0") {
+            $failures += "run $index selected-skip count is absent or nonzero"
+        }
         if (-not $logExit.Success -or $logExit.Groups[1].Value -ne [string]$index -or
-            $logExit.Groups[2].Value -ne "0" -or $recordedExit -ne "0") {
+            $logExit.Groups[2].Value -ne "0" -or $recordedExit -ne "0" -or
+            $logSkip -ne "0" -or $recordedSkip -ne "0") {
             $failures += "run $index has a missing, mismatched, or nonzero gate exit"
         }
         else {
@@ -198,9 +275,6 @@ if ($VerifyOnly) {
 if ([string]::IsNullOrWhiteSpace($Preregister)) {
     throw "-Preregister is required for a soak run (the claim is written before run 1)"
 }
-if (-not (Test-Path -LiteralPath $GateScript)) {
-    throw "gate script not found: $GateScript"
-}
 $powershell = Get-Command powershell.exe -ErrorAction Stop
 
 if (-not (Test-Path -LiteralPath $Out)) {
@@ -215,13 +289,22 @@ $headerLines = @(
     "preregistration: $Preregister",
     "repetitions: $Repetitions",
     "distribution: $Distribution",
+    "producer-mode: $producerMode",
+    "producer-version: $PRODUCER_VERSION",
     "gate-script: $GateScript",
+    "soak-script-sha256: $soakHash",
+    "gate-script-sha256: $gateHash",
+    "process-sha256: $processHash",
     "started-utc: $([DateTime]::UtcNow.ToString('o'))"
 )
 [System.IO.File]::WriteAllText($headerPath, ($headerLines -join "`n") + "`n")
 
 $exitCodes = @()
 $hashes = @()
+$skips = @()
+$starts = @()
+$finishes = @()
+$logHashes = @()
 $passCount = 0
 for ($index = 1; $index -le $Repetitions; $index++) {
     $logPath = New-RunLogPath -Directory $Out -Index $index
@@ -235,10 +318,18 @@ for ($index = 1; $index -le $Repetitions; $index++) {
     )
     # Foreground child process (never backgrounded): captures the exact exit code without the
     # gate's own `exit` terminating this wrapper, and preserves the full run log as evidence.
-    $process = Start-Process -FilePath $powershell.Source -ArgumentList $gateArgs `
-        -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
-    $exitCode = $process.ExitCode
+    $runStart = [DateTime]::UtcNow.ToString('o')
+    $exitCode = 127
+    try {
+        $process = Start-Process -FilePath $powershell.Source -ArgumentList $gateArgs `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        $exitCode = $process.ExitCode
+    }
+    catch {
+        [System.IO.File]::WriteAllText($stderrPath, "gate invocation failed: $_`n")
+    }
+    $runFinish = [DateTime]::UtcNow.ToString('o')
 
     $stdoutText = ""
     if (Test-Path -LiteralPath $stdoutPath) {
@@ -248,7 +339,8 @@ for ($index = 1; $index -le $Repetitions; $index++) {
     if (Test-Path -LiteralPath $stderrPath) {
         $stderrText = [System.IO.File]::ReadAllText($stderrPath)
     }
-    $combined = "=== run $index exit $exitCode ===`n=== stdout ===`n$stdoutText`n=== stderr ===`n$stderrText`n"
+    $skipCount = Get-SelectedSkipCount -Text $stdoutText
+    $combined = "=== run $index exit $exitCode ===`nrun-started-utc: $runStart`nrun-finished-utc: $runFinish`nrun-selected-skips: $skipCount`n=== stdout ===`n$stdoutText`n=== stderr ===`n$stderrText`n"
     [System.IO.File]::WriteAllText($logPath, $combined)
     foreach ($temp in @($stdoutPath, $stderrPath)) {
         if (Test-Path -LiteralPath $temp) {
@@ -258,7 +350,11 @@ for ($index = 1; $index -le $Repetitions; $index++) {
 
     $exitCodes += $exitCode
     $hashes += (Get-StagedTreeHash -Text $stdoutText)
-    if ($exitCode -eq 0) {
+    $skips += $skipCount
+    $starts += $runStart
+    $finishes += $runFinish
+    $logHashes += (Get-FileSha256 -Path $logPath)
+    if ($exitCode -eq 0 -and $skipCount -eq "0") {
         $passCount += 1
     }
     Write-Output "run $index exit $exitCode"
@@ -289,8 +385,13 @@ $verdict = if ($isPass) { "PASS" } else { "FAIL" }
 $rateLine = Format-Rate -PassCount $passCount -Total $Repetitions
 
 $verdictLines = @("preregistration: $Preregister", "repetitions: $Repetitions")
+$verdictLines += "header-sha256: $(Get-FileSha256 -Path $headerPath)"
 for ($index = 1; $index -le $Repetitions; $index++) {
     $verdictLines += ("run-{0:D2}-exit: {1}" -f $index, $exitCodes[$index - 1])
+    $verdictLines += ("run-{0:D2}-selected-skips: {1}" -f $index, $skips[$index - 1])
+    $verdictLines += ("run-{0:D2}-started-utc: {1}" -f $index, $starts[$index - 1])
+    $verdictLines += ("run-{0:D2}-finished-utc: {1}" -f $index, $finishes[$index - 1])
+    $verdictLines += ("run-{0:D2}-log-sha256: {1}" -f $index, $logHashes[$index - 1])
 }
 $verdictLines += "pass-count: $passCount"
 $verdictLines += "staged-tree-sha256: $singleHash"

@@ -559,7 +559,14 @@ def _packed_supervisor_status(
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux fast scope-collection invariant")
 @pytest.mark.parametrize(
     "case",
-    ["collected", "owner-alive", "path-replaced", "malformed-control", "missing-supervisor-record"],
+    [
+        "collected",
+        "owner-alive",
+        "path-replaced",
+        "malformed-control",
+        "missing-supervisor-record",
+        "proof-raises",
+    ],
 )
 def test_linux_fast_scope_collection_is_terminal_only_with_proved_owner_exit_and_exact_path(
     tmp_path: Path,
@@ -624,13 +631,14 @@ def test_linux_fast_scope_collection_is_terminal_only_with_proved_owner_exit_and
     if case != "missing-supervisor-record":
         os.write(status_write_fd, _packed_supervisor_status(hard_limit=1, hard_observed=987_654))
     os.close(status_write_fd)
-    proc = subprocess.Popen(
-        ("/bin/true",),
+    proc = subprocess.Popen(  # noqa: S603 - fixed Linux test commands
+        ("/bin/sleep", "30") if case == "proof-raises" else ("/bin/true",),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    proc.wait(timeout=5)
+    if case != "proof-raises":
+        proc.wait(timeout=5)
     runtime = process_module._RunningProcess(
         proc=proc,
         started=time.monotonic(),
@@ -638,12 +646,24 @@ def test_linux_fast_scope_collection_is_terminal_only_with_proved_owner_exit_and
         status_read_fd=status_read_fd,
     )
     runtime.resource_guard = guard
+    if case == "proof-raises":
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        runtime.scratch_tree = LinuxPathCapability.acquire_absolute(scratch, expected="directory")
+
+        def fail_proof(*_args: object, **_kwargs: object) -> bool:
+            raise ProcessExecutionError("injected collection proof failure")
+
+        monkeypatch.setattr(
+            process_module._LinuxResourceGuardState, "control_missing_after_collection", fail_proof
+        )
 
     expected_message = {
         "owner-alive": "could not read Linux resource guard cgroup.events",
         "path-replaced": "scope path was replaced before collection",
         "malformed-control": "cgroup.events is malformed",
         "missing-supervisor-record": "invalid status record",
+        "proof-raises": "could not read Linux resource guard cgroup.events",
     }.get(case)
     try:
         if expected_message is None:
@@ -655,12 +675,16 @@ def test_linux_fast_scope_collection_is_terminal_only_with_proved_owner_exit_and
             assert (status.hard_limit, status.hard_observed) == (1, 987_654)
         else:
             with pytest.raises(ProcessExecutionError, match=expected_message):
-                process_module._cleanup_process(runtime, abnormal=False)
+                process_module._cleanup_process(runtime, abnormal=case == "proof-raises")
             if case == "missing-supervisor-record":
                 # Collection still completed; the record is a separate fail-closed gate.
                 assert guard.collected is True
             elif case != "malformed-control":
                 assert guard.collected is False
+            if case == "proof-raises":
+                assert proc.poll() is not None
+                assert guard.kill_fd == -1
+                assert runtime.scratch_tree is None
         assert runtime.resource_guard is None
     finally:
         if live_owner is not None:
@@ -1101,7 +1125,8 @@ def test_outer_owner_exited_settles_gone_and_zombie_but_fails_on_live(tmp_path: 
         assert process_module._pid_starttime(live.pid) == token
         zombie_guard = _guard_with_owner(tmp_path / "zombie.scope", (live.pid, token))
         try:
-            assert zombie_guard.outer_owner_exited() is True
+            assert zombie_guard.outer_owner_exited() is False
+            assert zombie_guard.outer_owner_exited(allow_zombie=True) is True
         finally:
             zombie_guard.close()
     finally:
