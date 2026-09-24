@@ -34,7 +34,7 @@ import socket
 import sys
 import urllib.parse
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from measure_twice import __version__, runner
@@ -254,8 +254,8 @@ def _score_cellwise(run_id: str, out_dir: Path, scorer: Scorer) -> int:
 def _score_rubric(args: argparse.Namespace, deps: CliDeps, out_dir: Path) -> int:
     """(Re)score a rubric run via the k=3 median judge PASS (run-level per-judge parse-fail gate).
 
-    The judges + budget come from the resolved config (``--config`` else the resolution order); the
-    judge-caller is the injected stub (offline tests) or the real ``claude_call``-backed default. A
+    Judges come from the immutable manifest; config supplies the budget and must match the stored
+    execution profile. The judge-caller is the injected stub or the ``claude_call`` default. A
     broken judge trips the per-judge gate: :class:`~measure_twice.scoring.judge.JudgeParseFailError`
     (a ``ScoringError``) surfaces as a clean non-zero exit and the run store is left untouched (the
     gate fires BEFORE any rewrite — ``score_run_batch``). A budget exhausted mid-pass likewise
@@ -263,13 +263,18 @@ def _score_rubric(args: argparse.Namespace, deps: CliDeps, out_dir: Path) -> int
     """
     try:
         config = load_config(args.config)
-    except ConfigError as exc:
+        judges, execution_receipt = runner.load_run_judge_contract(args.run_id, out_dir, config)
+        config = replace(config, judges=list(judges))
+    except (ConfigError, RunError) as exc:
         print(f"score: {exc}", file=sys.stderr)
         return 1
     judge_caller = deps.judge_caller
     if judge_caller is None:
         judge_caller = default_judge_caller(
-            config, CallBudget(config.max_calls), runner_factory=deps.claude_runner_factory
+            config,
+            CallBudget(config.max_calls),
+            runner_factory=deps.claude_runner_factory,
+            execution_receipt=execution_receipt,
         )
     run_scorer = make_rubric_run_scorer(
         judges=config.judges, judge_caller=judge_caller, k=JUDGE_SAMPLE_K
@@ -651,7 +656,7 @@ def _build_parser(
     score_parser.add_argument(
         "--config",
         metavar="<path>",
-        help="explicit config path for rubric judging (judges + budget); else the resolution order",
+        help="rubric execution profile and budget; judges come from the recorded run manifest",
     )
 
     def _score(args: argparse.Namespace) -> int:

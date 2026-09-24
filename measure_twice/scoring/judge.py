@@ -52,9 +52,22 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Final
 
-from measure_twice.adapters.base import ModelCallResult
-from measure_twice.adapters.claude_cli import CallBudget, RunnerFactory, claude_call
+from measure_twice.adapters.base import UNRESOLVED_MODEL_ID, ModelCallResult
+from measure_twice.adapters.claude_cli import (
+    CallBudget,
+    ClaudeRuntime,
+    ClaudeSetupError,
+    RunnerFactory,
+    claude_call,
+    doctor_claude_runtime,
+)
 from measure_twice.config import RunConfig
+from measure_twice.model_sweep_execution import (
+    PROVIDER_CLAUDE,
+    ClaudeRuntimeEvidence,
+    ExecutionProfileError,
+    ExecutionReceipt,
+)
 from measure_twice.runner import NO_RESPONSE_SCORER, RunRow, RunScorer
 from measure_twice.scoring.deterministic import PARSE_FAIL_MARKER, ScoringError
 from measure_twice.suite import Item
@@ -236,7 +249,12 @@ def parse_judge_score(text: str) -> float | None:
 
 
 def _judge_one_cell(
-    cell: JudgeCell, judges: Sequence[str], judge_caller: JudgeCaller, k: int
+    cell: JudgeCell,
+    judges: Sequence[str],
+    judge_caller: JudgeCaller,
+    k: int,
+    *,
+    identities: dict[str, str] | None = None,
 ) -> tuple[JudgeItemResult, tuple[_JudgeCellStat, ...]]:
     """Judge one cell across every judge (k samples each); return its result + per-judge cell stats.
 
@@ -251,6 +269,8 @@ def _judge_one_cell(
     ``parsed`` = :data:`PARSE_FAIL_MARKER`, empty ``judge_scores``.
     """
     judge_prompt = build_judge_prompt(cell.prompt, cell.response, cell.rubric)
+    if identities is None:
+        identities = {}
     cell_stats: list[_JudgeCellStat] = []
     per_judge_medians: list[float] = []
     for judge in judges:
@@ -258,10 +278,26 @@ def _judge_one_cell(
         n_parse_fail = 0
         for _sample in range(k):
             result = judge_caller(judge_prompt, judge)
+            identity = result.resolved_model
+            has_identity = bool(identity.strip()) and identity != UNRESOLVED_MODEL_ID
+            if has_identity:
+                # A concrete provider identity pins this judge for the WHOLE pass, even on a
+                # non-success sample: the Claude adapter retains a real resolved id on failed,
+                # truncated, and no-response envelopes (adapters/claude_cli.py), so identity drift
+                # can surface on an unhappy sample too. Enforce continuity BEFORE the ok gate so a
+                # mixed pass (identity B on a failed sample, identity A on a parsed one) can never
+                # record a score under a silently changed identity — the fail-closed per-pass
+                # identity invariant must hold on every reachable sample, not just successes.
+                previous = identities.setdefault(judge, identity)
+                if previous != identity:
+                    raise ScoringError(f"judge {judge!r} provider identity changed during scoring")
             if not result.ok:
                 # INVOKE-ERROR (adapter error OR no-response): no usable text to parse. Excluded
-                # from both counters — a broken transport/empty answer is not a broken format.
+                # from both counters — a broken transport/empty answer is not a broken format. Any
+                # concrete identity it DID carry was already drift-checked above.
                 continue
+            if not has_identity:
+                raise ScoringError(f"judge {judge!r} returned unresolved provider identity")
             value = parse_judge_score(result.response_raw)
             if value is None:
                 n_parse_fail += 1  # PARSE-FAIL: returned text, no parseable SCORE — counts to rate.
@@ -354,8 +390,11 @@ def judge_run(
     results: list[JudgeItemResult] = []
     acc_fail: dict[str, int] = {judge: 0 for judge in unique_judges}
     acc_attempts: dict[str, int] = {judge: 0 for judge in unique_judges}
+    identities: dict[str, str] = {}
     for cell in cells:
-        item_result, cell_stats = _judge_one_cell(cell, unique_judges, judge_caller, k)
+        item_result, cell_stats = _judge_one_cell(
+            cell, unique_judges, judge_caller, k, identities=identities
+        )
         results.append(item_result)
         for stat in cell_stats:
             acc_fail[stat.judge] += stat.n_parse_fail
@@ -436,17 +475,77 @@ def default_judge_caller(
     *,
     timeout: float | None = None,
     runner_factory: RunnerFactory | None = None,
+    execution_receipt: ExecutionReceipt | None = None,
 ) -> JudgeCaller:
     """The production judge-caller: one Claude call per sample via ``claude_call`` (plan §4).
 
     Closes over the run ``config`` + ``budget`` (each judge sample counts against the budget, to cap
-    subscription spend) and returns a :class:`JudgeCaller` the rubric pass calls per sample.
+    subscription spend) and returns a :class:`JudgeCaller` the rubric pass calls per sample. The
+    first call doctors and caches one runtime; a setup failure becomes :class:`ScoringError`, the
+    fail-loud family handled by ``mt score``, before the budget or run store is mutated.
     ``runner_factory`` is the same subprocess DI seam ``claude_call`` takes — production leaves it
-    ``None`` (real subprocess); a live-path test could inject a stub subprocess factory, though the
-    rubric tests inject a stub :class:`JudgeCaller` directly and never reach this.
+    ``None`` (real subprocess); tests may inject a stub without bypassing the doctor or final
+    invocation builder. CLI scoring supplies the manifest's validated ``execution_receipt``;
+    profile, selected binding and runtime drift abort before the first model call. Direct callers
+    without a stored run may omit it, but cannot claim a recorded run's execution contract.
     """
 
+    runtime: ClaudeRuntime | None = None
+    configured_aliases = frozenset(config.judges)
+    capability_error: str | None = None
+    if (
+        execution_receipt is not None
+        and config.execution_profile.sha256 != execution_receipt.execution_profile_sha256
+    ):
+        capability_error = "judge execution profile differs from the stored receipt"
+    for configured_alias in config.judges:
+        try:
+            binding = config.execution_profile.binding_for(configured_alias)
+        except ExecutionProfileError as exc:  # defensive behind RunConfig validation
+            capability_error = f"default Claude judge cannot bind {configured_alias!r}: {exc}"
+            break
+        if binding.provider != PROVIDER_CLAUDE:
+            capability_error = (
+                f"default Claude judge does not support alias {configured_alias!r} bound to "
+                f"provider {binding.provider!r}; inject a JudgeCaller that supports that provider"
+            )
+            break
+        if execution_receipt is not None and binding not in execution_receipt.bindings:
+            capability_error = f"judge {configured_alias!r} differs from the stored receipt"
+            break
+
     def _call(judge_prompt: str, judge_alias: str) -> ModelCallResult:
+        nonlocal runtime
+        # Validate the whole configured judge roster on the first scoring call. This is lazy only
+        # so the error lands inside score_run_batch's existing ScoringError boundary; the complete
+        # prevalidation happened at construction, before any doctor/model/budget/store mutation.
+        if capability_error is not None:
+            raise ScoringError(capability_error)
+        if judge_alias not in configured_aliases:
+            raise ScoringError(
+                f"default Claude judge received unconfigured alias {judge_alias!r}; "
+                f"configured judges are {sorted(configured_aliases)!r}"
+            )
+        if runtime is None:
+            try:
+                candidate = doctor_claude_runtime(config, runner_factory=runner_factory)
+            except ClaudeSetupError as exc:
+                raise ScoringError(f"Claude CLI judge preflight failed: {exc}") from exc
+            if execution_receipt is not None:
+                evidence = (
+                    None
+                    if candidate.cli_version is None
+                    else ClaudeRuntimeEvidence(candidate.executable, candidate.cli_version)
+                )
+                if (
+                    evidence != execution_receipt.claude_cli
+                    or candidate.context.sha256 != execution_receipt.context_profile_sha256
+                ):
+                    raise ScoringError(
+                        "Claude judge runtime differs from the stored sealed contract; "
+                        "collect a new run under the current sealed contract"
+                    )
+            runtime = candidate
         return claude_call(
             judge_prompt,
             alias=judge_alias,
@@ -454,6 +553,7 @@ def default_judge_caller(
             budget=budget,
             timeout=timeout,
             runner_factory=runner_factory,
+            runtime=runtime,
         )
 
     return _call

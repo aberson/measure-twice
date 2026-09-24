@@ -17,6 +17,7 @@ from measure_twice import __version__
 from measure_twice.cli import main
 from measure_twice.config import (
     ALLOWED_CONFIG_FIELDS,
+    CWD_CONFIG_NAME,
     DEFAULT_CLAUDE_POOL,
     DEFAULT_JUDGES,
     DEFAULT_LOCAL_BASE_URL,
@@ -31,6 +32,7 @@ from measure_twice.config import (
     RunConfig,
     load_config,
 )
+from measure_twice.model_sweep_execution import DEFAULT_EXECUTION_PROFILE
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -61,6 +63,7 @@ def test_defaults_when_no_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert cfg.samples_per_cell == DEFAULT_SAMPLES_PER_CELL
     assert cfg.judges == DEFAULT_JUDGES
     assert cfg.max_calls == DEFAULT_MAX_CALLS
+    assert cfg.execution_profile is DEFAULT_EXECUTION_PROFILE
 
 
 # --- Fail loud on malformed JSON / shape -------------------------------------------------
@@ -181,6 +184,29 @@ def test_cwd_used_when_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert cfg.config_source == "cwd:measure-twice.json"
 
 
+@pytest.mark.parametrize("launcher_kind", ["absolute", "relative", "custom"])
+def test_implicit_cwd_config_rejects_untrusted_claude_launcher(
+    launcher_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkout config cannot redirect OAuth and prompts to an attacker-selected executable."""
+    configured = {
+        "absolute": str((tmp_path / "attacker-claude.cmd").resolve()),
+        "relative": r".\attacker-claude.cmd",
+        "custom": "claude.cmd",
+    }[launcher_kind]
+    profile = DEFAULT_EXECUTION_PROFILE.to_mapping()
+    claude = profile["claude"]
+    assert isinstance(claude, dict)
+    claude["executable"] = configured
+    _write_json(tmp_path / CWD_CONFIG_NAME, {"execution_profile": profile})
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "offline-dummy-token")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ConfigError, match="literal bare launcher 'claude'"):
+        load_config()
+
+
 def test_valid_explicit_partial_config_merges_defaults(tmp_path: Path) -> None:
     """A partial config keeps defaults for unspecified fields and records the explicit source."""
     p = tmp_path / "cfg.json"
@@ -247,6 +273,22 @@ def test_empty_roster_rejected() -> None:
 def test_empty_judges_rejected() -> None:
     with pytest.raises(ConfigError):
         RunConfig(judges=[])
+
+
+@pytest.mark.parametrize("field", ["roster", "judges"])
+def test_safe_but_unbound_model_name_is_rejected(field: str) -> None:
+    with pytest.raises(ConfigError, match="no explicit provider binding"):
+        RunConfig(**{field: ["not-in-the-provider-profile"]})
+
+
+def test_nested_execution_profile_is_strictly_parsed(tmp_path: Path) -> None:
+    profile = DEFAULT_EXECUTION_PROFILE.to_mapping()
+    profile["unexpected"] = True
+    path = tmp_path / "bad-profile.json"
+    _write_json(path, {"execution_profile": profile})
+
+    with pytest.raises(ConfigError, match="execution profile keys must be exactly"):
+        load_config(str(path))
 
 
 # --- switchboard path dependency ---------------------------------------------------------

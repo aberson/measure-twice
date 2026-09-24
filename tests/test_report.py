@@ -191,6 +191,7 @@ def test_report_counts_rubric_parse_fail(tmp_path: Path) -> None:
         roster=["general-35b"],
         samples_per_cell=1,
         local_transport_factory=StubAdapters(local=lambda p: "a model answer").local_factory(),
+        claude_runner_factory=StubAdapters().claude_factory(),
     )
 
     def judge_caller(judge_prompt: str, judge_alias: str) -> ModelCallResult:

@@ -65,6 +65,17 @@ Suites carry ALL item content (no prompt templates in adapters — the fallback-
 
 The Linux substrate rests on one **kernel-object-identity invariant**: every caller-supplied filesystem source is opened once via `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)` and thereafter referred to only by that owned descriptor (`LinuxPathCapability`), so a later rename, unlink, or symlink swap cannot redirect a mount, a cwd, a capture scan, or a resource walk. Processes launch through `systemd-run --user --scope` into a fresh transient cgroup (`LinuxResourceGuard`) with a private tmpfs per evaluator repetition (`EvaluatorScratch`), sandboxed by Bubblewrap using `--bind-fd`/`--ro-bind-fd`. Resource enforcement is explicitly **two-layer and self-labelling**: memory/pids/tmpfs ceilings are hard host guards read back before the target is released and record `hard-guard` provenance, while cumulative CPU and logical-tree thresholds are sampled scoring rules that record `sampled-threshold` provenance and may overshoot. There is no polling-only or path-bind fallback: a missing or incompatible dependency raises `IsolationUnavailableError` and fails the gate rather than degrading.
 
+Instrument A execution is profile-bound: aliases require explicit provider/requested-model entries.
+The sealed Claude environment excludes ambient proxy/CA overrides. For rubric suites, collection
+preflights and records the judges alongside the model roster without invoking them; verdict/exact
+suites only preflight the roster. `mt score` selects judges from the immutable manifest and checks
+the stored profile and Claude runtime before calls. Unresolved successful judge identities and
+identity changes during a scoring pass raise `ScoringError` before row writes; transport failures
+and no-response retain their existing exclusion semantics. Legacy data remains readable and
+deterministically rescorable offline; fresh rubric judging needs the current seal and recorded
+judge bindings, requiring recollection when evidence is missing. Step 57 owns receipt-aware reports
+and the qualification wrapper; Step 58 owns the live qualification run.
+
 ## Status
 
 **Phase A (core engine) COMPLETE** (2026-07-17): Steps 1–7 shipped + merged to master (issues #1–#7 closed) — `config` resolver, `suite` schema + canonical item-hash + `mt validate`, model `adapters` (local OpenAI-compat + `claude` CLI, both behind DI seams), the sweep `runner` (append-only JSONL, cell-level resume, budgets, no-response force-0), deterministic verdict/exact `scoring` + the §5.6 parse spine + frozen anchors, the k=3-median rubric `judge` (per-judge parse-fail gate), and `report` + `mt smoke`. Step M1 local-endpoint smoke (#18) is closed.

@@ -18,22 +18,42 @@ per the Step-4 done-when:
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import sys
+import textwrap
 import urllib.error
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
-from conftest import StubAdapters, _iid  # shared offline stub scaffolding (tests/conftest.py)
+from conftest import (
+    StubAdapters,
+    _claude_stdout,
+    _iid,
+    _openai_body,
+)  # shared offline stub scaffolding (tests/conftest.py)
 
 from measure_twice.adapters import claude_cli
 from measure_twice.adapters.base import RC_OS_ERROR, RC_UNREACHABLE
+from measure_twice.adapters.claude_cli import ClaudeInvocation, SubprocessResult
 from measure_twice.cli import CliDeps, main
 from measure_twice.config import ENV_VAR, RunConfig
+from measure_twice.model_sweep_execution import (
+    CLAUDE_ARGV_TEMPLATE,
+    CLAUDE_ENV_ALLOWLIST,
+    DEFAULT_EXECUTION_PROFILE,
+    PROVIDER_CLAUDE,
+    PROVIDER_LOCAL,
+    ExecutionReceipt,
+    ModelSweepExecutionProfile,
+)
 from measure_twice.runner import (
     NO_RESPONSE_SCORER,
     RunError,
     ScoreOutcome,
+    load_run_suite,
     run,
     score_run,
 )
@@ -65,6 +85,7 @@ MANIFEST_KEYS = {
     "config_source",
     "budgets",
     "preregistration",
+    "execution_receipt",
 }
 
 
@@ -96,15 +117,184 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
     ]
 
 
+def _base_python_executable() -> Path:
+    """Return the base interpreter outside this worktree's virtual environment."""
+    executable = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
+    repo_root = Path(__file__).resolve().parents[1]
+    assert not executable.is_relative_to(repo_root)
+    return executable
+
+
+def _write_fake_claude(root: Path) -> tuple[Path, Path]:
+    """Create a local CLI double reached by the production ``subprocess.Popen`` path."""
+    root.mkdir(parents=True, exist_ok=True)
+    base_python = _base_python_executable()
+    observation_path = root / "fake-claude-observations.jsonl"
+    helper_path = root / "fake_claude.py"
+    helper_source = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import sys
+        from pathlib import Path
+
+        observation_path = Path({str(observation_path)!r})
+        arguments = sys.argv[1:]
+        executable = str(Path(sys.argv[0]).resolve())
+        if arguments[:1] == ["--fake-launcher"]:
+            executable = str(Path(arguments[1]).resolve())
+            arguments = arguments[2:]
+
+        prompt = sys.stdin.read()
+        record = {{
+            "argv": [executable, *arguments],
+            "helper_executable": str(Path(sys.executable).resolve()),
+            "cwd": str(Path.cwd().resolve()),
+            "cwd_entries": sorted(os.listdir(Path.cwd())),
+            "environment": dict(os.environ),
+            "stdin": prompt,
+        }}
+        with observation_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\\n")
+        if arguments == ["--version"]:
+            print("fake-claude 9.8.7")
+            raise SystemExit(0)
+        if arguments == ["--help"]:
+            print(" ".join({list(CLAUDE_ARGV_TEMPLATE)!r}))
+            raise SystemExit(0)
+        print({_claude_stdout("pass", model="fake-concrete-sonnet")!r})
+        """
+    ).lstrip()
+
+    if os.name == "nt":
+        helper_path.write_text(helper_source, encoding="utf-8")
+        launcher_path = root / "claude.cmd"
+        launcher_path.write_text(
+            f'@echo off\r\nset "PROMPT="\r\n{base_python.stem} "{helper_path}" '
+            '--fake-launcher "%~f0" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        launcher_path = root / "claude"
+        launcher_path.write_text(f"#!{base_python}\n{helper_source}", encoding="utf-8")
+        launcher_path.chmod(0o755)
+    return launcher_path.resolve(), observation_path
+
+
+def _sealed_test_config() -> dict[str, object]:
+    profile = DEFAULT_EXECUTION_PROFILE.to_mapping()
+    profile["id"] = "test-model-sweep-execution-v1"
+    models = profile["models"]
+    assert isinstance(models, list)
+    models.append(
+        {
+            "alias": "public-sonnet",
+            "provider": PROVIDER_CLAUDE,
+            "requested_model": "claude-sonnet-4-5-20250929",
+        }
+    )
+    return {
+        "roster": ["public-sonnet"],
+        "claude_pool": 1,
+        "judges": ["public-sonnet"],
+        "execution_profile": profile,
+    }
+
+
 # --- Full sweep --------------------------------------------------------------------------
+
+
+def test_local_dispatch_preserves_distinct_public_requested_and_observed_models(
+    tmp_path: Path,
+) -> None:
+    profile = DEFAULT_EXECUTION_PROFILE.to_mapping()
+    profile["models"].append(
+        {
+            "alias": "public-local",
+            "provider": PROVIDER_LOCAL,
+            "requested_model": "registry.example/org/model:tag",
+        }
+    )
+    config = RunConfig(execution_profile=ModelSweepExecutionProfile.from_mapping(profile))
+    requests: list[dict[str, object]] = []
+
+    def transport(url: str, data: bytes, timeout: float) -> str:
+        requests.append(json.loads(data))
+        return _openai_body("pass", model="served-model-Q4_K_M")
+
+    result = run(
+        suite=_suite(["a"]),
+        config=config,
+        out_dir=tmp_path,
+        roster=["public-local"],
+        local_transport_factory=lambda: transport,
+    )
+    assert [request["model"] for request in requests] == ["registry.example/org/model:tag"]
+    run_dir = tmp_path / "runs" / result.run_id
+    (row,) = _read_jsonl(run_dir / "rows.jsonl")
+    assert row["model"] == "public-local"
+    assert row["model_id_resolved"] == "served-model-Q4_K_M"
+    receipt = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))[
+        "execution_receipt"
+    ]
+    assert receipt["bindings"] == [
+        {
+            "alias": "public-local",
+            "provider": PROVIDER_LOCAL,
+            "requested_model": "registry.example/org/model:tag",
+        }
+    ]
+
+
+def test_rubric_run_rejects_non_claude_judge_before_run_dir(tmp_path: Path) -> None:
+    """A rubric suite whose selected judge is bound to a non-Claude provider is rejected BEFORE any
+    run-dir mutation: the shipped ``mt score`` path is Claude-only, so collecting such a run would
+    mint a store the product CLI can never score (producer/consumer drift, fail-closed)."""
+    profile = DEFAULT_EXECUTION_PROFILE.to_mapping()
+    profile["models"].append(
+        {
+            "alias": "public-local",
+            "provider": PROVIDER_LOCAL,
+            "requested_model": "registry.example/org/model:tag",
+        }
+    )
+    config = RunConfig(execution_profile=ModelSweepExecutionProfile.from_mapping(profile))
+    with pytest.raises(RunError, match=r"rubric judge.*not scoreable by the default Claude judge"):
+        run(
+            suite=_suite(["a"], scoring_type="rubric"),
+            config=config,
+            out_dir=tmp_path,
+            roster=["general-35b"],
+            judges=["public-local"],
+        )
+    assert not (tmp_path / "runs").exists()  # failed before any run-dir mutation
+
+
+def test_rubric_run_allows_claude_judge(tmp_path: Path) -> None:
+    """The rubric-judge provider guard admits a Claude-bound judge: a rubric collection with a
+    Claude judge mints its run dir normally (the guard rejects only non-Claude judge providers)."""
+    config = ModelSweepExecutionProfile.from_mapping(_sealed_test_config()["execution_profile"])
+    run_config = RunConfig(execution_profile=config, judges=["public-sonnet"])
+    stub = StubAdapters()
+    result = run(
+        suite=_suite(["a"], scoring_type="rubric"),
+        config=run_config,
+        out_dir=tmp_path,
+        roster=["public-sonnet"],
+        judges=["public-sonnet"],
+        claude_runner_factory=stub.claude_factory(),
+    )
+    assert not result.aborted
+    assert (tmp_path / "runs" / result.run_id).is_dir()
 
 
 def test_full_sweep_writes_manifest_and_all_rows(tmp_path: Path) -> None:
     suite = _suite(["a", "b", "c"])
     stub = StubAdapters()
+    config = RunConfig()
     result = run(
         suite=suite,
-        config=RunConfig(),
+        config=config,
         out_dir=tmp_path,
         roster=["general-35b", "haiku"],
         samples_per_cell=2,
@@ -131,6 +321,16 @@ def test_full_sweep_writes_manifest_and_all_rows(tmp_path: Path) -> None:
     assert manifest["config_source"] == "defaults"
     assert manifest["budgets"] == {"max_calls": RunConfig().max_calls}
     assert manifest["preregistration"] == "this run will decide X"
+    receipt = ExecutionReceipt.from_mapping(manifest["execution_receipt"])
+    assert receipt.profile_id == config.execution_profile.id
+    assert receipt.execution_profile_sha256 == config.execution_profile.sha256
+    assert receipt.provider_profile_sha256 == config.execution_profile.provider_profile_sha256
+    assert receipt.context_profile_sha256 == config.execution_profile.claude.sha256
+    assert [binding.alias for binding in receipt.bindings] == ["general-35b", "haiku"]
+    assert receipt.claude_cli is not None
+    assert Path(receipt.claude_cli.executable).is_absolute()
+    assert receipt.claude_cli.version == "test-claude 1.0"
+    assert receipt.to_mapping() == manifest["execution_receipt"]
 
     rows = _read_jsonl(run_dir / "rows.jsonl")
     assert len(rows) == 12
@@ -225,7 +425,11 @@ def test_error_row_records_reason_class(tmp_path: Path) -> None:
 # --- Resume: exactly the incomplete cells ------------------------------------------------
 
 
-def test_resume_skips_exactly_completed_cells(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("duplicate_selections", [False, True])
+def test_resume_skips_exactly_completed_cells(
+    tmp_path: Path, legacy: bool, duplicate_selections: bool
+) -> None:
     suite = _suite(["a", "b", "c", "d"])
     cfg = RunConfig()
     stub1 = StubAdapters()
@@ -242,6 +446,16 @@ def test_resume_skips_exactly_completed_cells(tmp_path: Path) -> None:
     assert [_iid(p) for p in stub1.local_calls] == ["a", "b"]
     completed = {r["item_id"] for r in _read_jsonl(tmp_path / "runs" / r1.run_id / "rows.jsonl")}
     assert completed == {"a", "b"}
+    manifest_path = tmp_path / "runs" / r1.run_id / "manifest.json"
+    if legacy or duplicate_selections:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if legacy:
+            del manifest["execution_receipt"]
+        if duplicate_selections:
+            manifest["roster"] *= 2
+            manifest["judges"] *= 2
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    manifest_before = manifest_path.read_bytes()
 
     stub2 = StubAdapters()
     r2 = run(
@@ -260,6 +474,7 @@ def test_resume_skips_exactly_completed_cells(tmp_path: Path) -> None:
     final = {r["item_id"] for r in _read_jsonl(tmp_path / "runs" / r1.run_id / "rows.jsonl")}
     assert final == {"a", "b", "c", "d"}
     assert r2.cells_completed == 4
+    assert manifest_path.read_bytes() == manifest_before
 
 
 def test_resume_suite_hash_mismatch_fails_loud(tmp_path: Path) -> None:
@@ -324,6 +539,246 @@ def test_torn_trailing_line_tolerated_on_resume(tmp_path: Path) -> None:
     assert len(final_rows) == 4  # the torn line was dropped, not counted
     assert {r["item_id"] for r in final_rows} == {"a", "b", "c", "d"}
     assert [_iid(p) for p in stub2.local_calls] == ["c", "d"]
+
+
+@pytest.mark.parametrize(
+    ("alias", "provider", "requested_model"),
+    [
+        ("haiku", PROVIDER_CLAUDE, "haiku"),
+        ("haiku", PROVIDER_LOCAL, "haiku"),
+        ("sonnet", PROVIDER_LOCAL, "sonnet"),
+        ("opus", PROVIDER_LOCAL, "opus"),
+        ("fable", PROVIDER_LOCAL, "fable"),
+        ("general-35b", PROVIDER_LOCAL, "different-local-model"),
+        ("general-35b", PROVIDER_CLAUDE, "sonnet"),
+    ],
+)
+def test_pending_legacy_resume_rejects_rebinding_before_any_mutation(
+    tmp_path: Path,
+    alias: str,
+    provider: str,
+    requested_model: str,
+) -> None:
+    suite = _suite(["a", "b"])
+    first_stub = StubAdapters()
+    first = run(
+        suite=suite,
+        config=RunConfig(claude_pool=2),
+        out_dir=tmp_path,
+        roster=[alias],
+        max_calls=1,
+        claude_runner_factory=first_stub.claude_factory(),
+        local_transport_factory=first_stub.local_factory(),
+    )
+    assert first.aborted
+    run_dir = tmp_path / "runs" / first.run_id
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["execution_receipt"]  # exact shape of a readable pre-Step-56 manifest
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    assert load_run_suite(run_id=first.run_id, out_dir=tmp_path) == suite
+
+    rows_path = run_dir / "rows.jsonl"
+    with rows_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"run_id":"torn legacy claude tail"')
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    profile = DEFAULT_EXECUTION_PROFILE.to_mapping()
+    for binding in profile["models"]:
+        if binding["alias"] == alias:
+            binding["provider"] = provider
+            binding["requested_model"] = requested_model
+    config = RunConfig(execution_profile=ModelSweepExecutionProfile.from_mapping(profile))
+    calls: list[str] = []
+
+    def forbidden_factory():
+        calls.append("factory")
+        raise AssertionError("Legacy validation must precede doctor and provider calls")
+
+    with pytest.raises(RunError, match=r"legacy-unsealed"):
+        run(
+            suite=suite,
+            config=config,
+            out_dir=tmp_path,
+            resume=first.run_id,
+            max_calls=10,
+            claude_runner_factory=forbidden_factory,
+            local_transport_factory=forbidden_factory,
+        )
+
+    assert {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    } == before
+    assert calls == []
+
+    # Fresh Claude execution is forbidden, but deterministic scoring of the stored bytes works.
+    score_rc = main(["score", first.run_id, "--out", str(tmp_path)])
+    assert score_rc == 0
+    rescored = _read_jsonl(rows_path)
+    assert len(rescored) == 1
+    assert rescored[0]["response_raw"] == ("loc-answer" if alias == "general-35b" else "cl-answer")
+    assert rescored[0]["scorer"] == "verdict"
+    assert "execution_receipt" not in json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def test_valid_unterminated_final_row_is_repaired_before_resume_append(tmp_path: Path) -> None:
+    suite = _suite(["a", "b", "c"])
+    first_stub = StubAdapters()
+    first = run(
+        suite=suite,
+        config=RunConfig(),
+        out_dir=tmp_path,
+        roster=["general-35b"],
+        max_calls=2,
+        local_transport_factory=first_stub.local_factory(),
+    )
+    assert first.aborted
+    rows_path = tmp_path / "runs" / first.run_id / "rows.jsonl"
+    original = rows_path.read_bytes()
+    assert original.endswith(b"\n")
+    rows_path.write_bytes(original[:-1])
+    resume_stub = StubAdapters()
+
+    resumed = run(
+        suite=suite,
+        config=RunConfig(),
+        out_dir=tmp_path,
+        resume=first.run_id,
+        max_calls=10,
+        local_transport_factory=resume_stub.local_factory(),
+    )
+
+    assert not resumed.aborted
+    assert [_iid(prompt) for prompt in resume_stub.local_calls] == ["c"]
+    assert rows_path.read_bytes().endswith(b"\n")
+    assert [row["item_id"] for row in _read_jsonl(rows_path)] == ["a", "b", "c"]
+
+
+def test_pending_sealed_resume_rejects_valid_static_profile_drift_before_any_mutation(
+    tmp_path: Path,
+) -> None:
+    suite = _suite(["a", "b"])
+    first_stub = StubAdapters()
+    first = run(
+        suite=suite,
+        config=RunConfig(claude_pool=1),
+        out_dir=tmp_path,
+        roster=["haiku"],
+        max_calls=1,
+        claude_runner_factory=first_stub.claude_factory(),
+    )
+    assert first.aborted
+    run_dir = tmp_path / "runs" / first.run_id
+    rows_path = run_dir / "rows.jsonl"
+    with rows_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"run_id":"torn sealed static tail"')
+
+    profile_mapping = DEFAULT_EXECUTION_PROFILE.to_mapping()
+    models = profile_mapping["models"]
+    assert isinstance(models, list)
+    for binding in models:
+        assert isinstance(binding, dict)
+        if binding["alias"] == "general-35b":
+            binding["requested_model"] = "different-valid-local-model"
+            break
+    changed_profile = ModelSweepExecutionProfile.from_mapping(profile_mapping)
+    changed_config = RunConfig(claude_pool=1, execution_profile=changed_profile)
+    before_bytes = {
+        name: (run_dir / name).read_bytes()
+        for name in ("rows.jsonl", "manifest.json", "suite.json")
+    }
+    before_entries = {path.name for path in run_dir.iterdir()}
+    runner_factory_calls: list[str] = []
+    local_factory_calls: list[str] = []
+
+    def forbidden_runner_factory() -> object:
+        runner_factory_calls.append("created")
+        return lambda *_args: SubprocessResult(0, "", "")
+
+    def forbidden_local_factory() -> object:
+        local_factory_calls.append("created")
+        return lambda *_args: ""
+
+    with pytest.raises(RunError, match="execution profile/provider bindings differ"):
+        run(
+            suite=suite,
+            config=changed_config,
+            out_dir=tmp_path,
+            resume=first.run_id,
+            max_calls=10,
+            local_transport_factory=forbidden_local_factory,  # type: ignore[arg-type]
+            claude_runner_factory=forbidden_runner_factory,  # type: ignore[arg-type]
+        )
+
+    assert runner_factory_calls == []
+    assert local_factory_calls == []
+    assert {name: (run_dir / name).read_bytes() for name in before_bytes} == before_bytes
+    assert {path.name for path in run_dir.iterdir()} == before_entries
+    assert not (run_dir / "rows.jsonl.tmp").exists()
+
+
+def test_pending_sealed_resume_rejects_redoctored_version_drift_before_any_mutation(
+    tmp_path: Path,
+) -> None:
+    suite = _suite(["a", "b"])
+    first_stub = StubAdapters()
+    config = RunConfig(claude_pool=1)
+    first = run(
+        suite=suite,
+        config=config,
+        out_dir=tmp_path,
+        roster=["haiku"],
+        max_calls=1,
+        claude_runner_factory=first_stub.claude_factory(),
+    )
+    assert first.aborted
+    run_dir = tmp_path / "runs" / first.run_id
+    rows_path = run_dir / "rows.jsonl"
+    with rows_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"run_id":"torn sealed runtime tail"')
+    before_bytes = {
+        name: (run_dir / name).read_bytes()
+        for name in ("rows.jsonl", "manifest.json", "suite.json")
+    }
+    before_entries = {path.name for path in run_dir.iterdir()}
+    invocations: list[tuple[tuple[str, ...], str]] = []
+    local_factory_calls: list[str] = []
+
+    def runner(invocation: ClaudeInvocation, input_text: str, timeout: float) -> SubprocessResult:
+        args = invocation.argv[1:]
+        invocations.append((args, input_text))
+        if args == ("--version",):
+            return SubprocessResult(0, "test-claude 2.0", "")
+        if args == ("--help",):
+            return SubprocessResult(0, " ".join(CLAUDE_ARGV_TEMPLATE), "")
+        return SubprocessResult(0, "must-not-be-used", "")
+
+    def forbidden_local_factory() -> object:
+        local_factory_calls.append("created")
+        return lambda *_args: ""
+
+    with pytest.raises(RunError, match=r"current Claude executable/version.*differs"):
+        run(
+            suite=suite,
+            config=config,
+            out_dir=tmp_path,
+            resume=first.run_id,
+            max_calls=10,
+            local_transport_factory=forbidden_local_factory,  # type: ignore[arg-type]
+            claude_runner_factory=lambda: runner,
+        )
+
+    assert invocations == [(("--version",), ""), (("--help",), "")]
+    assert all("-p" not in args and stdin == "" for args, stdin in invocations)
+    assert local_factory_calls == []
+    assert {name: (run_dir / name).read_bytes() for name in before_bytes} == before_bytes
+    assert {path.name for path in run_dir.iterdir()} == before_entries
+    assert not (run_dir / "rows.jsonl.tmp").exists()
 
 
 def test_midfile_corruption_is_fatal(tmp_path: Path) -> None:
@@ -541,6 +996,220 @@ def test_cli_run_integration_on_smoke_suite(
     assert run_dir.name in captured.out  # the one-line summary was printed
 
 
+@pytest.mark.parametrize("install_name", ["approved-install", "approved install with spaces"])
+def test_cli_run_production_builder_launches_fully_sealed_fake_claude(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    install_name: str,
+) -> None:
+    """Real ``main(['run', ...])`` -> production builder -> ``subprocess.Popen`` integration."""
+    launcher, observations_path = _write_fake_claude(tmp_path / install_name)
+    dependency_directories: tuple[Path, ...] = (_base_python_executable().parent,)
+    if sys.platform == "win32":
+        windows = claude_cli._windows_runtime_paths().windows
+        dependency_directories = (*dependency_directories, windows / "System32", windows)
+    injected_boundary = claude_cli._LauncherBoundary(
+        launcher_directory=launcher.parent,
+        target_roots=(launcher.parent,),
+        dependency_directories=dependency_directories,
+    )
+    monkeypatch.setattr(claude_cli, "_runtime_launcher_policy", lambda: (injected_boundary,))
+    config_path = tmp_path / "sealed-config.json"
+    config_path.write_text(json.dumps(_sealed_test_config(), indent=2), encoding="utf-8")
+    suite_path = tmp_path / "sealed-suite.json"
+    suite_path.write_text(
+        json.dumps(asdict(_suite(["sealed-a", "sealed-b"])), indent=2), encoding="utf-8"
+    )
+    out = tmp_path / "data"
+    allowed_marker = "test-subscription-oauth"
+
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    ambient_bin = tmp_path / "ambient-interposer"
+    ambient_bin.mkdir()
+    interposer_marker = tmp_path / "ambient-helper-ran.txt"
+    if sys.platform == "win32":
+        (ambient_bin / f"{_base_python_executable().stem}.cmd").write_text(
+            f'@echo hostile > "{interposer_marker}"\r\n@exit /b 97\r\n', encoding="utf-8"
+        )
+    monkeypatch.setenv("PATH", os.pathsep.join((str(ambient_bin), str(launcher.parent))))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", allowed_marker)
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-leak")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "must-not-leak"))
+    monkeypatch.setenv("MEASURE_TWICE_SECRET", "must-not-leak")
+    network_overrides = (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NODE_EXTRA_CA_CERTS",
+        "NODE_TLS_REJECT_UNAUTHORIZED",
+        "NODE_OPTIONS",
+        "CLAUDE_CODE_CERT_STORE",
+        "CLAUDE_CODE_CLIENT_CERT",
+        "CLAUDE_CODE_CLIENT_KEY",
+        "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+        "ANTHROPIC_BASE_URL",
+    )
+    for name in network_overrides:
+        monkeypatch.setenv(name, "hostile-initial-value")
+
+    rc = main(
+        [
+            "run",
+            "--suite",
+            str(suite_path),
+            "--config",
+            str(config_path),
+            "--out",
+            str(out),
+            "--budget",
+            "1",
+        ]
+    )
+
+    assert rc == 0
+    assert not interposer_marker.exists()
+    run_dirs = list((out / "runs").iterdir())
+    assert len(run_dirs) == 1
+    manifest = json.loads((run_dirs[0] / "manifest.json").read_text(encoding="utf-8"))
+    receipt = ExecutionReceipt.from_mapping(manifest["execution_receipt"])
+    assert [
+        (binding.alias, binding.provider, binding.requested_model) for binding in receipt.bindings
+    ] == [("public-sonnet", PROVIDER_CLAUDE, "claude-sonnet-4-5-20250929")]
+    assert receipt.claude_cli is not None
+    assert receipt.claude_cli.executable == str(launcher)
+    assert receipt.claude_cli.version == "fake-claude 9.8.7"
+    assert receipt.to_mapping()["receipt_sha256"] == manifest["execution_receipt"]["receipt_sha256"]
+
+    for name in network_overrides:
+        monkeypatch.setenv(name.lower(), "hostile-resumed-value")
+    resume_rc = main(
+        [
+            "run",
+            "--suite",
+            str(suite_path),
+            "--config",
+            str(config_path),
+            "--out",
+            str(out),
+            "--resume",
+            run_dirs[0].name,
+            "--budget",
+            "1",
+        ]
+    )
+    assert resume_rc == 0
+
+    observations = _read_jsonl(observations_path)
+    assert len(observations) == 6
+    expected_path = [
+        launcher.parent.resolve(),
+        *(path.resolve() for path in dependency_directories),
+    ]
+    for record in observations:
+        assert record["helper_executable"] == str(_base_python_executable())
+        environment = record["environment"]
+        assert isinstance(environment, dict)
+        assert not {name.upper() for name in environment}.intersection(network_overrides)
+        child_path = [Path(entry).resolve() for entry in str(environment["PATH"]).split(os.pathsep)]
+        assert child_path == expected_path
+    expected_tail = [
+        "-p",
+        "--model",
+        "claude-sonnet-4-5-20250929",
+        "--output-format",
+        "json",
+        "--safe-mode",
+        "--tools",
+        "",
+        "--disable-slash-commands",
+        "--no-chrome",
+        "--no-session-persistence",
+    ]
+    doctor_observations = [record for record in observations if record["argv"][1:] != expected_tail]
+    model_observations = [record for record in observations if record["argv"][1:] == expected_tail]
+    assert {record["argv"][-1] for record in doctor_observations} == {"--version", "--help"}
+    assert {record["stdin"] for record in doctor_observations} == {""}
+    assert all(
+        "CLAUDE_CODE_OAUTH_TOKEN" not in record["environment"] for record in doctor_observations
+    )
+    assert len(model_observations) == 2
+    assert {record["stdin"] for record in model_observations} == {
+        "PROMPT::sealed-a",
+        "PROMPT::sealed-b",
+    }
+    observed_cwds: set[str] = set()
+    for record in model_observations:
+        assert record["argv"] == [str(launcher), *expected_tail]
+        assert record["cwd_entries"] == []
+        cwd = str(record["cwd"])
+        assert Path(cwd).is_absolute()
+        assert not Path(cwd).exists()
+        observed_cwds.add(cwd)
+        environment = record["environment"]
+        assert isinstance(environment, dict)
+        assert set(environment).issubset(CLAUDE_ENV_ALLOWLIST)
+        assert environment["CLAUDE_CODE_OAUTH_TOKEN"] == allowed_marker
+        assert environment["LC_ALL"] == "C.UTF-8"
+        child_path = [Path(entry).resolve() for entry in str(environment["PATH"]).split(os.pathsep)]
+        assert child_path == expected_path
+        repo_root = Path(__file__).resolve().parents[1]
+        assert all(not entry.is_relative_to(repo_root) for entry in child_path)
+        assert "ANTHROPIC_API_KEY" not in environment
+        assert "CLAUDE_CONFIG_DIR" not in environment
+        assert "MEASURE_TWICE_SECRET" not in environment
+        if sys.platform == "win32":
+            system32 = (claude_cli._windows_runtime_paths().windows / "System32").resolve()
+            assert environment["COMSPEC"] == str(system32 / "cmd.exe")
+            assert environment["PATHEXT"] == ".COM;.EXE;.BAT;.CMD"
+    assert len(observed_cwds) == 2
+
+    rows = _read_jsonl(run_dirs[0] / "rows.jsonl")
+    assert {row["model"] for row in rows} == {"public-sonnet"}
+    assert {row["model_id_resolved"] for row in rows} == {"fake-concrete-sonnet"}
+    assert run_dirs[0].name in capsys.readouterr().out
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows batch dependency lookup")
+def test_cli_run_missing_approved_batch_dependency_rejects_ambient_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An ambient bare helper cannot substitute for a missing approved dependency."""
+    launcher, observations_path = _write_fake_claude(tmp_path / "approved install with spaces")
+    windows = claude_cli._windows_runtime_paths().windows
+    boundary = claude_cli._LauncherBoundary(
+        launcher_directory=launcher.parent,
+        target_roots=(launcher.parent,),
+        dependency_directories=(windows / "System32", windows),
+    )
+    monkeypatch.setattr(claude_cli, "_runtime_launcher_policy", lambda: (boundary,))
+    ambient_bin = tmp_path / "ambient-interposer"
+    ambient_bin.mkdir()
+    marker = tmp_path / "ambient-helper-ran.txt"
+    (ambient_bin / f"{_base_python_executable().stem}.cmd").write_text(
+        f'@echo hostile > "{marker}"\r\n@exit /b 97\r\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("PATH", os.pathsep.join((str(ambient_bin), str(launcher.parent))))
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    config_path = tmp_path / "sealed-config.json"
+    config_path.write_text(json.dumps(_sealed_test_config()), encoding="utf-8")
+    suite_path = tmp_path / "sealed-suite.json"
+    suite_path.write_text(json.dumps(asdict(_suite(["sealed-a"]))), encoding="utf-8")
+    out = tmp_path / "data"
+
+    rc = main(["run", "--suite", str(suite_path), "--config", str(config_path), "--out", str(out)])
+
+    assert rc != 0
+    assert "--version failed (exit" in capsys.readouterr().err
+    assert not observations_path.exists()
+    assert not marker.exists()
+    assert not out.exists()
+
+
 def test_cli_score_integration(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     suite = _suite(["a", "b"])
     stub = StubAdapters()
@@ -590,6 +1259,62 @@ def test_zero_budget_fails_before_any_write(tmp_path: Path) -> None:
     assert stub.local_calls == []
 
 
+def test_unbound_alias_fails_before_run_dir_or_adapter_creation(tmp_path: Path) -> None:
+    suite = _suite(["a"])
+    stub = StubAdapters()
+
+    with pytest.raises(RunError, match="no explicit provider binding"):
+        run(
+            suite=suite,
+            config=RunConfig(),
+            out_dir=tmp_path,
+            roster=["unknown-safe-alias"],
+            local_transport_factory=stub.local_factory(),
+            claude_runner_factory=stub.claude_factory(),
+        )
+
+    assert not (tmp_path / "runs").exists()
+    assert stub.local_calls == []
+    assert stub.claude_calls == []
+
+
+@pytest.mark.parametrize(
+    ("scoring_type", "roster"),
+    [("verdict", ["haiku"]), ("rubric", ["general-35b"])],
+)
+def test_claude_doctor_rejects_unsupported_seal_before_run_dir(
+    tmp_path: Path, scoring_type: str, roster: list[str]
+) -> None:
+    suite = _suite(["a"], scoring_type=scoring_type)
+    invocations: list[tuple[str, ...]] = []
+
+    def factory():
+        def invoke(
+            invocation: ClaudeInvocation, input_text: str, timeout: float
+        ) -> SubprocessResult:
+            invocations.append(invocation.argv)
+            if invocation.argv[-1] == "--version":
+                return SubprocessResult(0, "fake 1.0", "")
+            if invocation.argv[-1] == "--help":
+                return SubprocessResult(0, "-p --model --output-format", "")
+            raise AssertionError("model call must not run after a failed doctor")
+
+        return invoke
+
+    with pytest.raises(RunError, match="does not advertise required prompt-only flag"):
+        run(
+            suite=suite,
+            config=RunConfig(),
+            out_dir=tmp_path,
+            roster=roster,
+            local_transport_factory=StubAdapters().local_factory(),
+            claude_runner_factory=factory,
+        )
+
+    assert [invocation[-1] for invocation in invocations] == ["--version", "--help"]
+    assert not (tmp_path / "runs").exists()
+
+
 def test_cli_zero_budget_fails_and_writes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -632,7 +1357,7 @@ def test_claude_worker_exception_persists_sibling_success(tmp_path: Path) -> Non
 
 
 # BLOCK A (iter 3) — a fault in the POST-PROCESSING tail of claude_call (past the subprocess:
-# resolved_model_of / success()) must also become a structured error row, not propagate and discard
+# identity extraction / success()) must become a structured error row, not propagate and discard
 # a sibling's budget-consumed success. Discriminates the whole-function try from the spawn-only try.
 
 
@@ -641,17 +1366,17 @@ def test_claude_post_processing_fault_persists_sibling_success(
 ) -> None:
     suite = _suite(["a", "b"])
     cfg = RunConfig(claude_pool=2)  # both cells in one concurrent wave
-    # Echo the item id into the envelope's `result` field so the patched resolved_model_of can fault
+    # Echo the item id into `result` so the patched identity extractor can fault
     # exactly one worker in the POST-subprocess tail (proving the try wraps the whole body).
     stub = StubAdapters(claude=lambda prompt: _iid(prompt))
-    real_resolve = claude_cli.resolved_model_of
+    real_resolve = claude_cli._resolved_claude_model
 
-    def faulty_resolve(envelope: dict[str, object], requested: str) -> str:
+    def faulty_resolve(envelope: dict[str, object]) -> str:
         if envelope.get("result") == "b":
             raise RuntimeError("post-processing boom (past the subprocess)")
-        return real_resolve(envelope, requested)
+        return real_resolve(envelope)
 
-    monkeypatch.setattr(claude_cli, "resolved_model_of", faulty_resolve)
+    monkeypatch.setattr(claude_cli, "_resolved_claude_model", faulty_resolve)
     result = run(
         suite=suite,
         config=cfg,

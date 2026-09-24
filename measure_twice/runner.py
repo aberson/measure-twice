@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -59,11 +60,21 @@ from measure_twice.adapters.claude_cli import (
     BudgetExhaustedError,
     CallBudget,
     ClaudeRequest,
+    ClaudeRuntime,
+    ClaudeSetupError,
     RunnerFactory,
     claude_call_batch,
+    doctor_claude_runtime,
 )
 from measure_twice.adapters.local import TransportFactory, local_chat
 from measure_twice.config import ConfigError, RunConfig, _validate_name_list
+from measure_twice.model_sweep_execution import (
+    PROVIDER_CLAUDE,
+    PROVIDER_LOCAL,
+    ExecutionProfileError,
+    ExecutionReceipt,
+    ModelBinding,
+)
 from measure_twice.suite import Item, Suite, SuiteError
 
 __all__ = [
@@ -77,15 +88,16 @@ __all__ = [
     "ScoreResult",
     "Scorer",
     "collect_only_scorer",
+    "load_run_judge_contract",
     "load_run_suite",
     "run",
     "score_run",
     "score_run_batch",
 ]
 
-# Which roster names route to the claude adapter; everything else is treated as a local model
-# (the "simple mapping" of plan §5). A model not in this set goes to the local endpoint. Kept in
-# sync with the config default roster's claude tiers (haiku/sonnet/opus) plus the one-off ``fable``.
+# Frozen pre-receipt routing contract: these aliases used Claude, all others used local with
+# requested model equal to alias. Only legacy resume consults this history; fresh dispatch uses
+# explicit profile bindings. Never derive historical provenance from a configurable profile.
 CLAUDE_ALIASES: Final[frozenset[str]] = frozenset({"haiku", "sonnet", "opus", "fable"})
 
 # The reserved scorer name a no-response cell carries. It is set ONLY by the runner's force-0 branch
@@ -230,6 +242,7 @@ class _Cell:
     """One sweep cell: a (model, item, sample_k) to call."""
 
     model: str
+    binding: ModelBinding
     item: Item
     sample_k: int
 
@@ -262,8 +275,9 @@ def _write_manifest(
     config: RunConfig,
     max_calls: int,
     preregister: str | None,
+    execution_receipt: ExecutionReceipt,
 ) -> None:
-    """Write ``manifest.json`` with EXACTLY the plan §3 keys (written once, at run start)."""
+    """Write the plan §3 manifest keys plus the execution receipt once, at run start."""
     manifest: dict[str, object] = {
         "run_id": run_id,
         "suite": suite.suite,
@@ -275,6 +289,7 @@ def _write_manifest(
         "config_source": config.config_source,
         "budgets": {"max_calls": max_calls},
         "preregistration": preregister,
+        "execution_receipt": execution_receipt.to_mapping(),
     }
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=True), encoding="utf-8"
@@ -293,6 +308,16 @@ def _read_manifest(run_dir: Path) -> Mapping[str, object]:
     if not isinstance(data, dict):
         raise RunError(f"manifest {path} must be a JSON object, got {type(data).__name__}")
     return cast("Mapping[str, object]", data)
+
+
+def _read_manifest_selection(manifest: Mapping[str, object], label: str) -> list[str]:
+    """Read safe recorded model aliases, deduplicated in their original order."""
+    raw = manifest.get(label)
+    if not isinstance(raw, list) or not all(isinstance(name, str) for name in raw):
+        raise RunError(f"manifest {label} must be a list of model aliases")
+    names = cast("list[str]", raw)
+    _validate_names(names, label)
+    return list(dict.fromkeys(names))
 
 
 def _write_suite_snapshot(run_dir: Path, suite: Suite) -> None:
@@ -329,10 +354,12 @@ def _read_suite_snapshot(run_dir: Path) -> Suite:
 def _read_rows(run_dir: Path) -> tuple[list[RunRow], bool]:
     """Read ``rows.jsonl`` defensively; return ``(rows, torn)``.
 
-    A crash mid-append can leave a truncated final line. That is tolerated ONLY when it is the last
-    line AND the file does not end in a newline (a clean append always terminates with ``\\n``): the
-    torn line is dropped and ``torn=True`` is returned so the caller rewrites the file before
-    appending. A parse failure on ANY earlier line is real corruption and raises :class:`RunError`.
+    A crash mid-append can leave either a truncated final JSON object or a complete object missing
+    only its final newline. Both are repair-needed ONLY at the last line: an invalid tail is
+    dropped,
+    while a valid unterminated row is retained. ``torn=True`` makes the caller canonically rewrite
+    before append so two JSON objects can never be concatenated. A parse failure on ANY earlier line
+    is real corruption and raises :class:`RunError`.
     """
     path = run_dir / "rows.jsonl"
     if not path.is_file():
@@ -348,7 +375,7 @@ def _read_rows(run_dir: Path) -> tuple[list[RunRow], bool]:
         raw_lines = raw_lines[:-1]
 
     rows: list[RunRow] = []
-    torn = False
+    torn = not ends_with_newline
     last_index = len(raw_lines) - 1
     for i, line in enumerate(raw_lines):
         is_torn_candidate = i == last_index and not ends_with_newline
@@ -493,7 +520,7 @@ def _sweep_local(
             return written, True
         result = local_chat(
             cell.item.prompt,
-            model=cell.model,
+            model=cell.binding.requested_model,
             config=config,
             timeout=config.local_timeout_s,
             transport_factory=transport_factory,
@@ -512,6 +539,7 @@ def _sweep_claude(
     budget: CallBudget,
     scorer: Scorer,
     runner_factory: RunnerFactory | None,
+    runtime: ClaudeRuntime,
 ) -> tuple[int, bool]:
     """Call claude cells through the bounded pool (``config.claude_pool``), one wave per chunk.
 
@@ -527,7 +555,11 @@ def _sweep_claude(
             return written, True
         requests = [ClaudeRequest(prompt=cell.item.prompt, alias=cell.model) for cell in chunk]
         results = claude_call_batch(
-            requests, config=config, budget=budget, runner_factory=runner_factory
+            requests,
+            config=config,
+            budget=budget,
+            runner_factory=runner_factory,
+            runtime=runtime,
         )
         aborted = False
         for cell, res in zip(chunk, results, strict=True):
@@ -590,15 +622,151 @@ def _validate_sweep_params(roster: Sequence[str], samples: int, max_calls: int) 
         raise RunError(f"budget max_calls must be >= 1, got {max_calls}")
 
 
+def _resolve_bindings(
+    config: RunConfig, aliases: Sequence[str], *, label: str
+) -> tuple[ModelBinding, ...]:
+    """Resolve every alias explicitly, translating profile failures to the runner error face."""
+    try:
+        return config.execution_profile.bindings_for(aliases)
+    except ExecutionProfileError as exc:
+        raise RunError(f"{label}: {exc}") from exc
+
+
+def _doctor_execution(
+    config: RunConfig,
+    bindings: Sequence[ModelBinding],
+    *,
+    runner_factory: RunnerFactory | None,
+) -> tuple[ExecutionReceipt, ClaudeRuntime | None]:
+    """Doctor any selected Claude provider and build immutable receipt evidence."""
+    runtime: ClaudeRuntime | None = None
+    if any(binding.provider == PROVIDER_CLAUDE for binding in bindings):
+        try:
+            runtime = doctor_claude_runtime(config, runner_factory=runner_factory)
+        except (ClaudeSetupError, OSError, subprocess.TimeoutExpired) as exc:
+            raise RunError(f"Claude CLI preflight failed: {exc}") from exc
+        if runtime.cli_version is None:  # defensive: doctor success always returns a version.
+            raise RunError("Claude CLI preflight returned no version evidence")
+    try:
+        receipt = ExecutionReceipt.create(
+            config.execution_profile,
+            bindings,
+            claude_executable=None if runtime is None else runtime.executable,
+            claude_version=None if runtime is None else runtime.cli_version,
+        )
+    except ExecutionProfileError as exc:
+        raise RunError(f"could not build execution receipt: {exc}") from exc
+    return receipt, runtime
+
+
+def _execution_bindings(
+    config: RunConfig, suite: Suite, roster: Sequence[str], judges: Sequence[str]
+) -> tuple[ModelBinding, ...]:
+    """Select the collection roster and, only for rubric suites, its future judges.
+
+    A rubric run's judges must be scoreable by the shipped ``mt score`` path, whose only default
+    judge caller is Claude-only (``measure_twice/scoring/judge.py`` ``default_judge_caller``). A
+    non-Claude judge binding would pass every other fresh-run check and mint a run the product CLI
+    can never score — producer/consumer drift. Reject it HERE, before any run-dir mutation, so
+    collection and scoring agree on which judge selections are valid (fail-closed, plan §8 D9;
+    first-measurement plan §3 keeps judge providers Claude-only). An injected non-Claude
+    ``JudgeCaller`` is a library capability, not a CLI one, so it never reaches this path.
+    """
+    aliases = list(roster)
+    if suite.scoring.type == "rubric":
+        judge_bindings = _resolve_bindings(config, list(dict.fromkeys(judges)), label="judges")
+        unsupported = [b for b in judge_bindings if b.provider != PROVIDER_CLAUDE]
+        if unsupported:
+            detail = ", ".join(f"{b.alias!r} bound to provider {b.provider!r}" for b in unsupported)
+            raise RunError(
+                f"rubric judge(s) not scoreable by the default Claude judge: {detail}; "
+                f"rubric judging supports only the {PROVIDER_CLAUDE!r} provider"
+            )
+        aliases.extend(judges)
+    return _resolve_bindings(config, list(dict.fromkeys(aliases)), label="execution")
+
+
+def _read_execution_receipt(manifest: Mapping[str, object]) -> ExecutionReceipt | None:
+    """Read the additive receipt; a missing key identifies a readable legacy manifest."""
+    if "execution_receipt" not in manifest:
+        return None
+    raw = manifest["execution_receipt"]
+    try:
+        return ExecutionReceipt.from_mapping(raw)
+    except ExecutionProfileError as exc:
+        raise RunError(f"invalid execution receipt in manifest: {exc}") from exc
+
+
+def _validate_receipt_profile(
+    stored: ExecutionReceipt,
+    config: RunConfig,
+    bindings: Sequence[ModelBinding],
+) -> None:
+    """Validate static profile/bindings without requiring a needless live CLI probe."""
+    runtime = stored.claude_cli
+    try:
+        expected = ExecutionReceipt.create(
+            config.execution_profile,
+            bindings,
+            claude_executable=None if runtime is None else runtime.executable,
+            claude_version=None if runtime is None else runtime.version,
+        )
+    except ExecutionProfileError as exc:
+        raise RunError(f"cannot validate stored execution receipt: {exc}") from exc
+    if stored != expected:
+        raise RunError(
+            "execution profile/provider bindings differ from the stored receipt; "
+            "collect a new run under the current sealed contract"
+        )
+
+
+def _has_pending_claude(
+    bindings: Sequence[ModelBinding],
+    suite: Suite,
+    samples: int,
+    done_keys: set[tuple[str, str, int]],
+) -> bool:
+    return any(
+        binding.provider == PROVIDER_CLAUDE
+        and bool(_pending_cells(binding, suite, samples, done_keys))
+        for binding in bindings
+    )
+
+
+def _validate_legacy_resume(
+    bindings: Sequence[ModelBinding],
+    suite: Suite,
+    samples: int,
+    done_keys: set[tuple[str, str, int]],
+) -> None:
+    """Prove pending cells retain their historical provider/requested-model contract."""
+    for binding in bindings:
+        if not _pending_cells(binding, suite, samples, done_keys):
+            continue
+        if binding.alias in CLAUDE_ALIASES:
+            raise RunError(
+                "cannot resume legacy-unsealed run: pending Claude cells would mix unsealed "
+                "and sealed execution contracts"
+            )
+        if binding.provider != PROVIDER_LOCAL or binding.requested_model != binding.alias:
+            raise RunError(
+                "cannot resume legacy-unsealed run: pending local cells require their historical "
+                f"provider and requested model for alias {binding.alias!r}"
+            )
+
+
 def _pending_cells(
-    model: str, suite: Suite, samples: int, done_keys: set[tuple[str, str, int]]
+    binding: ModelBinding,
+    suite: Suite,
+    samples: int,
+    done_keys: set[tuple[str, str, int]],
 ) -> list[_Cell]:
-    """The cells for ``model`` that have no terminal row yet (item x sample, in suite order)."""
+    """The cells for ``binding`` that have no terminal row yet (item x sample, in suite order)."""
     return [
-        _Cell(model, item, k)
+        _Cell(binding.alias, binding, item, k)
         for item in suite.items
         for k in range(samples)
-        if (model, item.id, k) not in done_keys
+        if (binding.alias, item.id, k) not in done_keys
     ]
 
 
@@ -633,6 +801,7 @@ def run(
     out_path = Path(out_dir)
 
     if resume is not None:
+        claude_runtime: ClaudeRuntime | None = None
         run_id = resume
         # Validate the untrusted incoming run_id + containment BEFORE any path join (BLOCK 4).
         run_dir = _resolve_run_dir(out_path, run_id)
@@ -647,32 +816,63 @@ def run(
             )
         # Dedupe defensively (the manifest roster was deduped at write time — a duplicate model must
         # never re-process a cell, see the fresh branch); samples/budget from the stored manifest.
-        stored_roster = cast("Sequence[object]", manifest["roster"])
-        eff_roster = list(dict.fromkeys(str(m) for m in stored_roster))
+        eff_roster = _read_manifest_selection(manifest, "roster")
         eff_samples = int(cast("int", manifest["samples_per_cell"]))
+        eff_judges = _read_manifest_selection(manifest, "judges")
         stored_budgets = cast("Mapping[str, object]", manifest["budgets"])
         eff_max_calls = (
             max_calls if max_calls is not None else int(cast("int", stored_budgets["max_calls"]))
         )
         # Fail loud on an invalid (e.g. --budget 0) resume budget BEFORE the torn-line rewrite.
         _validate_sweep_params(eff_roster, eff_samples, eff_max_calls)
+        bindings = _resolve_bindings(config, eff_roster, label="roster")
+        _resolve_bindings(config, eff_judges, label="judges")
+        selected_bindings = _execution_bindings(config, suite, eff_roster, eff_judges)
         existing_rows, torn = _read_rows(run_dir)
+        done_keys = {row.cell_key for row in existing_rows}
+        stored_receipt = _read_execution_receipt(manifest)
+        pending_claude = _has_pending_claude(bindings, suite, eff_samples, done_keys)
+        if stored_receipt is None:
+            _validate_legacy_resume(bindings, suite, eff_samples, done_keys)
+        else:
+            _validate_receipt_profile(stored_receipt, config, selected_bindings)
+            if pending_claude:
+                current_receipt, claude_runtime = _doctor_execution(
+                    config,
+                    selected_bindings,
+                    runner_factory=claude_runner_factory,
+                )
+                if current_receipt != stored_receipt:
+                    raise RunError(
+                        "cannot resume: current Claude executable/version or execution receipt "
+                        "differs from the stored sealed contract"
+                    )
+        # Contract validation/rejection intentionally precedes this first resume mutation.
         if torn:
             _rewrite_rows(run_dir, existing_rows)
     else:
-        run_id = _mint_run_id()
-        run_dir = out_path / "runs" / run_id  # minted id is trusted by construction.
         # Dedupe the roster preserving order: a duplicate model (e.g. --models "m,m") must not
         # double-write the same (model,item,sample) cell (BLOCK 3).
         eff_roster = list(dict.fromkeys(roster if roster is not None else config.roster))
         eff_samples = samples_per_cell if samples_per_cell is not None else config.samples_per_cell
-        eff_judges = list(judges) if judges is not None else list(config.judges)
+        eff_judges = list(dict.fromkeys(judges if judges is not None else config.judges))
         eff_max_calls = max_calls if max_calls is not None else config.max_calls
         # ALL validity checks BEFORE any filesystem mutation (BLOCK 1): invalid budget/roster/
         # samples or a malformed --models/--judges name must fail loud without minting a run dir.
         _validate_sweep_params(eff_roster, eff_samples, eff_max_calls)
         _validate_names(eff_roster, "roster")  # CLI overrides through the config-roster validation
         _validate_names(eff_judges, "judges")
+        bindings = _resolve_bindings(config, eff_roster, label="roster")
+        _resolve_bindings(config, eff_judges, label="judges")
+        execution_receipt, claude_runtime = _doctor_execution(
+            config,
+            _execution_bindings(config, suite, eff_roster, eff_judges),
+            runner_factory=claude_runner_factory,
+        )
+        # All validation, provider binding, executable resolution, and CLI doctoring is complete
+        # before the run id/directory exists.
+        run_id = _mint_run_id()
+        run_dir = out_path / "runs" / run_id  # minted id is trusted by construction.
         try:
             run_dir.mkdir(parents=True)  # NOT exist_ok: a run_id collision must fail loud.
         except FileExistsError as exc:
@@ -687,6 +887,7 @@ def run(
             config=config,
             max_calls=eff_max_calls,
             preregister=preregister,
+            execution_receipt=execution_receipt,
         )
         _write_suite_snapshot(run_dir, suite)
         existing_rows = []
@@ -700,11 +901,13 @@ def run(
     rows_path = run_dir / "rows.jsonl"
     with rows_path.open("a", encoding="utf-8") as fh:
         try:
-            for model in eff_roster:
-                pending = _pending_cells(model, suite, eff_samples, done_keys)
+            for binding in bindings:
+                pending = _pending_cells(binding, suite, eff_samples, done_keys)
                 if not pending:
                     continue
-                if model in CLAUDE_ALIASES:
+                if binding.provider == PROVIDER_CLAUDE:
+                    if claude_runtime is None:
+                        raise RunError("Claude cells reached scheduling without a sealed runtime")
                     written, aborted = _sweep_claude(
                         fh,
                         run_id,
@@ -713,8 +916,9 @@ def run(
                         budget=budget,
                         scorer=scorer,
                         runner_factory=claude_runner_factory,
+                        runtime=claude_runtime,
                     )
-                else:
+                elif binding.provider == PROVIDER_LOCAL:
                     written, aborted = _sweep_local(
                         fh,
                         run_id,
@@ -724,6 +928,8 @@ def run(
                         scorer=scorer,
                         transport_factory=local_transport_factory,
                     )
+                else:  # strict profile validation makes this unreachable; keep dispatch closed.
+                    raise RunError(f"unsupported provider at dispatch: {binding.provider!r}")
                 cells_written += written
                 if aborted:
                     break
@@ -777,6 +983,34 @@ def load_run_suite(run_id: str, out_dir: str | Path) -> Suite:
     hash mismatch all raise :class:`RunError`.
     """
     return _open_run(run_id, out_dir)[1]
+
+
+def load_run_judge_contract(
+    run_id: str, out_dir: str | Path, config: RunConfig
+) -> tuple[tuple[str, ...], ExecutionReceipt]:
+    """Read recorded rubric judges and validate their sealed profile before fresh judging.
+
+    Historical runs remain readable and deterministically rescorable. Fresh judge calls require
+    a receipt covering the recorded collection roster AND judges; a new config cannot rebind them.
+    Runtime evidence is checked by the judge caller immediately before invoking its first sample.
+    """
+    run_dir, suite = _open_run(run_id, out_dir)
+    if suite.scoring.type != "rubric":
+        raise RunError("judge contract requires a rubric suite")
+    manifest = _read_manifest(run_dir)
+    roster = _read_manifest_selection(manifest, "roster")
+    judges = tuple(_read_manifest_selection(manifest, "judges"))
+    if not judges:
+        raise RunError("rubric judging requires recorded judge models")
+    stored = _read_execution_receipt(manifest)
+    if stored is None:
+        raise RunError(
+            "cannot freshly judge legacy-unsealed run without a stored receipt; collect a new "
+            "run under the current sealed contract (deterministic offline rescoring is available)"
+        )
+    selected = _execution_bindings(config, suite, roster, judges)
+    _validate_receipt_profile(stored, config, selected)
+    return judges, stored
 
 
 def score_run(
