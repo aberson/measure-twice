@@ -639,6 +639,7 @@ def _packed_supervisor_status(
     [
         "collected",
         "owner-alive",
+        "owner-stat-unreadable",
         "path-replaced",
         "malformed-control",
         "missing-supervisor-record",
@@ -670,7 +671,7 @@ def test_linux_fast_scope_collection_is_terminal_only_with_proved_owner_exit_and
         if case == "path-replaced":
             scope.mkdir()
 
-    if case == "owner-alive":
+    if case in ("owner-alive", "owner-stat-unreadable"):
         live_owner = subprocess.Popen(
             ("/bin/sleep", "30"),
             stdin=subprocess.DEVNULL,
@@ -723,6 +724,15 @@ def test_linux_fast_scope_collection_is_terminal_only_with_proved_owner_exit_and
         status_read_fd=status_read_fd,
     )
     runtime.resource_guard = guard
+    if case == "owner-stat-unreadable":
+        original_record = process_module._pid_exit_record
+
+        def unreadable_owner_stat(pid: int) -> tuple[int, str] | None:
+            if pid == owner_identity[0]:
+                raise ProcessExecutionError("could not read Linux resource guard outer owner stat")
+            return original_record(pid)
+
+        monkeypatch.setattr(process_module, "_pid_exit_record", unreadable_owner_stat)
     if case == "proof-raises":
         scratch = tmp_path / "scratch"
         scratch.mkdir()
@@ -737,6 +747,7 @@ def test_linux_fast_scope_collection_is_terminal_only_with_proved_owner_exit_and
 
     expected_message = {
         "owner-alive": "could not read Linux resource guard cgroup.events",
+        "owner-stat-unreadable": "could not read Linux resource guard outer owner stat",
         "path-replaced": "scope path was replaced before collection",
         "malformed-control": "cgroup.events is malformed",
         "missing-supervisor-record": "invalid status record",
@@ -1077,10 +1088,11 @@ def _assert_linux_identity_gone(identity: tuple[int, int]) -> None:
     host_pid, start_token = identity
     deadline = time.monotonic() + process_module._REAP_TIMEOUT_S
     while True:
-        if process_module._pid_starttime(host_pid) != start_token:
+        record = process_module._pid_exit_record(host_pid)
+        if record is None or record[0] != start_token:
             return
-        state = process_module._pid_state(host_pid)
-        if state is None or state == "Z":
+        state = record[1]
+        if state == "Z":
             return
         if time.monotonic() >= deadline:
             raise AssertionError(
@@ -1149,6 +1161,22 @@ def _guard_with_owner(
     guard.trusted_for_cleanup = True
     guard.validated_for_release = True
     return guard
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc identity proof semantics")
+@pytest.mark.parametrize("bad_record", ["unreadable", "malformed"])
+def test_pid_exit_record_fails_closed_on_unproved_identity(
+    monkeypatch: pytest.MonkeyPatch, bad_record: str
+) -> None:
+    def read_bad_stat(_path: Path, *, encoding: str) -> str:
+        assert encoding == "ascii"
+        if bad_record == "unreadable":
+            raise PermissionError("injected /proc read failure")
+        return "malformed stat record"
+
+    monkeypatch.setattr(Path, "read_text", read_bad_stat)
+    with pytest.raises(ProcessExecutionError, match="outer owner stat"):
+        process_module._pid_exit_record(42)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc identity state semantics")

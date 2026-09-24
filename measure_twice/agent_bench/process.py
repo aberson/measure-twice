@@ -1179,6 +1179,29 @@ def _pid_state(pid: int) -> str | None:
     return fields[0]
 
 
+def _pid_exit_record(pid: int) -> tuple[int, str] | None:
+    """Read one owner identity/state record, failing closed on unreadable or malformed proc data."""
+
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise ProcessExecutionError("could not read Linux resource guard outer owner stat") from exc
+    closing = raw.rfind(")")
+    if closing < 0:
+        raise ProcessExecutionError("Linux resource guard outer owner stat is malformed")
+    fields = raw[closing + 2 :].split()
+    try:
+        state = fields[0]
+        starttime = int(fields[19])
+    except (IndexError, ValueError) as exc:
+        raise ProcessExecutionError("Linux resource guard outer owner stat is malformed") from exc
+    if len(state) != 1:
+        raise ProcessExecutionError("Linux resource guard outer owner state is malformed")
+    return starttime, state
+
+
 def _pid_namespace_chain(pid: int) -> tuple[int, ...] | None:
     """Return host-visible PID-namespace IDs, preserving the process identity boundary."""
 
@@ -2102,16 +2125,12 @@ class _LinuxResourceGuardState:
         if identity is None:
             raise ProcessExecutionError("Linux resource guard outer owner was not captured")
         pid, starttime = identity
-        if _pid_starttime(pid) != starttime:
-            # The exact process is gone: the record vanished, or a reused PID no longer matches
-            # this owner's immutable start token.
+        record = _pid_exit_record(pid)
+        if record is None or record[0] != starttime:
+            # The exact process is gone: the record vanished, or a reused PID has a new token.
             return True
-        state = _pid_state(pid)
-        # Re-confirm identity after reading the state: a reap-then-PID-reuse between the two reads
-        # could otherwise let an unrelated new process's state decide this. If the token still
-        # matches, the state belongs to the exact captured owner; if it changed, the owner is gone.
-        if _pid_starttime(pid) != starttime:
-            return True
+        # The token and state came from one proc record, so the state belongs to this owner.
+        state = record[1]
         return allow_zombie and state == "Z"
 
     def _verify_expected_scope_identity(self) -> None:
